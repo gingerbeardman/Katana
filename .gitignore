@@ -1,0 +1,14 @@
+# Xcode / local
+build/
+.DS_Store
+**/xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# MenuGDIBuilder build outputs (shipped binary lives in Katana/Resources/Helpers/)
+Tools/MenuGDIBuilder/bin/
+Tools/MenuGDIBuilder/obj/
+Tools/MenuGDIBuilder/publish/
+
+# IDE
+.nova/
