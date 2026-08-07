@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import Observation
 import SwiftUI
+import UniformTypeIdentifiers
 
 @Observable
 @MainActor
@@ -10,6 +11,8 @@ final class AppState {
     var games: [GameEntry] = []
     /// Multi-select (⌘/⇧ click). Empty when nothing selected.
     var selection: Set<GameEntry.ID> = []
+    /// Bumped while the table is filling so the list can scroll to the newest row.
+    var scrollTargetGameID: GameEntry.ID?
     var searchText: String = ""
     /// When true, list only games that share a serial (or name) with another.
     var showDuplicatesOnly: Bool = false
@@ -25,11 +28,27 @@ final class AppState {
             UserDefaults.standard.set(ejectOnQuit, forKey: AppState.ejectOnQuitKey)
         }
     }
+    /// When true, follow newly scanned/imported rows in the table. Default off.
+    var scrollToNewRows: Bool = UserDefaults.standard.bool(forKey: AppState.scrollToNewRowsKey) {
+        didSet {
+            UserDefaults.standard.set(scrollToNewRows, forKey: AppState.scrollToNewRowsKey)
+        }
+    }
     var isScanning = false
-    /// Trailing inspector visibility (standard macOS `.inspector`).
-    var isInspectorPresented: Bool = true
+    /// Trailing inspector visibility (standard macOS `.inspector`). Persisted across launches.
+    var isInspectorPresented: Bool = AppState.loadInspectorPresented() {
+        didSet {
+            UserDefaults.standard.set(isInspectorPresented, forKey: AppState.isInspectorPresentedKey)
+        }
+    }
     /// Bumped to focus the name field in the inspector (e.g. Rename…).
     var focusNameFieldToken: Int = 0
+    /// True while a text field / field editor is first responder (search, rename, …).
+    /// Menu key equivalents that would steal ⌘A / ⌫ / ⌘Z are disabled while set.
+    var isTextInputFocused: Bool = false
+    /// Finder-style inline rename target in the game table (`nil` when idle).
+    /// Observed inside `RenameAwareTitleCell` so SwiftUI Table cell caching still updates.
+    var renamingGameID: GameEntry.ID?
     /// Non-nil while a disk mutation runs (renumber, copy, delete).
     var busyMessage: String?
     /// Live scan progress for the status line / table chrome (`nil` when idle).
@@ -45,9 +64,24 @@ final class AppState {
     var displaySort: DisplaySortPreference = .mostRecentFirst
     /// Which console menu image to bake (GDmenu or openMenu). Persisted per volume.
     var menuKind: MenuKind = .gdMenu
-    /// True when disc names/order changed since the last menu GDI bake.
-    /// Quit prompts to rebuild (then optionally ejects and exits).
-    private(set) var menuNeedsRebuild: Bool = false
+    /// Kind currently installed in slot 01 (last successful bake, or detected on open).
+    /// Switching preference away and back without list changes does not dirty the menu.
+    private(set) var bakedMenuKind: MenuKind = .gdMenu
+    /// Names / order / slots changed since the last bake (independent of menu-type picker).
+    private(set) var menuContentDirty: Bool = false
+    /// Rebuild needed when the list changed **or** the chosen type ≠ what’s on the card.
+    var menuNeedsRebuild: Bool {
+        guard volume != nil, !games.isEmpty else { return false }
+        return menuContentDirty || menuKind != bakedMenuKind
+    }
+    /// Per-card “not a duplicate” identity keys for the open volume (`DuplicateIdentity`).
+    private(set) var notDuplicateKeys: Set<String> = []
+    /// Inspector section expand/collapse (global UserDefaults, survives launches).
+    var inspectorSectionExpanded: [String: Bool] = AppState.loadInspectorSections() {
+        didSet {
+            AppState.saveInspectorSections(inspectorSectionExpanded)
+        }
+    }
 
     let undoManager = UndoManager()
 
@@ -63,17 +97,62 @@ final class AppState {
 
     private static let showDuplicateMarkersKey = "showDuplicateMarkers"
     private static let ejectOnQuitKey = "ejectOnQuit"
+    private static let scrollToNewRowsKey = "scrollToNewRows"
+    private static let isInspectorPresentedKey = "isInspectorPresented"
+    private static let inspectorSectionsKey = "inspectorSectionExpanded"
+
+    /// Default on when the key has never been written (first launch).
+    private static func loadInspectorPresented() -> Bool {
+        if UserDefaults.standard.object(forKey: isInspectorPresentedKey) == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: isInspectorPresentedKey)
+    }
+
+    private static func loadInspectorSections() -> [String: Bool] {
+        (UserDefaults.standard.dictionary(forKey: inspectorSectionsKey) as? [String: Bool]) ?? [:]
+    }
+
+    private static func saveInspectorSections(_ map: [String: Bool]) {
+        UserDefaults.standard.set(map, forKey: inspectorSectionsKey)
+    }
+
+    func isInspectorSectionExpanded(_ section: InspectorSection) -> Bool {
+        inspectorSectionExpanded[section.rawValue] ?? section.defaultExpanded
+    }
+
+    func toggleInspectorSection(_ section: InspectorSection) {
+        var next = inspectorSectionExpanded
+        let current = next[section.rawValue] ?? section.defaultExpanded
+        next[section.rawValue] = !current
+        inspectorSectionExpanded = next
+    }
+
+    func setInspectorSection(_ section: InspectorSection, expanded: Bool) {
+        var next = inspectorSectionExpanded
+        next[section.rawValue] = expanded
+        inspectorSectionExpanded = next
+    }
 
     var isBusy: Bool { isScanning || busyMessage != nil }
 
-    /// List-row badge when markers are enabled and this id is in a group.
-    func listDuplicateBadge(for id: GameEntry.ID) -> DuplicateInfo? {
+    /// List-row badge when markers are enabled.
+    /// While analysis is in flight every row is `.pending` (“—”), not a stale grade/count.
+    func listDuplicateBadge(for id: GameEntry.ID) -> DuplicateListBadge? {
         guard showDuplicateMarkers else { return nil }
-        return duplicateInfoByID[id]
+        if isDuplicateInfoComputing {
+            return .pending
+        }
+        if let info = duplicateInfoByID[id] {
+            return .ready(info)
+        }
+        return nil
     }
 
     /// Cached duplicate map — recomputed off the main actor when `games` changes.
     private(set) var duplicateInfoByID: [GameEntry.ID: DuplicateInfo] = [:]
+    /// True between scheduling analysis and applying the latest result.
+    private(set) var isDuplicateInfoComputing: Bool = false
     private var duplicateRecomputeGeneration: UInt64 = 0
 
     var duplicateGameCount: Int {
@@ -114,28 +193,71 @@ final class AppState {
     private(set) var hashingFolderPath: String?
     /// Live remaining-bytes / rate / ETA for the active hash run.
     private(set) var hashingProgress: HashingProgress?
+    /// Last measured hashing throughput for the open card (bytes/sec). Seeds ETA on the next run.
+    private(set) var cachedHashBytesPerSecond: Double?
 
-    /// Sidebar status while hashing (count, throughput, ETA once known).
-    var hashingStatusText: String {
+    /// Effective rate: live sample, else last-known card seed.
+    private var hashingEffectiveRate: Double? {
+        if let bps = hashingProgress?.bytesPerSecond, bps.isFinite, bps > 0 { return bps }
+        if let s = cachedHashBytesPerSecond, s.isFinite, s > 0 { return s }
+        return nil
+    }
+
+    /// 0…1 for the linear progress bar (Spindle-style).
+    var hashingFraction: Double {
+        hashingProgress?.fractionComplete ?? 0
+    }
+
+    /// Compact label above the bar, e.g. `Hashing — 18m remaining`.
+    var hashingProgressLabel: String {
         if isStoppingHashing {
-            return "Stopping… finishing current file"
+            return "Stopping…"
         }
+        let eta: Double? = {
+            guard let progress = hashingProgress else { return nil }
+            if let e = progress.etaSeconds { return e }
+            guard let rate = hashingEffectiveRate, rate > 0, progress.remainingBytes > 0 else {
+                return nil
+            }
+            return Double(progress.remainingBytes) / rate
+        }()
+        if let eta {
+            let duration = ByteCount.etaString(seconds: eta)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "~"))
+            return "Hashing — \(duration) remaining"
+        }
+        return "Hashing…"
+    }
+
+    /// Trailing percent, e.g. `17%`.
+    var hashingPercentLabel: String {
+        if isStoppingHashing { return "" }
+        let pct = hashingFraction * 100
+        if pct > 0, pct < 10 {
+            return String(format: "%.0f%%", pct)
+        }
+        return "\(Int(pct.rounded(.down)))%"
+    }
+
+    /// Full detail for tooltips (rate, counts).
+    var hashingHelpText: String {
         guard let progress = hashingProgress else {
-            return "Hashing…"
+            return "Hashing disc content"
         }
-        var parts: [String] = ["\(progress.pendingCount) left"]
+        var lines = ["\(progress.completedCount) of \(progress.totalCount) games"]
+        if progress.hashedBytes > 0 {
+            lines.append("\(ByteCount.string(for: progress.hashedBytes)) hashed")
+        }
         if progress.remainingBytes > 0 {
-            parts.append(ByteCount.string(for: progress.remainingBytes))
+            lines.append("\(ByteCount.string(for: progress.remainingBytes)) remaining")
         }
-        if let bps = progress.bytesPerSecond {
-            parts.append(ByteCount.throughput(bytesPerSecond: bps))
+        if let bps = hashingEffectiveRate {
+            lines.append(ByteCount.throughput(bytesPerSecond: bps))
         }
         if let eta = progress.etaSeconds {
-            parts.append(ByteCount.etaString(seconds: eta))
-        } else if progress.completedCount == 0 {
-            parts.append("estimating…")
+            lines.append("ETA \(ByteCount.etaString(seconds: eta))")
         }
-        return "Hashing… " + parts.joined(separator: " · ")
+        return lines.joined(separator: "\n")
     }
 
     func isHashingGame(_ game: GameEntry) -> Bool {
@@ -191,6 +313,10 @@ final class AppState {
 
     var canEject: Bool { volume != nil && !isBusy }
 
+    var canAddGames: Bool {
+        volume != nil && !isBusy && volume?.isReadOnly != true
+    }
+
     var canDeleteSelection: Bool { !selection.isEmpty && !isBusy }
 
     var canMoveSelectionUp: Bool {
@@ -204,6 +330,7 @@ final class AppState {
     }
 
     func focusRenameInInspector(for id: UUID? = nil) {
+        cancelInlineRename()
         if let id {
             selection = [id]
         }
@@ -213,13 +340,41 @@ final class AppState {
         }
     }
 
+    /// Start Finder-style inline rename on a single game (table title cell).
+    /// Defers setting `renamingGameID` so context-menu teardown does not immediately
+    /// cancel the brand-new field editor (2UP activation pattern).
+    func beginInlineRename(_ id: GameEntry.ID) {
+        guard !isBusy, !isScanning, games.contains(where: { $0.id == id }) else { return }
+        selection = [id]
+        // If already renaming this row, leave the field alone.
+        if renamingGameID == id { return }
+        renamingGameID = nil
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard !self.isBusy, !self.isScanning,
+                  self.selection == [id],
+                  self.games.contains(where: { $0.id == id })
+            else { return }
+            self.renamingGameID = id
+        }
+    }
+
+    func cancelInlineRename() {
+        renamingGameID = nil
+    }
+
+    func commitInlineRename(id: GameEntry.ID, to newName: String) {
+        renamingGameID = nil
+        rename(id: id, to: newName)
+    }
+
     func selectOnly(_ id: GameEntry.ID) {
         selection = [id]
         isInspectorPresented = true
     }
 
     func selectAllDuplicates() {
-        selection = DuplicateDetector.allDuplicateIDs(in: games)
+        selection = DuplicateDetector.allDuplicateIDs(in: games, ignoredIdentityKeys: notDuplicateKeys)
         if !selection.isEmpty {
             isInspectorPresented = true
             showDuplicatesOnly = true
@@ -231,7 +386,11 @@ final class AppState {
 
     /// Select every copy except the lowest slot number in each group (safe delete targets).
     func selectRedundantDuplicates(minimumGrade: DuplicateGrade = .weak) {
-        selection = DuplicateDetector.redundantIDs(in: games, minimumGrade: minimumGrade)
+        selection = DuplicateDetector.redundantIDs(
+            in: games,
+            minimumGrade: minimumGrade,
+            ignoredIdentityKeys: notDuplicateKeys
+        )
         if !selection.isEmpty {
             isInspectorPresented = true
             showDuplicatesOnly = true
@@ -246,14 +405,119 @@ final class AppState {
         selectRedundantDuplicates(minimumGrade: .exact)
     }
 
+    /// Mark game(s) as not duplicates on **this card** (persisted by volume UUID).
+    func markNotDuplicate(ids: Set<GameEntry.ID>? = nil) {
+        let targetIDs = ids ?? selection
+        guard let uuid = volume?.volumeUUID else { return }
+        let targets = games.filter { targetIDs.contains($0.id) && !$0.isMenu }
+        guard !targets.isEmpty else {
+            flash("Nothing to mark")
+            return
+        }
+        var keys = notDuplicateKeys
+        for game in targets {
+            keys.insert(DuplicateIdentity.key(for: game))
+        }
+        notDuplicateKeys = keys
+        Task {
+            try? await VolumeStore.shared.setNotDuplicateKeys(keys, for: uuid)
+        }
+        scheduleDuplicateRecompute()
+        let n = targets.count
+        flash(n == 1 ? "Marked not a duplicate" : "Marked \(n) games not duplicates")
+    }
+
+    /// Undo a “not a duplicate” mark for the selection (or given ids).
+    func clearNotDuplicateMark(ids: Set<GameEntry.ID>? = nil) {
+        let targetIDs = ids ?? selection
+        guard let uuid = volume?.volumeUUID else { return }
+        let targets = games.filter { targetIDs.contains($0.id) }
+        guard !targets.isEmpty else { return }
+        var keys = notDuplicateKeys
+        var removed = 0
+        for game in targets {
+            if keys.remove(DuplicateIdentity.key(for: game)) != nil {
+                removed += 1
+            }
+        }
+        guard removed > 0 else {
+            flash("Not marked as not-a-duplicate")
+            return
+        }
+        notDuplicateKeys = keys
+        Task {
+            try? await VolumeStore.shared.setNotDuplicateKeys(keys, for: uuid)
+        }
+        scheduleDuplicateRecompute()
+        flash(removed == 1 ? "Duplicate detection restored" : "Restored \(removed) games")
+    }
+
+    func isMarkedNotDuplicate(_ game: GameEntry) -> Bool {
+        notDuplicateKeys.contains(DuplicateIdentity.key(for: game))
+    }
+
+    /// Games on the open card that currently match a stored “not a duplicate” key.
+    var gamesMarkedNotDuplicate: [GameEntry] {
+        games.filter { isMarkedNotDuplicate($0) }
+    }
+
+    var notDuplicateMarkCount: Int {
+        // Prefer live matches; fall back to raw key count (orphans after rename/delete).
+        let matched = gamesMarkedNotDuplicate.count
+        return matched > 0 ? matched : notDuplicateKeys.count
+    }
+
+    /// Select every game on this card that is marked not-a-duplicate.
+    func selectMarkedNotDuplicates() {
+        let ids = Set(gamesMarkedNotDuplicate.map(\.id))
+        guard !ids.isEmpty else {
+            flash("No not-a-duplicate marks on this card")
+            return
+        }
+        selection = ids
+        isInspectorPresented = true
+        showDuplicatesOnly = false
+        flash("\(ids.count) marked not-duplicate selected")
+    }
+
+    /// Clear every “not a duplicate” mark for the open card (including orphan keys).
+    func clearAllNotDuplicateMarks() {
+        guard let uuid = volume?.volumeUUID else { return }
+        guard !notDuplicateKeys.isEmpty else {
+            flash("No not-a-duplicate marks on this card")
+            return
+        }
+        let n = notDuplicateMarkCount
+        notDuplicateKeys = []
+        Task {
+            try? await VolumeStore.shared.setNotDuplicateKeys([], for: uuid)
+        }
+        scheduleDuplicateRecompute()
+        flash(n == 1 ? "Cleared 1 not-a-duplicate mark" : "Cleared \(n) not-a-duplicate marks")
+    }
+
     /// Games still without a content hash (for UI).
     var unhashedGameCount: Int {
         games.filter { !$0.isMenu && !$0.hasContentHash }.count
     }
 
+    /// Hashing and menu rebuild both thrash the card — never run them together.
+    var canStartHashing: Bool {
+        volume != nil
+            && !isBusy
+            && !isHashing
+            && unhashedGameCount > 0
+    }
+
     /// User-initiated: compute missing content hashes in the background (never automatic).
     func startContentHashing() {
-        guard !isBusy, volume != nil, !isHashing else { return }
+        guard canStartHashing else {
+            if isHashing { return }
+            if isBusy {
+                flash("Wait for the current operation to finish before hashing")
+            }
+            return
+        }
         let missing = unhashedGameCount
         guard missing > 0 else {
             flash("All games already have hashes")
@@ -264,6 +528,10 @@ final class AppState {
         isStoppingHashing = false
         isHashingActive = true
         hashingProgress = nil
+
+        let volumeUUID = volume?.volumeUUID
+        let gamesSnapshot = games
+
         ContentHashService.shared.onCurrentFolderChanged = { [weak self] path in
             self?.hashingFolderPath = path
         }
@@ -278,21 +546,65 @@ final class AppState {
         ContentHashService.shared.onProgress = { [weak self] progress in
             self?.hashingProgress = progress
         }
+        ContentHashService.shared.onMeasuredRate = { [weak self] rate in
+            guard let self else { return }
+            self.cachedHashBytesPerSecond = rate
+            guard let volumeUUID else { return }
+            Task {
+                try? await VolumeStore.shared.setHashBytesPerSecond(rate, for: volumeUUID)
+            }
+        }
         ContentHashService.shared.onFinished = { [weak self] in
             guard let self else { return }
+            let measured = ContentHashService.shared.lastMeasuredBytesPerSecond
+            let uuid = self.volume?.volumeUUID
             self.isStoppingHashing = false
             self.isHashingActive = false
             self.hashingFolderPath = nil
             self.hashingProgress = nil
+            if let measured {
+                self.cachedHashBytesPerSecond = measured
+                if let uuid {
+                    Task {
+                        try? await VolumeStore.shared.setHashBytesPerSecond(measured, for: uuid)
+                    }
+                }
+            }
         }
-        ContentHashService.shared.startFilling(games: games)
-        hashingFolderPath = ContentHashService.shared.currentFolderPath
-        hashingProgress = ContentHashService.shared.progress
-        let remaining = hashingProgress?.remainingBytes ?? 0
-        if remaining > 0 {
-            flash("Hashing \(missing) games · \(ByteCount.string(for: remaining))")
-        } else {
-            flash("Hashing \(missing) games…")
+
+        // Always resolve seed before startFilling — memory can be stale after snapshot open /
+        // same-card early return that skipped loadCachedHashRate.
+        Task {
+            var seed: Double? = {
+                guard let s = self.cachedHashBytesPerSecond, s.isFinite, s > 0 else { return nil }
+                return s
+            }()
+            if seed == nil, let volumeUUID {
+                if let stored = try? await VolumeStore.shared.hashBytesPerSecond(for: volumeUUID),
+                   stored.isFinite, stored > 0
+                {
+                    seed = stored
+                    self.cachedHashBytesPerSecond = stored
+                }
+            }
+            guard self.isHashingActive else { return }
+
+            ContentHashService.shared.startFilling(
+                games: gamesSnapshot,
+                seedBytesPerSecond: seed
+            )
+            self.hashingFolderPath = ContentHashService.shared.currentFolderPath
+            self.hashingProgress = ContentHashService.shared.progress
+
+            let remaining = self.hashingProgress?.remainingBytes ?? 0
+            var flashParts = ["Hashing \(missing) games"]
+            if remaining > 0 {
+                flashParts.append(ByteCount.string(for: remaining))
+            }
+            if let seed, seed > 0 {
+                flashParts.append(ByteCount.throughput(bytesPerSecond: seed))
+            }
+            self.flash(flashParts.joined(separator: " · "))
         }
     }
 
@@ -300,8 +612,8 @@ final class AppState {
         guard canStopHashing else { return }
         isStoppingHashing = true
         ContentHashService.shared.cancel()
-        // Keep row spinner on the current file until it finishes; button stays disabled.
-        flash("Stopping hashing…")
+        // Keep row spinner on the current file until it finishes; onFinished clears stopping.
+        flash("Stopping… finishing current file")
     }
 
     // MARK: - Open / close
@@ -343,6 +655,7 @@ final class AppState {
     func openRemembered(_ remembered: RememberedVolume, showErrorIfMissing: Bool = true) async {
         // Already showing this card — don't wipe the list and rescan.
         if volume?.volumeUUID == remembered.volumeUUID, !isScanning {
+            await loadCachedHashRate(for: remembered.volumeUUID)
             return
         }
 
@@ -384,10 +697,7 @@ final class AppState {
         // Same card already open (sidebar / Open panel / restore) — keep list, no rescan.
         // Explicit Rescan / Clear Cache still passes forceRescan: true.
         if !forceRescan, !isScanning, isSameOpenVolume(as: url) {
-            // Refresh free-space chrome only.
-            if let resolved = try? VolumeIdentity.resolve(rootURL: url) {
-                volume = resolved
-            }
+            await refreshOpenVolumeChrome(for: url)
             return
         }
 
@@ -404,8 +714,10 @@ final class AppState {
         cancelLazyDetailEnrichment()
         selection = []
         duplicateInfoByID = [:]
+        isDuplicateInfoComputing = false
+        notDuplicateKeys = []
         games = []
-        menuNeedsRebuild = false
+        menuContentDirty = false
         isScanning = true
         scanProgress = nil
         statusText = "Scanning \(url.lastPathComponent)…"
@@ -414,6 +726,7 @@ final class AppState {
         if let resolved = try? VolumeIdentity.resolve(rootURL: url) {
             volume = resolved
             await loadDisplaySort(for: resolved.volumeUUID)
+            await loadNotDuplicateKeys(for: resolved.volumeUUID)
         }
 
         // Let SwiftUI paint the empty/disabled table before heavy work begins.
@@ -426,11 +739,19 @@ final class AppState {
         }
 
         do {
-            // CardScanner.scan is nonisolated and runs in Task.detached internally.
-            // Progress callbacks hop to MainActor so the table fills live.
-            let result = try await CardScanner.scan(rootURL: url) { event in
+            // Recent / reopen: if the saved cache still lists the same slot folders, skip
+            // per-folder I/O and paint the table from the snapshot.
+            let preferSnapshot = !forceRescan
+            if preferSnapshot {
+                statusText = "Opening \(url.lastPathComponent)…"
+            }
+
+            let result = try await CardScanner.scan(
+                rootURL: url,
+                preferSnapshotCache: preferSnapshot
+            ) { event in
                 await MainActor.run {
-                    self.insertScannedEntry(event.entry)
+                    self.insertScannedEntries(event.entries)
                     self.scanProgress = (event.completed, event.total)
                     self.statusText = "Scanning… \(event.completed)/\(event.total)"
                 }
@@ -444,8 +765,14 @@ final class AppState {
             } else {
                 selection = []
             }
-            lastScanStats = "\(result.cacheHits) cached · \(result.cacheMisses) scanned · \(result.durationMilliseconds) ms"
+            if result.cacheMisses == 0, result.cacheHits > 0, preferSnapshot {
+                lastScanStats = "\(result.cacheHits) from cache · \(result.durationMilliseconds) ms"
+            } else {
+                lastScanStats = "\(result.cacheHits) cached · \(result.cacheMisses) scanned · \(result.durationMilliseconds) ms"
+            }
             await resolveMenuKind(for: result.volume.volumeUUID, games: result.entries)
+            await loadCachedHashRate(for: result.volume.volumeUUID)
+            await loadNotDuplicateKeys(for: result.volume.volumeUUID)
             if result.volume.isReadOnly {
                 statusText = "\(result.entries.count) games · \(ByteCount.string(for: totalBytes)) · Read-only · \(menuKind.displayName)"
                 flash("Card is read-only — check the SD lock switch")
@@ -472,6 +799,8 @@ final class AppState {
             games = []
             selection = []
             duplicateInfoByID = [:]
+            isDuplicateInfoComputing = false
+            notDuplicateKeys = []
             menuKind = .gdMenu
             lastError = error.localizedDescription
             statusText = "Failed to open card"
@@ -599,24 +928,66 @@ final class AppState {
         }
     }
 
+    /// Batch insert for scan progress — one array mutation pass, optional single scroll target.
+    private func insertScannedEntries(_ entries: [GameEntry]) {
+        guard !entries.isEmpty else { return }
+        // Merge sorted by slot into `games` (also kept sorted by number).
+        let incoming = entries.sorted { $0.number < $1.number }
+        if games.isEmpty {
+            games = incoming
+        } else {
+            for entry in incoming {
+                insertScannedEntry(entry)
+            }
+        }
+        if isScanning, scrollToNewRows, let last = incoming.last {
+            selection = [last.id]
+            scrollTargetGameID = last.id
+        }
+    }
+
     /// O(n²) duplicate analysis off the main actor; results land asynchronously.
     private func scheduleDuplicateRecompute() {
         duplicateRecomputeGeneration &+= 1
         let generation = duplicateRecomputeGeneration
         let snapshot = games
+        let ignored = notDuplicateKeys
+        if snapshot.isEmpty {
+            duplicateInfoByID = [:]
+            isDuplicateInfoComputing = false
+            return
+        }
+        // Pending “—” on every marker row until this generation finishes.
+        isDuplicateInfoComputing = true
         Task.detached(priority: .utility) {
-            let info = DuplicateDetector.analyze(snapshot)
+            let info = DuplicateDetector.analyze(snapshot, ignoredIdentityKeys: ignored)
             await MainActor.run {
                 guard generation == self.duplicateRecomputeGeneration else { return }
                 self.duplicateInfoByID = info
+                self.isDuplicateInfoComputing = false
             }
         }
+    }
+
+    private func loadNotDuplicateKeys(for volumeUUID: String) async {
+        notDuplicateKeys = (try? await VolumeStore.shared.notDuplicateKeys(for: volumeUUID)) ?? []
     }
 
     /// Load persisted visual sort for this card (default: newest slots first).
     func loadDisplaySort(for volumeUUID: String) async {
         displaySort = (try? await VolumeStore.shared.displaySort(for: volumeUUID))
             ?? .mostRecentFirst
+    }
+
+    /// Load last hashing throughput for instant ETA on “Compute Missing Hashes”.
+    private func loadCachedHashRate(for volumeUUID: String) async {
+        if let rate = try? await VolumeStore.shared.hashBytesPerSecond(for: volumeUUID),
+           rate.isFinite, rate > 0
+        {
+            cachedHashBytesPerSecond = rate
+        } else {
+            cachedHashBytesPerSecond = nil
+        }
     }
 
     /// Persist table column sort for the open card.
@@ -628,18 +999,20 @@ final class AppState {
         }
     }
 
-    /// Prefer saved choice, else detect from slot 01 name / IP.BIN, else GDmenu.
+    /// Prefer saved choice for picker; always set `bakedMenuKind` from what’s on the card.
     private func resolveMenuKind(for volumeUUID: String, games: [GameEntry]) async {
+        let detected = MenuRebuildService.detectMenuKind(games: games) ?? .gdMenu
+        bakedMenuKind = detected
         if let saved = try? await VolumeStore.shared.menuKind(for: volumeUUID) {
             menuKind = saved
-            return
+        } else {
+            menuKind = detected
+            // Remember detection so rebuild stays consistent even if name.txt is edited later.
+            try? await VolumeStore.shared.setMenuKind(menuKind, for: volumeUUID)
         }
-        menuKind = MenuRebuildService.detectMenuKind(games: games) ?? .gdMenu
-        // Remember detection so rebuild stays consistent even if name.txt is edited later.
-        try? await VolumeStore.shared.setMenuKind(menuKind, for: volumeUUID)
     }
 
-    /// User chose GDmenu vs openMenu (rebuild will bake that image).
+    /// User chose GDmenu vs openMenu. Rebuild only if type ≠ baked image or list is dirty.
     func setMenuKind(_ kind: MenuKind) {
         guard menuKind != kind else { return }
         menuKind = kind
@@ -648,9 +1021,16 @@ final class AppState {
                 try? await VolumeStore.shared.setMenuKind(kind, for: uuid)
             }
         }
-        if volume != nil, !games.isEmpty {
-            markMenuNeedsRebuild()
-            flash("Menu set to \(kind.displayName) — rebuild to apply (⇧⌘R)")
+        guard volume != nil, !games.isEmpty else { return }
+        if menuKind == bakedMenuKind {
+            // Restored the type already on the card — no type-mismatch rebuild.
+            if menuContentDirty {
+                flash("Menu set to \(kind.displayName) — list still needs rebuild (⌘S)")
+            } else {
+                flash("Menu set to \(kind.displayName)")
+            }
+        } else {
+            flash("Menu set to \(kind.displayName) — rebuild to apply (⌘S)")
         }
     }
 
@@ -679,6 +1059,14 @@ final class AppState {
         return false
     }
 
+    /// Refresh free-space chrome + hash-rate seed when re-selecting the open card.
+    private func refreshOpenVolumeChrome(for url: URL) async {
+        if let resolved = try? VolumeIdentity.resolve(rootURL: url) {
+            volume = resolved
+            await loadCachedHashRate(for: resolved.volumeUUID)
+        }
+    }
+
     func eject() async {
         guard let volume, !isBusy else { return }
         busyMessage = "Ejecting \(volume.volumeName)…"
@@ -692,7 +1080,8 @@ final class AppState {
             self.volume = nil
             games = []
             selection = []
-            menuNeedsRebuild = false
+            menuContentDirty = false
+            bakedMenuKind = .gdMenu
             menuKind = .gdMenu
             undoManager.removeAllActions()
             try await VolumeEject.eject(rootURL: root)
@@ -704,6 +1093,88 @@ final class AppState {
             lastError = error.localizedDescription
             statusText = "Eject failed"
             await open(url: root, preexistingBookmark: bookmarkData)
+        }
+    }
+
+    // MARK: - Import (add discs)
+
+    /// Pick disc images / game folders and copy them into the next free slots.
+    func addGames() {
+        guard canAddGames else { return }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.treatsFilePackagesAsDirectories = true
+        panel.message = "Select Dreamcast disc images or game folders (.gdi / .cdi / .ccd)"
+        panel.prompt = "Add to Card"
+        var types: [UTType] = [.folder]
+        for ext in ["gdi", "cdi", "ccd"] {
+            if let t = UTType(filenameExtension: ext) {
+                types.append(t)
+            }
+        }
+        panel.allowedContentTypes = types
+
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        Task { await importDiscURLs(panel.urls) }
+    }
+
+    func importDiscURLs(_ urls: [URL]) async {
+        guard canAddGames, let volume else { return }
+        let root = volume.rootURL
+        let snapshot = games
+        let progress = makeProgressHandler()
+
+        busyMessage = "Adding \(urls.count) disc\(urls.count == 1 ? "" : "s")…"
+        defer { busyMessage = nil }
+
+        do {
+            let result = try await Task.detached(priority: .userInitiated) {
+                try CardOperations.importDiscs(
+                    sources: urls,
+                    games: snapshot,
+                    rootURL: root,
+                    progress: progress
+                )
+            }.value
+
+            games = result.games
+            if let last = result.added.last {
+                selection = [last.id]
+                if scrollToNewRows {
+                    scrollTargetGameID = last.id
+                }
+            }
+            scheduleDuplicateRecompute()
+            markMenuNeedsRebuild()
+            refreshStatus()
+            invalidateCacheAsync()
+            // Free space may have changed after large copies.
+            if let resolved = try? VolumeIdentity.resolve(rootURL: root) {
+                self.volume = resolved
+            }
+
+            if result.added.isEmpty {
+                let reason = result.skipped.first?.reason ?? "Nothing to add"
+                lastError = reason
+                flash("No discs added")
+            } else {
+                let skipNote = result.skipped.isEmpty
+                    ? ""
+                    : " · \(result.skipped.count) skipped"
+                flash("Added \(result.added.count) game\(result.added.count == 1 ? "" : "s")\(skipNote)")
+                if !result.skipped.isEmpty {
+                    let detail = result.skipped
+                        .prefix(5)
+                        .map { "\($0.url.lastPathComponent): \($0.reason)" }
+                        .joined(separator: "\n")
+                    lastError = "Some items were skipped:\n\(detail)"
+                }
+            }
+        } catch {
+            lastError = error.localizedDescription
         }
     }
 
@@ -739,17 +1210,47 @@ final class AppState {
 
     /// Apply sentence case to every selected game (immediate writes).
     func sentenceCaseSelection() {
-        let targets = selectedGames
+        applyBulkRename(to: selectedGames, actionName: "Sentence Case") { $0.name.sentenceCasedTitle }
+    }
+
+    /// Auto-rename selection from IP.BIN / folder name / disc file name (GCM-style).
+    func autoRenameSelection(from source: AutoRenameSource) {
+        autoRename(ids: selection, from: source)
+    }
+
+    func autoRename(ids: Set<UUID>, from source: AutoRenameSource) {
+        let targets = games.filter { ids.contains($0.id) }
+        guard !targets.isEmpty, !isBusy else { return }
+
+        applyBulkRename(to: targets, actionName: source.menuTitle) { game in
+            source.suggestedName(for: game)
+        }
+    }
+
+    /// Shared path for sentence-case / auto-rename batches (undoable).
+    private func applyBulkRename(
+        to targets: [GameEntry],
+        actionName: String,
+        newName: (GameEntry) -> String?
+    ) {
         guard !targets.isEmpty, !isBusy else { return }
 
         var undos: [(UUID, String)] = []
+        var skipped = 0
         for game in targets {
-            let converted = game.name.sentenceCasedTitle
+            guard let converted = newName(game)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !converted.isEmpty
+            else {
+                skipped += 1
+                continue
+            }
             guard converted != game.name else { continue }
             guard let index = games.firstIndex(where: { $0.id == game.id }) else { continue }
             do {
                 let previous = try CardOperations.rename(game: games[index], to: converted)
                 games[index].name = converted
+                games[index].isMenu = GameEntry.isMenuName(converted) || games[index].number == 1
                 undos.append((game.id, previous))
             } catch {
                 lastError = error.localizedDescription
@@ -757,7 +1258,14 @@ final class AppState {
             }
         }
 
-        guard !undos.isEmpty else { return }
+        guard !undos.isEmpty else {
+            if skipped == targets.count {
+                flash("No names available from that source")
+            } else {
+                flash("Names already match")
+            }
+            return
+        }
         markMenuNeedsRebuild()
         refreshStatus()
         invalidateCacheAsync()
@@ -768,7 +1276,8 @@ final class AppState {
                 target.rename(id: id, to: previous)
             }
         }
-        undoManager.setActionName(undos.count == 1 ? "Sentence Case" : "Sentence Case \(undos.count) Games")
+        let label = undos.count == 1 ? actionName : "\(actionName) (\(undos.count))"
+        undoManager.setActionName(label)
     }
 
     func deleteSelected() {
@@ -955,19 +1464,27 @@ final class AppState {
     // MARK: - GDmenu list rebuild
 
     var canRebuildMenu: Bool {
-        volume != nil && !games.isEmpty && !isBusy
+        volume != nil && !games.isEmpty && !isBusy && !isHashing
     }
 
     func markMenuNeedsRebuild() {
-        menuNeedsRebuild = true
+        menuContentDirty = true
     }
 
+    /// After a successful bake: list matches disc and baked kind matches the picker.
     func clearMenuNeedsRebuild() {
-        menuNeedsRebuild = false
+        menuContentDirty = false
+        bakedMenuKind = menuKind
     }
 
     /// Rebuild the on-console GDmenu / openMenu image so the list matches current slots/names.
     func rebuildMenuList() {
+        guard canRebuildMenu || (isHandlingQuit && !isHashing && volume != nil && !games.isEmpty) else {
+            if isHashing {
+                flash("Stop hashing before rebuilding the menu")
+            }
+            return
+        }
         Task {
             _ = await rebuildMenuListAsync()
         }
@@ -977,6 +1494,12 @@ final class AppState {
     @discardableResult
     func rebuildMenuListAsync() async -> Bool {
         guard volume != nil, !games.isEmpty else { return false }
+        // Never contend with hashing for SD card I/O.
+        guard !isHashing else {
+            lastError = "Can’t rebuild the menu while content hashing is running."
+            flash("Stop hashing before rebuilding the menu")
+            return false
+        }
         // Allow quit-time rebuild even if `isBusy` was set by the quit handler.
         guard !isScanning else { return false }
         if busyMessage != nil, !isHandlingQuit { return false }
@@ -1016,11 +1539,12 @@ final class AppState {
                 games[idx].contentSHA256 = nil
             }
             menuKind = result.menuKind
+            bakedMenuKind = result.menuKind
+            menuContentDirty = false
             if let uuid = volume?.volumeUUID {
                 try? await VolumeStore.shared.setMenuKind(result.menuKind, for: uuid)
             }
 
-            clearMenuNeedsRebuild()
             refreshStatus()
             invalidateCacheAsync()
             flash("Rebuilt \(result.menuKind.displayName) · \(result.itemCount) items")
@@ -1040,11 +1564,24 @@ final class AppState {
             return .terminateNow
         }
 
-        // Don't interrupt in-flight card work unless we're only "busy" with nothing critical.
+        // Don't interrupt in-flight card work (rebuild, imports, …).
         if isBusy {
             let alert = NSAlert()
             alert.messageText = "Still working"
             alert.informativeText = busyMessage ?? "Wait for the current operation to finish, then quit again."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return .terminateCancel
+        }
+
+        // Hashing is not `isBusy` (UI stays usable) but still owns the card.
+        if isHashing {
+            let alert = NSAlert()
+            alert.messageText = "Hashing in progress"
+            alert.informativeText = isStoppingHashing
+                ? "Wait for the current file to finish, then quit again."
+                : "Stop hashing (or wait for it to finish) before quitting. Rebuilding the menu and hashing both use the SD card heavily."
             alert.alertStyle = .warning
             alert.addButton(withTitle: "OK")
             alert.runModal()
@@ -1138,7 +1675,9 @@ final class AppState {
             self.volume = nil
             games = []
             selection = []
-            menuNeedsRebuild = false
+            menuContentDirty = false
+            bakedMenuKind = .gdMenu
+            menuKind = .gdMenu
             undoManager.removeAllActions()
             try await VolumeEject.eject(rootURL: root)
         } catch {
@@ -1218,6 +1757,7 @@ final class AppState {
         isHashingActive = false
         hashingFolderPath = nil
         hashingProgress = nil
+        cachedHashBytesPerSecond = nil
         accessURL?.stopAccessingSecurityScopedResource()
         accessURL = nil
     }

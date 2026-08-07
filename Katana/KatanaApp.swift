@@ -30,16 +30,23 @@ struct KatanaApp: App {
                     state.undoManager.undo()
                 }
                 .keyboardShortcut("z", modifiers: .command)
-                .disabled(!state.undoManager.canUndo)
+                // While typing, leave ⌘Z to the field editor / system Edit menu.
+                .disabled(!state.undoManager.canUndo || state.isTextInputFocused)
 
                 Button("Redo") {
                     state.undoManager.redo()
                 }
                 .keyboardShortcut("z", modifiers: [.command, .shift])
-                .disabled(!state.undoManager.canRedo)
+                .disabled(!state.undoManager.canRedo || state.isTextInputFocused)
             }
 
             CommandMenu("Card") {
+                Button("Add Games…") {
+                    state.addGames()
+                }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+                .disabled(!state.canAddGames)
+
                 Button("Apply A–Z Order to Disc") {
                     state.sortAlphabetically()
                 }
@@ -49,9 +56,10 @@ struct KatanaApp: App {
                 Button("Rebuild Menu List…") {
                     state.rebuildMenuList()
                 }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
-                .disabled(!state.canRebuildMenu)
+                .keyboardShortcut("s", modifiers: .command)
+                .disabled(!state.canRebuildMenu || state.isTextInputFocused)
                 // Bakes LIST.INI (GDmenu) or OPENMENU.INI (openMenu) into slot 01.
+                // Disabled while hashing so rebuild and hash never contend for the card.
 
                 Menu("Menu Type") {
                     ForEach(MenuKind.allCases) { kind in
@@ -69,19 +77,30 @@ struct KatanaApp: App {
                 }
                 .disabled(state.volume == nil || state.isBusy)
 
+                Menu("Automatically Rename") {
+                    ForEach(AutoRenameSource.allCases) { source in
+                        Button(source.menuTitle) {
+                            state.autoRenameSelection(from: source)
+                        }
+                    }
+                }
+                .disabled(state.selection.isEmpty || state.isBusy)
+
                 Button(state.selection.count > 1
                        ? "Delete \(state.selection.count) Games"
                        : "Delete Selected") {
                     state.deleteSelected()
                 }
                 .keyboardShortcut(.delete, modifiers: [])
-                .disabled(!state.canDeleteSelection)
+                // ⌫ must delete characters in a text field, not games.
+                .disabled(!state.canDeleteSelection || state.isTextInputFocused)
 
                 Button("Select All") {
                     state.selection = Set(state.filteredGames.map(\.id))
                 }
                 .keyboardShortcut("a", modifiers: .command)
-                .disabled(state.games.isEmpty || state.isBusy)
+                // ⌘A must select field text, not every game row.
+                .disabled(state.games.isEmpty || state.isBusy || state.isTextInputFocused)
 
                 Button("Deselect All") {
                     state.selection = []
@@ -110,12 +129,29 @@ struct KatanaApp: App {
                 }
                 .disabled(state.redundantDuplicateCount == 0 || state.isBusy)
 
+                Button("Select Not-Duplicate Marks") {
+                    state.selectMarkedNotDuplicates()
+                }
+                .disabled(state.gamesMarkedNotDuplicate.isEmpty || state.isBusy)
+                .help("Select games marked “not a duplicate” on this card")
+
+                Button("Clear Not-Duplicate Marks") {
+                    state.clearAllNotDuplicateMarks()
+                }
+                .disabled(state.notDuplicateMarkCount == 0 || state.isBusy)
+                .help("Remove all not-a-duplicate marks for this card")
+
                 Divider()
 
                 Button("Compute Missing Hashes…") {
                     state.startContentHashing()
                 }
-                .disabled(state.volume == nil || state.isBusy || state.isHashing || state.unhashedGameCount == 0)
+                .disabled(!state.canStartHashing)
+                .help(
+                    state.isBusy
+                        ? "Wait for the current operation (e.g. menu rebuild) to finish before hashing."
+                        : "Background SHA-256 of disc payload; writes sidecars. Not available during menu rebuild."
+                )
 
                 Button(state.isStoppingHashing ? "Stopping…" : "Stop Hashing") {
                     state.stopContentHashing()
@@ -152,6 +188,11 @@ struct KatanaApp: App {
                 ))
                 .keyboardShortcut("d", modifiers: [.command, .option])
 
+                Toggle("Scroll to New Rows While Scanning", isOn: Binding(
+                    get: { state.scrollToNewRows },
+                    set: { state.scrollToNewRows = $0 }
+                ))
+
                 Toggle("Show Duplicates Only", isOn: Binding(
                     get: { state.showDuplicatesOnly },
                     set: { state.showDuplicatesOnly = $0 }
@@ -182,6 +223,14 @@ struct KatanaApp: App {
                     Text("Grade badges (Exact 1/2, …) on titles in the game list. Off by default.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
+
+                    Toggle("Scroll to new rows while scanning", isOn: Binding(
+                        get: { state.scrollToNewRows },
+                        set: { state.scrollToNewRows = $0 }
+                    ))
+                    Text("Follow each game as the table fills (and after Add). Off by default.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 }
                 Section("Card") {
                     Toggle("Eject SD card on quit", isOn: Binding(
@@ -208,7 +257,7 @@ struct KatanaApp: App {
                         .font(.callout)
                         .foregroundStyle(.secondary)
 
-                    Text("After renames or reordering, use Card → Rebuild Menu List (⇧⌘R) so the console menu matches the SD card. GDmenu and openMenu are both supported — pick the type above, then rebuild. Folder names and name.txt update immediately; the list is baked into slot 01.")
+                    Text("After renames or reordering, use Card → Rebuild Menu List (⌘S) so the console menu matches the SD card. GDmenu and openMenu are both supported — pick the type above, then rebuild. Folder names and name.txt update immediately; the list is baked into slot 01.")
                         .foregroundStyle(.secondary)
                     Text("On quit, if the menu is out of date you will be prompted to rebuild. Eject-on-quit is optional (Settings → Card).")
                         .foregroundStyle(.secondary)

@@ -6,9 +6,8 @@ enum MenuRebuildService: Sendable {
         case noVolume
         case noGames
         case noMenuFolder
-        case missingHelper
         case missingAssets
-        case helperFailed(String)
+        case bakeFailed(String)
         case installFailed(String)
 
         var errorDescription: String? {
@@ -16,9 +15,8 @@ enum MenuRebuildService: Sendable {
             case .noVolume: return "No SD card open."
             case .noGames: return "No games to put in the menu list."
             case .noMenuFolder: return "Menu folder (slot 01) not found on the card."
-            case .missingHelper: return "MenuGDIBuilder helper is missing from the app bundle."
             case .missingAssets: return "GDmenu / openMenu assets are missing from the app bundle."
-            case .helperFailed(let msg): return "Menu GDI build failed: \(msg)"
+            case .bakeFailed(let msg): return "Menu GDI build failed: \(msg)"
             case .installFailed(let msg): return "Could not install menu image: \(msg)"
             }
         }
@@ -53,27 +51,30 @@ enum MenuRebuildService: Sendable {
         let listText = MenuListGenerator.makeList(kind: kind, items: items)
         progress?("Building \(kind.displayName) image…")
 
-        let helper = try helperURL()
         let assets = try assetsURL(for: kind)
 
         let tempRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("dcgdsd-menu-\(UUID().uuidString)", isDirectory: true)
-        let listFile = tempRoot.appendingPathComponent(kind.listFileName)
         let outDir = tempRoot.appendingPathComponent("menu_gdi", isDirectory: true)
 
         defer { try? FileManager.default.removeItem(at: tempRoot) }
 
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
-        try listText.write(to: listFile, atomically: true, encoding: .utf8)
         try FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
 
-        try runHelper(
-            helper: helper,
-            kind: kind,
-            listFile: listFile,
-            assets: assets,
-            outDir: outDir
-        )
+        do {
+            try MenuGDIBake.build(
+                MenuGDIBake.Options(
+                    kind: kind,
+                    listText: listText,
+                    assetsRoot: assets,
+                    outDir: outDir,
+                    truncate: true
+                )
+            )
+        } catch {
+            throw RebuildError.bakeFailed(error.localizedDescription)
+        }
 
         progress?("Installing menu into slot 01…")
         let menuFolder = try installMenu(
@@ -122,20 +123,6 @@ enum MenuRebuildService: Sendable {
     }
 
     // MARK: - Bundle resources
-
-    nonisolated static func helperURL() throws -> URL {
-        // Bundle may flatten Resources/Helpers → Resources/MenuGDIBuilder.
-        let candidates: [URL?] = [
-            Bundle.main.url(forResource: "MenuGDIBuilder", withExtension: nil, subdirectory: "Helpers"),
-            Bundle.main.url(forResource: "MenuGDIBuilder", withExtension: nil),
-            Bundle.main.resourceURL?.appendingPathComponent("Helpers/MenuGDIBuilder"),
-            Bundle.main.resourceURL?.appendingPathComponent("MenuGDIBuilder"),
-        ]
-        for case let url? in candidates where FileManager.default.fileExists(atPath: url.path) {
-            return url
-        }
-        throw RebuildError.missingHelper
-    }
 
     /// Returns a directory shaped like `tools/gdMenu` (IP.BIN + menu_data + menu_gdi + menu_low_data).
     ///
@@ -193,7 +180,7 @@ enum MenuRebuildService: Sendable {
         proc.waitUntilExit()
         guard proc.terminationStatus == 0 else {
             let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "unzip failed"
-            throw RebuildError.helperFailed(msg)
+            throw RebuildError.bakeFailed(msg)
         }
         guard fm.fileExists(atPath: root.appendingPathComponent("IP.BIN").path) else {
             throw RebuildError.missingAssets
@@ -261,54 +248,6 @@ enum MenuRebuildService: Sendable {
         return root
     }
 
-    // MARK: - Helper process
-
-    nonisolated private static func runHelper(
-        helper: URL,
-        kind: MenuKind,
-        listFile: URL,
-        assets: URL,
-        outDir: URL
-    ) throws {
-        let proc = Process()
-        proc.executableURL = helper
-        proc.arguments = [
-            "--kind", kind == .gdMenu ? "gdMenu" : "openMenu",
-            "--list", listFile.path,
-            "--assets", assets.path,
-            "--out", outDir.path,
-            "--truncate", "true",
-        ]
-
-        let errPipe = Pipe()
-        let outPipe = Pipe()
-        proc.standardError = errPipe
-        proc.standardOutput = outPipe
-
-        // Ensure executable bit survives bundle copy.
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o755],
-            ofItemAtPath: helper.path
-        )
-
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-        } catch {
-            throw RebuildError.helperFailed(error.localizedDescription)
-        }
-
-        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
-        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-        let errText = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let outText = String(data: outData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        guard proc.terminationStatus == 0 else {
-            let msg = errText.isEmpty ? (outText.isEmpty ? "exit \(proc.terminationStatus)" : outText) : errText
-            throw RebuildError.helperFailed(msg)
-        }
-    }
-
     // MARK: - Install into slot 01
 
     nonisolated private static func installMenu(
@@ -331,7 +270,31 @@ enum MenuRebuildService: Sendable {
             try fm.createDirectory(at: menuFolder, withIntermediateDirectories: true)
         }
 
-        // Remove old image payload (keep name.txt / serial.txt / hashes).
+        let built = try fm.contentsOfDirectory(
+            at: builtGDI,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ).filter { url in
+            (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+                && !url.lastPathComponent.hasPrefix(".")
+        }
+        guard built.contains(where: { $0.lastPathComponent.lowercased() == "disc.gdi" }) else {
+            throw RebuildError.installFailed("Builder did not produce disc.gdi")
+        }
+        // Basic sanity: every track listed in disc.gdi must exist and be non-empty.
+        try validateBuiltMenu(builtGDI: builtGDI, files: built)
+
+        // Stage onto the same volume first — never wipe slot 01 until the new set is complete.
+        let stageRoot = rootURL
+            .appendingPathComponent(".dcgdsd-tmp", isDirectory: true)
+            .appendingPathComponent("menu-stage-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: stageRoot, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: stageRoot.deletingLastPathComponent()) }
+
+        for src in built {
+            try fm.copyItem(at: src, to: stageRoot.appendingPathComponent(src.lastPathComponent))
+        }
+
         let keepNames: Set<String> = [
             "name.txt", "serial.txt", "hash.dcgdsd",
             "info.txt", "0gdtex.pvr", "0GDTEX.PVR",
@@ -358,23 +321,50 @@ enum MenuRebuildService: Sendable {
             }
         }
 
-        // Copy new tracks + disc.gdi
-        let built = try fm.contentsOfDirectory(
-            at: builtGDI,
+        let staged = try fm.contentsOfDirectory(
+            at: stageRoot,
             includingPropertiesForKeys: nil,
             options: [.skipsHiddenFiles]
         )
-        guard built.contains(where: { $0.lastPathComponent.lowercased() == "disc.gdi" }) else {
-            throw RebuildError.installFailed("Builder did not produce disc.gdi")
-        }
-        for src in built {
+        for src in staged {
             let dest = menuFolder.appendingPathComponent(src.lastPathComponent)
             if fm.fileExists(atPath: dest.path) {
                 try fm.removeItem(at: dest)
             }
-            try fm.copyItem(at: src, to: dest)
+            try fm.moveItem(at: src, to: dest)
         }
 
         return menuFolder
+    }
+
+    /// Ensure disc.gdi references present, non-empty track files before touching slot 01.
+    nonisolated private static func validateBuiltMenu(builtGDI: URL, files: [URL]) throws {
+        let fm = FileManager.default
+        let gdiURL = builtGDI.appendingPathComponent("disc.gdi")
+        let text = try String(contentsOf: gdiURL, encoding: .utf8)
+        let names = Set(files.map { $0.lastPathComponent })
+        for line in text.split(whereSeparator: \.isNewline) {
+            let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+            // track lines: N LBA type sectorSize filename offset
+            guard parts.count >= 5, Int(parts[0]) != nil else { continue }
+            let fileName = parts[4]
+            guard names.contains(fileName) else {
+                throw RebuildError.installFailed("Built menu missing \(fileName) listed in disc.gdi")
+            }
+            let url = builtGDI.appendingPathComponent(fileName)
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            guard size > 0 else {
+                throw RebuildError.installFailed("Built menu file \(fileName) is empty")
+            }
+        }
+        // High-density data track must exist for a usable menu.
+        let hasDataTrack = files.contains {
+            let n = $0.lastPathComponent.lowercased()
+            return n.hasPrefix("track") && n.hasSuffix(".iso") && n != "track01.iso"
+        }
+        guard hasDataTrack else {
+            throw RebuildError.installFailed("Built menu has no high-density data track")
+        }
+        _ = fm
     }
 }

@@ -25,6 +25,17 @@ struct CardScannerIntegrationTests {
         #expect(second.cacheHits == second.entries.count)
         #expect(second.durationMilliseconds <= first.durationMilliseconds + 5_000)
 
+        // Snapshot path (recent reopen): folder set match → no per-folder I/O.
+        let snap = try await CardScanner.loadSnapshotIfValid(rootURL: url)
+        #expect(snap != nil)
+        #expect(snap?.entries.count == first.entries.count)
+        #expect(snap?.cacheMisses == 0)
+        #expect((snap?.durationMilliseconds ?? 9_999) < first.durationMilliseconds)
+
+        // Force full rescan ignores snapshot preference still works via preferSnapshotCache: false
+        let forced = try await CardScanner.scan(rootURL: url, preferSnapshotCache: false)
+        #expect(forced.entries.count == first.entries.count)
+
         // Spot-check known titles from this card.
         let names = Set(second.entries.map(\.name))
         #expect(names.contains("GDMENU") || names.contains { $0.localizedCaseInsensitiveContains("menu") })
@@ -47,6 +58,11 @@ struct CardScannerIntegrationTests {
         #expect(result.entries[1].format == .cdi)
         #expect(result.entries[2].format == .gdi)
         #expect(result.entries[1].serial == "MK-51000")
+
+        // Second open uses snapshot when folder set is unchanged.
+        let snap = try await CardScanner.loadSnapshotIfValid(rootURL: root)
+        #expect(snap?.entries.count == 3)
+        #expect(snap?.entries.map(\.name) == result.entries.map(\.name))
     }
 
     private func makeGameFolder(at url: URL, name: String, serial: String, image: String) throws {

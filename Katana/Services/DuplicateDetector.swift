@@ -77,6 +77,24 @@ nonisolated struct DuplicateInfo: Hashable, Sendable {
     }
 }
 
+/// Stable “this is not a duplicate” identity for a game on a card.
+/// Prefer content hash; fall back to folder + serial + name + size so marks survive rescan.
+enum DuplicateIdentity: Sendable {
+    /// Key stored per volume UUID in `VolumeStore`.
+    nonisolated static func key(for game: GameEntry) -> String {
+        if let hash = game.contentSHA256?.lowercased(), hash.count >= 16 {
+            return "h:\(hash)"
+        }
+        let folder = URL(fileURLWithPath: game.folderPath).lastPathComponent
+        let serial = game.serial.uppercased().filter { $0.isLetter || $0.isNumber }
+        let name = game.name
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let size = game.payloadByteSize > 0 ? game.payloadByteSize : game.byteSize
+        return "f:\(folder)|s:\(serial)|n:\(name)|z:\(size)"
+    }
+}
+
 // MARK: - Detector
 
 enum DuplicateDetector {
@@ -92,9 +110,17 @@ enum DuplicateDetector {
     nonisolated static let weakSerialFrequency: Int = 4
 
     /// Build per-game duplicate info. Menu entries are never flagged.
+    /// - Parameter ignoredIdentityKeys: Per-card “not a duplicate” marks (see `DuplicateIdentity`).
     /// Safe to call off the main actor (O(n²) pair checks).
-    nonisolated static func analyze(_ games: [GameEntry]) -> [GameEntry.ID: DuplicateInfo] {
-        let candidates = games.filter { !$0.isMenu }
+    nonisolated static func analyze(
+        _ games: [GameEntry],
+        ignoredIdentityKeys: Set<String> = []
+    ) -> [GameEntry.ID: DuplicateInfo] {
+        let candidates = games.filter { game in
+            guard !game.isMenu else { return false }
+            if ignoredIdentityKeys.isEmpty { return true }
+            return !ignoredIdentityKeys.contains(DuplicateIdentity.key(for: game))
+        }
         guard candidates.count >= 2 else { return [:] }
 
         let serialFreq = serialFrequency(candidates)
@@ -176,28 +202,41 @@ enum DuplicateDetector {
         return result
     }
 
-    nonisolated static func redundantIDs(in games: [GameEntry]) -> Set<GameEntry.ID> {
-        Set(analyze(games).compactMap { id, info in info.isRedundant ? id : nil })
+    nonisolated static func redundantIDs(
+        in games: [GameEntry],
+        ignoredIdentityKeys: Set<String> = []
+    ) -> Set<GameEntry.ID> {
+        Set(
+            analyze(games, ignoredIdentityKeys: ignoredIdentityKeys)
+                .compactMap { id, info in info.isRedundant ? id : nil }
+        )
     }
 
     /// Prefer deleting exact/strong extras first.
     nonisolated static func redundantIDs(
         in games: [GameEntry],
-        minimumGrade: DuplicateGrade
+        minimumGrade: DuplicateGrade,
+        ignoredIdentityKeys: Set<String> = []
     ) -> Set<GameEntry.ID> {
         Set(
-            analyze(games).compactMap { id, info in
+            analyze(games, ignoredIdentityKeys: ignoredIdentityKeys).compactMap { id, info in
                 (info.isRedundant && info.grade >= minimumGrade) ? id : nil
             }
         )
     }
 
-    nonisolated static func allDuplicateIDs(in games: [GameEntry]) -> Set<GameEntry.ID> {
-        Set(analyze(games).keys)
+    nonisolated static func allDuplicateIDs(
+        in games: [GameEntry],
+        ignoredIdentityKeys: Set<String> = []
+    ) -> Set<GameEntry.ID> {
+        Set(analyze(games, ignoredIdentityKeys: ignoredIdentityKeys).keys)
     }
 
-    nonisolated static func groupCount(in games: [GameEntry]) -> Int {
-        Set(analyze(games).values.map(\.groupKey)).count
+    nonisolated static func groupCount(
+        in games: [GameEntry],
+        ignoredIdentityKeys: Set<String> = []
+    ) -> Int {
+        Set(analyze(games, ignoredIdentityKeys: ignoredIdentityKeys).values.map(\.groupKey)).count
     }
 
     // MARK: - Pair match

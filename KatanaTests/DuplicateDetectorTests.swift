@@ -67,6 +67,14 @@ struct DuplicateDetectorTests {
         #expect(map.isEmpty)
     }
 
+    @Test func ignoredIdentityKeysExcludedFromGroups() {
+        let a = entry(number: 2, name: "Sonic Adventure", serial: "T-9708N", size: 500_000_000)
+        let b = entry(number: 5, name: "Sonic Adventure", serial: "T9708N", size: 500_000_000)
+        let ignored = Set([DuplicateIdentity.key(for: b)])
+        let map = DuplicateDetector.analyze([a, b], ignoredIdentityKeys: ignored)
+        #expect(map.isEmpty)
+    }
+
     @Test func redundantIDsKeepsLowestSlot() {
         let a = entry(number: 10, name: "Game", serial: "T0001", size: 200_000_000)
         let b = entry(number: 3, name: "Game", serial: "T0001", size: 200_000_000)

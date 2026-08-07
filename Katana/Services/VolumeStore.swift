@@ -20,17 +20,25 @@ private struct VolumePreferences: Codable, Sendable {
     var displaySortByVolume: [String: DisplaySortPreference]
     /// Per-volume GDmenu vs openMenu preference (rebuild target).
     var menuKindByVolume: [String: MenuKind]
+    /// Last measured content-hash throughput (bytes/sec) per volume — seeds ETA on next run.
+    var hashBytesPerSecondByVolume: [String: Double]
+    /// Per-volume “not a duplicate” identity keys (`DuplicateIdentity.key`).
+    var notDuplicateKeysByVolume: [String: [String]]
 
     init(
         lastVolumeUUID: String?,
         recents: [RememberedVolume],
         displaySortByVolume: [String: DisplaySortPreference],
-        menuKindByVolume: [String: MenuKind] = [:]
+        menuKindByVolume: [String: MenuKind] = [:],
+        hashBytesPerSecondByVolume: [String: Double] = [:],
+        notDuplicateKeysByVolume: [String: [String]] = [:]
     ) {
         self.lastVolumeUUID = lastVolumeUUID
         self.recents = recents
         self.displaySortByVolume = displaySortByVolume
         self.menuKindByVolume = menuKindByVolume
+        self.hashBytesPerSecondByVolume = hashBytesPerSecondByVolume
+        self.notDuplicateKeysByVolume = notDuplicateKeysByVolume
     }
 
     init(from decoder: Decoder) throws {
@@ -44,6 +52,14 @@ private struct VolumePreferences: Codable, Sendable {
         menuKindByVolume = try c.decodeIfPresent(
             [String: MenuKind].self,
             forKey: .menuKindByVolume
+        ) ?? [:]
+        hashBytesPerSecondByVolume = try c.decodeIfPresent(
+            [String: Double].self,
+            forKey: .hashBytesPerSecondByVolume
+        ) ?? [:]
+        notDuplicateKeysByVolume = try c.decodeIfPresent(
+            [String: [String]].self,
+            forKey: .notDuplicateKeysByVolume
         ) ?? [:]
     }
 }
@@ -76,7 +92,9 @@ actor VolumeStore {
         lastVolumeUUID: nil,
         recents: [],
         displaySortByVolume: [:],
-        menuKindByVolume: [:]
+        menuKindByVolume: [:],
+        hashBytesPerSecondByVolume: [:],
+        notDuplicateKeysByVolume: [:]
     )
     private var loaded = false
 
@@ -130,6 +148,55 @@ actor VolumeStore {
         try save()
     }
 
+    /// Last measured hashing throughput for a card (bytes per second), if any.
+    func hashBytesPerSecond(for volumeUUID: String) throws -> Double? {
+        try ensureLoaded()
+        return prefs.hashBytesPerSecondByVolume[volumeUUID]
+    }
+
+    func setHashBytesPerSecond(_ bytesPerSecond: Double, for volumeUUID: String) throws {
+        try ensureLoaded()
+        guard bytesPerSecond.isFinite, bytesPerSecond > 0 else { return }
+        prefs.hashBytesPerSecondByVolume[volumeUUID] = bytesPerSecond
+        try save()
+    }
+
+    /// Identity keys the user marked “not a duplicate” on this card.
+    func notDuplicateKeys(for volumeUUID: String) throws -> Set<String> {
+        try ensureLoaded()
+        return Set(prefs.notDuplicateKeysByVolume[volumeUUID] ?? [])
+    }
+
+    func setNotDuplicateKeys(_ keys: Set<String>, for volumeUUID: String) throws {
+        try ensureLoaded()
+        if keys.isEmpty {
+            prefs.notDuplicateKeysByVolume.removeValue(forKey: volumeUUID)
+        } else {
+            prefs.notDuplicateKeysByVolume[volumeUUID] = keys.sorted()
+        }
+        try save()
+    }
+
+    func addNotDuplicateKey(_ key: String, for volumeUUID: String) throws {
+        try ensureLoaded()
+        var set = Set(prefs.notDuplicateKeysByVolume[volumeUUID] ?? [])
+        set.insert(key)
+        prefs.notDuplicateKeysByVolume[volumeUUID] = set.sorted()
+        try save()
+    }
+
+    func removeNotDuplicateKey(_ key: String, for volumeUUID: String) throws {
+        try ensureLoaded()
+        var set = Set(prefs.notDuplicateKeysByVolume[volumeUUID] ?? [])
+        set.remove(key)
+        if set.isEmpty {
+            prefs.notDuplicateKeysByVolume.removeValue(forKey: volumeUUID)
+        } else {
+            prefs.notDuplicateKeysByVolume[volumeUUID] = set.sorted()
+        }
+        try save()
+    }
+
     /// Record a successful open. Creates a security-scoped bookmark when possible.
     func remember(
         volume: CardVolume,
@@ -174,6 +241,10 @@ actor VolumeStore {
     func forget(uuid: String) throws {
         try ensureLoaded()
         prefs.recents.removeAll { $0.volumeUUID == uuid }
+        prefs.displaySortByVolume.removeValue(forKey: uuid)
+        prefs.menuKindByVolume.removeValue(forKey: uuid)
+        prefs.hashBytesPerSecondByVolume.removeValue(forKey: uuid)
+        prefs.notDuplicateKeysByVolume.removeValue(forKey: uuid)
         if prefs.lastVolumeUUID == uuid {
             prefs.lastVolumeUUID = prefs.recents.first?.volumeUUID
         }

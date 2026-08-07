@@ -77,12 +77,19 @@ struct SidebarView: View {
 
                 if let free = volume.freeBytes, let total = volume.totalBytes, total > 0 {
                     let used = total - free
+                    let freeFraction = Double(free) / Double(total)
+                    // Free space left: green until 25%, amber until 10%, then red.
+                    let capacityColor: Color = {
+                        if freeFraction <= 0.10 { return .red }
+                        if freeFraction <= 0.25 { return .orange }
+                        return .green
+                    }()
                     VStack(alignment: .leading, spacing: 4) {
                         ProgressView(value: Double(used), total: Double(total))
+                            .tint(capacityColor)
                         Text("\(ByteCount.string(for: free)) free of \(ByteCount.string(for: total))")
-                            .font(.callout)
+                            .font(.callout.monospacedDigit())
                             .foregroundStyle(.secondary)
-                            .monospacedDigit()
                             .frame(maxWidth: .infinity)
                             .multilineTextAlignment(.center)
                     }
@@ -106,11 +113,7 @@ struct SidebarView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .disabled(state.isBusy)
-                .help("Console menu baked into slot 01. Switch and rebuild (⇧⌘R) to convert.")
-
-                if state.isScanning, let progress = state.scanProgress, progress.total > 0 {
-                    ProgressView(value: Double(progress.completed), total: Double(progress.total))
-                }
+                .help("Console menu baked into slot 01. Switch and rebuild (⌘S) to convert.")
 
                 Button {
                     Task { await state.eject() }
@@ -223,44 +226,50 @@ struct SidebarView: View {
                     .multilineTextAlignment(.center)
             }
 
+            if state.notDuplicateMarkCount > 0 {
+                metricRow(
+                    "Ignored",
+                    value: "\(state.notDuplicateMarkCount)",
+                    valueColor: .secondary
+                )
+            }
+
             metricRow("Unhashed", value: "\(state.unhashedGameCount)")
 
             if state.isHashing {
-                HStack(alignment: .top, spacing: 8) {
-                    ProgressView()
-                        .controlSize(.small)
-                        .padding(.top, 1)
-                    Text(state.hashingStatusText)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .help(state.hashingProgress.map { progress in
-                    var lines = ["\(progress.completedCount) of \(progress.totalCount) hashed"]
-                    if progress.hashedBytes > 0 {
-                        lines.append("\(ByteCount.string(for: progress.hashedBytes)) hashed")
+                // Spindle-style: compact “X of Y — time remaining” + % , linear bar, Stop.
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(state.hashingProgressLabel)
+                            .font(.callout.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.85)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if !state.hashingPercentLabel.isEmpty {
+                            Text(state.hashingPercentLabel)
+                                .font(.callout.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .fixedSize()
+                        }
                     }
-                    if progress.remainingBytes > 0 {
-                        lines.append("\(ByteCount.string(for: progress.remainingBytes)) remaining")
-                    }
-                    if let bps = progress.bytesPerSecond {
-                        lines.append(ByteCount.throughput(bytesPerSecond: bps))
-                    }
-                    if let eta = progress.etaSeconds {
-                        lines.append("ETA \(ByteCount.etaString(seconds: eta))")
-                    }
-                    return lines.joined(separator: "\n")
-                } ?? "Hashing disc content")
 
-                Button {
-                    state.stopContentHashing()
-                } label: {
-                    Text(state.isStoppingHashing ? "Stopping…" : "Stop Hashing")
-                        .frame(maxWidth: .infinity)
+                    HStack(spacing: 8) {
+                        ProgressView(value: state.hashingFraction)
+                            .progressViewStyle(.linear)
+                            .animation(.linear(duration: 0.25), value: state.hashingFraction)
+
+                        Button(role: .destructive) {
+                            state.stopContentHashing()
+                        } label: {
+                            Text(state.isStoppingHashing ? "…" : "Stop")
+                                .frame(minWidth: 44)
+                        }
+                        .disabled(!state.canStopHashing)
+                        .fixedSize()
+                    }
                 }
-                .disabled(!state.canStopHashing)
+                .help(state.hashingHelpText)
             } else {
                 Button {
                     state.startContentHashing()
@@ -268,8 +277,12 @@ struct SidebarView: View {
                     Text("Compute Missing Hashes…")
                         .frame(maxWidth: .infinity)
                 }
-                .disabled(state.isBusy || state.isHashing || state.unhashedGameCount == 0)
-                .help("Background SHA-256; writes sidecars. Never automatic.")
+                .disabled(!state.canStartHashing)
+                .help(
+                    state.isBusy
+                        ? "Wait for the current operation (e.g. menu rebuild) to finish before hashing."
+                        : "Background SHA-256; writes sidecars. Not available during menu rebuild."
+                )
             }
 
             Toggle("Show duplicate markers", isOn: $state.showDuplicateMarkers)
@@ -305,6 +318,28 @@ struct SidebarView: View {
                     .disabled(state.isBusy || state.redundantDuplicateCount == 0)
                     .help("Every non-primary copy in any group")
                 }
+
+                if state.notDuplicateMarkCount > 0 {
+                    HStack(spacing: 8) {
+                        Button {
+                            state.selectMarkedNotDuplicates()
+                        } label: {
+                            Text("Select Ignored")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .disabled(state.isBusy || state.gamesMarkedNotDuplicate.isEmpty)
+                        .help("Select games marked “not a duplicate” on this card")
+
+                        Button {
+                            state.clearAllNotDuplicateMarks()
+                        } label: {
+                            Text("Clear Ignored")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .disabled(state.isBusy)
+                        .help("Remove all not-a-duplicate marks for this card")
+                    }
+                }
             }
         }
         .padding(.horizontal, 16)
@@ -318,9 +353,8 @@ struct SidebarView: View {
         VStack(alignment: .leading, spacing: 10) {
             sectionHeader("Last Scan")
             Text(stats)
-                .font(.callout)
+                .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .monospacedDigit()
                 .frame(maxWidth: .infinity)
                 .multilineTextAlignment(.center)
         }
@@ -341,8 +375,8 @@ struct SidebarView: View {
                 .multilineTextAlignment(.center)
             Text(
                 state.menuNeedsRebuild
-                    ? "\(state.menuKind.displayName) list is out of date — Rebuild Menu (⇧⌘R), or you’ll be asked on quit."
-                    : "Rebuild Menu (⇧⌘R) updates \(state.menuKind.displayName) in slot 01."
+                    ? "\(state.menuKind.displayName) list is out of date — Rebuild Menu (⌘S), or you’ll be asked on quit."
+                    : "Rebuild Menu (⌘S) updates \(state.menuKind.displayName) in slot 01."
             )
                 .font(.callout)
                 .foregroundStyle(state.menuNeedsRebuild ? Color.orange : Color.secondary.opacity(0.8))
@@ -382,6 +416,7 @@ struct SidebarView: View {
                 .font(.body.monospacedDigit())
                 .foregroundStyle(valueColor)
                 .lineLimit(1)
+                .numericText()
         }
     }
 }

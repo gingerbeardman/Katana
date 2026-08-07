@@ -9,6 +9,8 @@ nonisolated struct IpBinInfo: Hashable, Sendable, Codable {
     var vga: Bool
     var version: String
     var releaseDate: String
+    /// 4-char header CRC field at IP.BIN 0x20 (shown in GCM as “CRC: B0F4”).
+    var crc: String = ""
     var isCodeBreaker: Bool
 
     static let menuDefaults = IpBinInfo(
@@ -35,9 +37,20 @@ nonisolated struct IpBinInfo: Hashable, Sendable, Codable {
             isCodeBreaker: false
         )
     }
+
+    /// One-line summary matching GCM’s Info window.
+    var detailSummary: String {
+        var lines: [String] = [name]
+        let vgaMark = vga ? "   VGA" : ""
+        lines.append("\(version)   DISC \(disc)\(vgaMark)")
+        let crcPart = crc.isEmpty ? "—" : crc
+        let product = productNumber.isEmpty ? "—" : productNumber
+        lines.append("CRC: \(crcPart)   Product: \(product)")
+        return lines.joined(separator: "\n")
+    }
 }
 
-enum MenuKind: String, Sendable, Codable, CaseIterable, Identifiable {
+nonisolated enum MenuKind: String, Sendable, Codable, CaseIterable, Identifiable {
     case gdMenu
     case openMenu
 

@@ -10,7 +10,7 @@ struct GameRowView: View {
         HStack(spacing: 12) {
             HStack(spacing: 4) {
                 Text(FolderNumbering.format(game.number, maxNumber: maxNumber))
-                    .font(.system(.body, design: .monospaced))
+                    .font(.body.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .frame(minWidth: 28, alignment: .trailing)
                 if isHashing {
@@ -25,22 +25,26 @@ struct GameRowView: View {
                     Text(game.name)
                         .fontWeight(game.isMenu ? .semibold : .regular)
                         .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     if game.isMenu {
                         Text("MENU")
                             .font(.caption2.weight(.bold))
                             .padding(.horizontal, 5)
                             .padding(.vertical, 1)
-                            .background(.blue.opacity(0.15), in: Capsule())
-                            .foregroundStyle(.blue)
+                            .background(Color.secondary.opacity(0.14), in: Capsule())
+                            .foregroundStyle(.secondary)
+                            .layoutPriority(1)
                     }
                     // Caller passes `duplicate` only when markers are enabled.
                     if let duplicate {
                         DuplicateBadge(info: duplicate)
+                            .layoutPriority(1)
                     }
                 }
                 if !game.serial.isEmpty {
                     Text(game.serial)
-                        .font(.caption)
+                        .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
@@ -59,26 +63,52 @@ struct GameRowView: View {
     }
 }
 
-struct DuplicateBadge: View {
-    let info: DuplicateInfo
+/// List badge for duplicate markers (ready grade, or pending “—” while analysing).
+enum DuplicateListBadge: Equatable {
+    case pending
+    case ready(DuplicateInfo)
+}
 
-    var body: some View {
-        Text("\(info.grade.shortLabel) \(info.indexInGroup)/\(info.groupSize)")
-            .font(.caption2.weight(.bold))
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
-            .background(color.opacity(0.18), in: Capsule())
-            .foregroundStyle(color)
-            .help(helpText)
+struct DuplicateBadge: View {
+    let badge: DuplicateListBadge
+
+    init(_ badge: DuplicateListBadge) {
+        self.badge = badge
     }
 
-    private var helpText: String {
+    /// Convenience for call sites that already have a resolved `DuplicateInfo`.
+    init(info: DuplicateInfo) {
+        self.badge = .ready(info)
+    }
+
+    var body: some View {
+        switch badge {
+        case .pending:
+            Text("—")
+                .font(.caption2.weight(.bold).monospacedDigit())
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Color.secondary.opacity(0.12), in: Capsule())
+                .foregroundStyle(.tertiary)
+                .help("Detecting duplicates…")
+        case .ready(let info):
+            Text("\(info.grade.shortLabel) \(info.indexInGroup)/\(info.groupSize)")
+                .font(.caption2.weight(.bold).monospacedDigit())
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(color(for: info).opacity(0.18), in: Capsule())
+                .foregroundStyle(color(for: info))
+                .help(helpText(for: info))
+        }
+    }
+
+    private func helpText(for info: DuplicateInfo) -> String {
         let signals = info.signals.map { "\($0.kind.rawValue): \($0.detail)" }.joined(separator: ", ")
         let role = info.isPrimary ? "keep (lowest slot)" : "extra"
         return "\(info.grade.label) · \(role) · \(signals)"
     }
 
-    private var color: Color {
+    private func color(for info: DuplicateInfo) -> Color {
         switch info.grade {
         case .exact:
             return info.isPrimary ? .purple : .pink

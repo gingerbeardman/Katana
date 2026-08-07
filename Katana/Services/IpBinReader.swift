@@ -148,6 +148,8 @@ enum IpBinReader: Sendable {
         let name = field(ipData, 0x80, 128)
         let media = field(ipData, 0x25, 6) // "GD-ROM" / "FCD   " etc.
         let boot = field(ipData, 0x60, 12)
+        // Device / CRC field (4 chars) immediately before media at 0x20 — GCM shows this as “CRC”.
+        let crc = field(ipData, 0x20, 4)
 
         let isCodeBreaker = media.hasPrefix("FCD")
             && releaseDate == "20000627"
@@ -164,6 +166,7 @@ enum IpBinReader: Sendable {
             vga: vga,
             version: version.isEmpty ? "V1.000" : version,
             releaseDate: releaseDate.isEmpty ? "19990909" : releaseDate,
+            crc: crc,
             isCodeBreaker: isCodeBreaker
         )
     }

@@ -13,15 +13,23 @@ struct ScanResult: Sendable {
 ///
 /// Initial scan is intentionally **lazy**:
 /// - Lists file *names*, finds the disc image, reads `name.txt` / `serial.txt`, stats the image only.
+/// - No IP.BIN open on the fast path (name.txt / serial.txt + GameDB is enough for first paint).
 /// - Folder/payload sizes and hash sidecars load afterward via `loadFolderDetails`.
 enum CardScanner: Sendable {
     private nonisolated static let nameFile = "name.txt"
     private nonisolated static let serialFile = "serial.txt"
     private nonisolated static let preferredImageNames = ["disc.gdi", "disc.cdi", "disc.ccd"]
 
+    /// How many folders to deliver to the UI in one MainActor hop (avoids 1-hop-per-row thrash).
+    private nonisolated static let progressBatchSize = 24
+
+    /// Concurrent folder workers. Moderate on purpose — FAT/exFAT SD hates high fan-out.
+    private nonisolated static let defaultMaxConcurrent = 8
+
     /// Progress event for live table fill (always off the main actor).
     struct ProgressEvent: Sendable {
-        var entry: GameEntry
+        /// One or more entries to insert (same batch → one UI update).
+        var entries: [GameEntry]
         var completed: Int
         var total: Int
     }
@@ -34,53 +42,90 @@ enum CardScanner: Sendable {
     }
 
     /// Scan a GDEMU card root. Safe to call from any isolation domain.
-    /// - Parameter onProgress: Invoked as each folder is identified (any order; UI should insert by slot).
+    /// - Parameter preferSnapshotCache: When true (default), if a saved `CardCache` for this volume
+    ///   lists the exact same slot folders as the live card, return that snapshot without per-folder I/O.
+    ///   Pass false for Rescan / Clear Cache so fingerprints and names are refreshed from disk.
+    /// - Parameter onProgress: Invoked in batches as folders are identified (UI should insert by slot).
     nonisolated static func scan(
         rootURL: URL,
-        maxConcurrent: Int = 16,
+        maxConcurrent: Int = defaultMaxConcurrent,
+        preferSnapshotCache: Bool = true,
         onProgress: (@Sendable (ProgressEvent) async -> Void)? = nil
     ) async throws -> ScanResult {
-        // Entire scan body is nonisolated; hop to the cache actor only for load/save.
-        try await Task.detached(priority: .userInitiated) {
-            try await performScan(
-                rootURL: rootURL,
-                maxConcurrent: maxConcurrent,
-                onProgress: onProgress
-            )
-        }.value
+        try await performScan(
+            rootURL: rootURL,
+            maxConcurrent: maxConcurrent,
+            preferSnapshotCache: preferSnapshotCache,
+            onProgress: onProgress
+        )
+    }
+
+    /// Load a previously saved card cache if the live slot-folder set still matches.
+    /// Used for recent-card reopen — one root directory listing, no per-game stats.
+    nonisolated static func loadSnapshotIfValid(rootURL: URL) async throws -> ScanResult? {
+        let started = Date()
+        let volume = try VolumeIdentity.resolve(rootURL: rootURL)
+        guard let cache = try? await CardCacheStore.shared.load(volumeUUID: volume.volumeUUID),
+              !cache.entries.isEmpty
+        else { return nil }
+
+        let liveFolders = try numberedFolderNames(at: rootURL)
+        let cachedFolders = Set(cache.entries.map(\.fingerprint.folderName))
+        guard liveFolders == cachedFolders else { return nil }
+
+        let entries: [GameEntry] = cache.entries.compactMap { cached in
+            var entry = cached.entry
+            let folderName = cached.fingerprint.folderName
+            guard let number = FolderNumbering.parse(folderName) else { return nil }
+            entry.number = number
+            entry.folderPath = rootURL.appendingPathComponent(folderName, isDirectory: true).path
+            // Snapshot rows are treated as fully loaded when sizes/hash were cached.
+            if entry.byteSize > 0 {
+                entry.detailsLoaded = true
+            }
+            return entry
+        }
+        .sorted { $0.number < $1.number }
+
+        guard entries.count == liveFolders.count, !entries.isEmpty else { return nil }
+
+        let ms = Int(Date().timeIntervalSince(started) * 1000)
+        return ScanResult(
+            volume: volume,
+            entries: entries,
+            cacheHits: entries.count,
+            cacheMisses: 0,
+            durationMilliseconds: ms
+        )
     }
 
     private nonisolated static func performScan(
         rootURL: URL,
         maxConcurrent: Int,
+        preferSnapshotCache: Bool,
         onProgress: (@Sendable (ProgressEvent) async -> Void)?
     ) async throws -> ScanResult {
         let started = Date()
         let volume = try VolumeIdentity.resolve(rootURL: rootURL)
         let fm = FileManager.default
 
+        if preferSnapshotCache,
+           let snapshot = try await loadSnapshotIfValid(rootURL: rootURL)
+        {
+            return snapshot
+        }
+
         let cached = try? await CardCacheStore.shared.load(volumeUUID: volume.volumeUUID)
+        // uniquingKeysWith: corrupt caches may repeat folder names after partial renumbers.
         let cacheByFolder: [String: CachedEntry] = {
             guard let cached else { return [:] }
-            return Dictionary(uniqueKeysWithValues: cached.entries.map { ($0.fingerprint.folderName, $0) })
+            return Dictionary(
+                cached.entries.map { ($0.fingerprint.folderName, $0) },
+                uniquingKeysWith: { _, last in last }
+            )
         }()
 
-        let children = try fm.contentsOfDirectory(
-            at: rootURL,
-            includingPropertiesForKeys: [.isDirectoryKey, .nameKey],
-            options: [.skipsHiddenFiles]
-        )
-
-        var numbered: [(Int, URL)] = []
-        numbered.reserveCapacity(children.count)
-        for child in children {
-            let values = try child.resourceValues(forKeys: [.isDirectoryKey])
-            guard values.isDirectory == true else { continue }
-            let name = child.lastPathComponent
-            guard let number = FolderNumbering.parse(name) else { continue }
-            numbered.append((number, child))
-        }
-        numbered.sort { $0.0 < $1.0 }
+        let numbered = try numberedFolderURLs(at: rootURL)
 
         let total = numbered.count
         var hits = 0
@@ -90,14 +135,31 @@ enum CardScanner: Sendable {
         collected.reserveCapacity(total)
         cacheEntries.reserveCapacity(total)
 
+        var progressBatch: [GameEntry] = []
+        progressBatch.reserveCapacity(progressBatchSize)
+
+        func flushProgress(force: Bool = false) async {
+            guard let onProgress else {
+                progressBatch.removeAll(keepingCapacity: true)
+                return
+            }
+            guard force ? !progressBatch.isEmpty : progressBatch.count >= progressBatchSize else { return }
+            let batch = progressBatch
+            progressBatch.removeAll(keepingCapacity: true)
+            await onProgress(
+                ProgressEvent(entries: batch, completed: collected.count, total: total)
+            )
+        }
+
         try await withThrowingTaskGroup(of: (Int, GameEntry, FolderFingerprint, Bool).self) { group in
             var iterator = numbered.makeIterator()
+            let limit = max(1, min(maxConcurrent, total))
 
             func enqueueNext() -> Bool {
                 guard let (number, url) = iterator.next() else { return false }
                 let folderName = url.lastPathComponent
                 let cachedEntry = cacheByFolder[folderName]
-                group.addTask {
+                group.addTask(priority: .userInitiated) {
                     let result = try scanFolderFast(
                         number: number,
                         folderURL: url,
@@ -108,26 +170,32 @@ enum CardScanner: Sendable {
                 return true
             }
 
-            for _ in 0..<min(maxConcurrent, total) {
+            for _ in 0..<limit {
                 _ = enqueueNext()
             }
 
             for try await (_, entry, fingerprint, cacheHit) in group {
+                // Keep workers fed *before* waiting on UI — MainActor hops used to starve the pool.
+                _ = enqueueNext()
+
                 if cacheHit { hits += 1 } else { misses += 1 }
                 collected.append(entry)
                 cacheEntries.append(CachedEntry(fingerprint: fingerprint, entry: entry))
-                if let onProgress {
-                    await onProgress(
-                        ProgressEvent(entry: entry, completed: collected.count, total: total)
-                    )
-                }
-                _ = enqueueNext()
+                progressBatch.append(entry)
+                await flushProgress()
             }
         }
 
+        await flushProgress(force: true)
+
         collected.sort { $0.number < $1.number }
-        let byNumber = Dictionary(uniqueKeysWithValues: cacheEntries.map { ($0.entry.number, $0) })
-        let orderedCache = collected.compactMap { byNumber[$0.number] }
+        let byFolder = Dictionary(
+            cacheEntries.map { ($0.fingerprint.folderName, $0) },
+            uniquingKeysWith: { _, last in last }
+        )
+        let orderedCache = collected.compactMap { entry in
+            byFolder[URL(fileURLWithPath: entry.folderPath).lastPathComponent]
+        }
 
         let cache = CardCache(
             volumeUUID: volume.volumeUUID,
@@ -136,7 +204,10 @@ enum CardScanner: Sendable {
             scannedAt: Date(),
             entries: orderedCache
         )
-        try? await CardCacheStore.shared.save(cache)
+        // Don't block returning the list on cache write.
+        Task.detached(priority: .utility) {
+            try? await CardCacheStore.shared.save(cache)
+        }
 
         let ms = Int(Date().timeIntervalSince(started) * 1000)
         return ScanResult(
@@ -156,7 +227,7 @@ enum CardScanner: Sendable {
         var cacheHit: Bool
     }
 
-    /// Name listing + image stat + name/serial only. No full size walk, no hash validation.
+    /// Name listing + image stat + name/serial only. No full size walk, no IP.BIN, no hash validation.
     private nonisolated static func scanFolderFast(
         number: Int,
         folderURL: URL,
@@ -174,15 +245,22 @@ enum CardScanner: Sendable {
             throw ScanError.noDiscImage(folderURL)
         }
         let imageURL = folderURL.appendingPathComponent(imageName)
-        let imageValues = try imageURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey, .isRegularFileKey])
+        let imageValues = try imageURL.resourceValues(forKeys: [
+            .fileSizeKey, .contentModificationDateKey, .isRegularFileKey,
+        ])
         guard imageValues.isRegularFile == true else {
             throw ScanError.noDiscImage(folderURL)
         }
         let imageSize = Int64(imageValues.fileSize ?? 0)
         let imageMod = imageValues.contentModificationDate ?? .distantPast
 
-        let nameOnDisk = readSidecar(named: nameFile, in: folderURL)
-        let serialOnDisk = readSidecar(named: serialFile, in: folderURL)
+        // Prefer path existence from the name listing — avoids an extra stat per sidecar.
+        let nameOnDisk = names.contains(where: { $0.caseInsensitiveCompare(nameFile) == .orderedSame })
+            ? readSidecar(named: nameFile, in: folderURL)
+            : nil
+        let serialOnDisk = names.contains(where: { $0.caseInsensitiveCompare(serialFile) == .orderedSame })
+            ? readSidecar(named: serialFile, in: folderURL)
+            : nil
 
         let fingerprint = FolderFingerprint(
             folderName: folderName,
@@ -199,7 +277,6 @@ enum CardScanner: Sendable {
             var entry = cached.entry
             entry.number = number
             entry.folderPath = folderURL.path
-            // Old cache rows may predate `detailsLoaded`; treat filled sizes as loaded.
             if !entry.detailsLoaded, entry.byteSize > 0 {
                 entry.detailsLoaded = true
             }
@@ -207,14 +284,18 @@ enum CardScanner: Sendable {
         }
 
         let format = formatForImage(imageName)
-        let displayName: String = {
-            if let nameOnDisk, !nameOnDisk.isEmpty { return nameOnDisk }
-            let base = (imageName as NSString).deletingPathExtension
-            if base.lowercased() != "disc" { return base }
-            return folderName
-        }()
 
-        let serial = serialOnDisk ?? ""
+        // Fast path: never open disc images. name.txt → GameDB(serial.txt) → folder/image.
+        // IP.BIN is reserved for rebuild list generation / inspector, not first paint.
+        let resolved = GameDatabase.resolveDisplayName(
+            nameTxt: nameOnDisk,
+            serialTxt: serialOnDisk,
+            ip: nil,
+            imageFileName: imageName,
+            folderName: folderName
+        )
+        let displayName = resolved.name
+        let serial = resolved.serial
         let isMenu = number == 1 || GameEntry.isMenuName(displayName)
 
         // Provisional sizes = image only; real totals fill in via loadFolderDetails.
@@ -262,9 +343,8 @@ enum CardScanner: Sendable {
             }
         }
 
-        // Prefer cheap aggregate JSON; full validHash re-walks the folder for validation.
+        // Prefer cheap aggregate JSON; skip full validHash re-walk on first enrich.
         let hash = ContentHashSidecar.readAggregate(in: folderURL)?.sha256
-            ?? ContentHashSidecar.validHash(in: folderURL)?.sha256
 
         return FolderDetails(
             byteSize: folderByteSize,
@@ -273,20 +353,65 @@ enum CardScanner: Sendable {
         )
     }
 
+    // MARK: - Root inventory
+
+    /// Slot folder names currently on the card (one root readdir).
+    nonisolated static func numberedFolderNames(at rootURL: URL) throws -> Set<String> {
+        Set(try numberedFolderURLs(at: rootURL).map { $0.1.lastPathComponent })
+    }
+
+    /// One folder per slot number; prefers ideal width (`01` vs `001`).
+    nonisolated private static func numberedFolderURLs(at rootURL: URL) throws -> [(Int, URL)] {
+        let fm = FileManager.default
+        let children = try fm.contentsOfDirectory(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+        var bestByNumber: [Int: URL] = [:]
+        bestByNumber.reserveCapacity(children.count)
+        for child in children {
+            let values = try child.resourceValues(forKeys: [.isDirectoryKey])
+            guard values.isDirectory == true else { continue }
+            let name = child.lastPathComponent
+            guard let number = FolderNumbering.parse(name) else { continue }
+            if let existing = bestByNumber[number] {
+                let existingName = existing.lastPathComponent
+                let ideal = FolderNumbering.format(number)
+                let preferNew = name == ideal
+                    || (existingName != ideal && name.count > existingName.count)
+                if preferNew {
+                    bestByNumber[number] = child
+                }
+            } else {
+                bestByNumber[number] = child
+            }
+        }
+        return bestByNumber.map { ($0.key, $0.value) }.sorted { $0.0 < $1.0 }
+    }
+
     // MARK: - Helpers
 
     private nonisolated static func detectImageName(in names: [String]) -> String? {
-        let byLower = Dictionary(uniqueKeysWithValues: names.map { ($0.lowercased(), $0) })
+        // Prefer O(n) scan over building a full dictionary for tiny folders.
+        var byLower: [String: String] = [:]
+        byLower.reserveCapacity(min(names.count, 16))
+        for name in names {
+            byLower[name.lowercased()] = name
+        }
         for preferred in preferredImageNames {
             if let name = byLower[preferred] { return name }
         }
         let priority: [String: Int] = ["gdi": 0, "cdi": 1, "ccd": 2]
-        let ranked = names.compactMap { name -> (String, Int)? in
+        var best: (String, Int)?
+        for name in names {
             let ext = (name as NSString).pathExtension.lowercased()
-            guard let rank = priority[ext] else { return nil }
-            return (name, rank)
+            guard let rank = priority[ext] else { continue }
+            if best == nil || rank < best!.1 {
+                best = (name, rank)
+            }
         }
-        return ranked.sorted { $0.1 < $1.1 }.first?.0
+        return best?.0
     }
 
     private nonisolated static func formatForImage(_ fileName: String) -> DiscFormat {
@@ -300,11 +425,11 @@ enum CardScanner: Sendable {
 
     private nonisolated static func readSidecar(named name: String, in folder: URL) -> String? {
         let url = folder.appendingPathComponent(name)
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        // No prior fileExists — try read and treat missing as nil.
         if let raw = try? String(contentsOf: url, encoding: .utf8) {
             return raw.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        guard let data = try? Data(contentsOf: url),
+        guard let data = try? Data(contentsOf: url, options: [.mappedIfSafe]),
               let raw = String(data: data, encoding: .isoLatin1)
         else { return nil }
         return raw.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -30,7 +30,7 @@ struct GameListView: View {
             TableColumn("#", value: \.number) { game in
                 HStack(spacing: 4) {
                     Text(FolderNumbering.format(game.number, maxNumber: maxNumber))
-                        .font(.body.monospaced())
+                        .font(.body.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .frame(minWidth: 28, alignment: .trailing)
                     if state.isHashingGame(game) {
@@ -43,22 +43,8 @@ struct GameListView: View {
             .width(min: 52, ideal: 64, max: 80)
 
             TableColumn("Title", value: \.name) { game in
-                HStack(spacing: 6) {
-                    Text(game.name)
-                        .fontWeight(game.isMenu ? .semibold : .regular)
-                        .lineLimit(1)
-                    if game.isMenu {
-                        Text("MENU")
-                            .font(.caption2.weight(.bold))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(.blue.opacity(0.15), in: Capsule())
-                            .foregroundStyle(.blue)
-                    }
-                    if let dup = state.listDuplicateBadge(for: game.id) {
-                        DuplicateBadge(info: dup)
-                    }
-                }
+                // Observe rename state inside the cell (Table caches closures).
+                RenameAwareTitleCell(game: game, state: state)
             }
             .width(min: 160, ideal: 280)
 
@@ -86,26 +72,63 @@ struct GameListView: View {
         // Keep rows visible while scanning; block interaction only.
         .disabled(state.isScanning || state.isBusy)
         .opacity(state.isScanning ? 0.72 : 1)
+        .background {
+            if state.scrollToNewRows {
+                TableSelectionScroller(trigger: state.scrollTargetGameID)
+            }
+        }
         .contextMenu(forSelectionType: GameEntry.ID.self) { selectedIDs in
             selectionContextMenu(selectedIDs)
         } primaryAction: { selectedIDs in
+            // Double-click: Finder-style inline rename (not inspector).
             if selectedIDs.count == 1, let id = selectedIDs.first {
-                state.focusRenameInInspector(for: id)
+                state.beginInlineRename(id)
             }
+        }
+        .onKeyPress(.return) {
+            guard state.renamingGameID == nil,
+                  !state.isBusy,
+                  !state.isScanning,
+                  state.selection.count == 1,
+                  let id = state.selection.first
+            else { return .ignored }
+            state.beginInlineRename(id)
+            return .handled
+        }
+        .onChange(of: state.selection) { _, newValue in
+            // Leave rename mode if the renamed row is no longer selected.
+            if let id = state.renamingGameID, !newValue.contains(id) {
+                state.cancelInlineRename()
+            }
+        }
+        .onChange(of: state.isBusy) { _, busy in
+            if busy { state.cancelInlineRename() }
+        }
+        .onChange(of: state.isScanning) { _, scanning in
+            if scanning { state.cancelInlineRename() }
         }
         .searchable(
             text: $state.searchText,
             placement: .toolbar,
             prompt: "Name, serial, number…"
         )
-        .safeAreaInset(edge: .top, spacing: 0) {
-            // Caption lives in the window subtitle; only the bar is needed here.
+        .overlay(alignment: .top) {
+            // Subtle edge progress only — count lives in the window subtitle.
             if state.isScanning, let progress = state.scanProgress, progress.total > 0 {
-                ProgressView(value: Double(progress.completed), total: Double(progress.total))
-                    .progressViewStyle(.linear)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(.bar)
+                GeometryReader { geo in
+                    let fraction = progress.total > 0
+                        ? min(1, max(0, Double(progress.completed) / Double(progress.total)))
+                        : 0
+                    ZStack(alignment: .leading) {
+                        Rectangle()
+                            .fill(Color.primary.opacity(0.08))
+                        Rectangle()
+                            .fill(Color.accentColor)
+                            .frame(width: geo.size.width * fraction)
+                    }
+                }
+                .frame(height: 2)
+                .allowsHitTesting(false)
             }
         }
         .overlay {
@@ -150,13 +173,9 @@ struct GameListView: View {
                 .background(.bar)
             }
         }
-        .onChange(of: state.selection) { _, newValue in
-            if !newValue.isEmpty {
-                state.isInspectorPresented = true
-            }
-        }
-        // Restore saved sort when a card opens / changes.
+        // Restore saved sort when a card opens / changes; drop any in-flight rename.
         .onChange(of: state.volume?.volumeUUID) { _, _ in
+            state.cancelInlineRename()
             sortOrder = state.displaySort.comparators
         }
         .onChange(of: state.displaySort) { _, new in
@@ -197,14 +216,40 @@ struct GameListView: View {
         let multi = count > 1
 
         if count == 1, let id = selectedIDs.first {
-            Button("Rename…") {
-                state.focusRenameInInspector(for: id)
+            Button("Rename") {
+                state.beginInlineRename(id)
+            }
+            .disabled(state.isBusy || state.isScanning)
+        }
+
+        let selectedGames = state.games.filter { selectedIDs.contains($0.id) }
+        let anyDup = selectedGames.contains { state.duplicateInfo(for: $0.id) != nil }
+        let anyMarked = selectedGames.contains { state.isMarkedNotDuplicate($0) }
+        if anyDup {
+            Button(multi ? "Mark Not Duplicates" : "Not a Duplicate") {
+                state.markNotDuplicate(ids: selectedIDs)
+            }
+        }
+        if anyMarked {
+            Button("Restore Duplicate Detection") {
+                state.clearNotDuplicateMark(ids: selectedIDs)
             }
         }
 
         Button(multi ? "Sentence Case (\(count))" : "Sentence Case") {
             state.selection = selectedIDs
             state.sentenceCaseSelection()
+        }
+        .disabled(count == 0 || state.isBusy)
+
+        Menu("Automatically Rename") {
+            ForEach(AutoRenameSource.allCases) { source in
+                Button(source.menuTitle) {
+                    state.selection = selectedIDs
+                    state.autoRename(ids: selectedIDs, from: source)
+                }
+                .help(source.helpText)
+            }
         }
         .disabled(count == 0 || state.isBusy)
 
@@ -250,5 +295,52 @@ struct GameListView: View {
         ProgressView(message)
             .padding(24)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+// MARK: - Scroll selected row into view (SwiftUI Table → AppKit NSTableView)
+
+/// When `trigger` changes, finds the hosting `NSTableView` and scrolls its selection into view.
+private struct TableSelectionScroller: NSViewRepresentable {
+    var trigger: GameEntry.ID?
+
+    func makeNSView(context: Context) -> NSView {
+        NSView()
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        guard trigger != nil else { return }
+        // Wait a beat so SwiftUI applies the new selection / row before we scroll.
+        DispatchQueue.main.async {
+            guard let root = view.window?.contentView ?? NSApp.keyWindow?.contentView else { return }
+            guard let table = Self.findTableView(in: root) else { return }
+            let rows = table.selectedRowIndexes
+            guard let row = rows.first, row >= 0, row < table.numberOfRows else { return }
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.15
+                ctx.allowsImplicitAnimation = true
+                table.animator().scrollRowToVisible(row)
+            }
+        }
+    }
+
+    private static func findTableView(in view: NSView) -> NSTableView? {
+        if let table = view as? NSTableView, table.numberOfColumns > 1 {
+            return table
+        }
+        var best: NSTableView?
+        for sub in view.subviews {
+            if let found = findTableView(in: sub) {
+                // Prefer the widest multi-column table (game list, not tiny side widgets).
+                if let current = best {
+                    if found.bounds.width > current.bounds.width {
+                        best = found
+                    }
+                } else {
+                    best = found
+                }
+            }
+        }
+        return best
     }
 }

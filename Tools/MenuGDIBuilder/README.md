@@ -1,21 +1,22 @@
-# MenuGDIBuilder
+# MenuGDIBuilder (reference only)
 
-CLI helper that rebuilds a GDmenu / openMenu GDI image using the same
-DiscUtils GDromBuilder path as GDMENUCardManager.
+Katana now bakes the menu GDI **natively in Swift**
+(`Katana/Services/MenuBake/`). This folder is kept as:
 
-## Build
+- Stock **gdMenu / openMenu** assets used by the app (and tests)
+- A DiscUtils / GDromBuilder **reference implementation** matching GDMENUCardManager
+
+You do **not** need to build or ship the .NET helper for the app.
+
+## Optional: run the reference CLI
 
 ```bash
-export DOTNET_ROOT="/opt/homebrew/opt/dotnet/libexec"
-export PATH="$DOTNET_ROOT:$PATH"
-dotnet publish -c Release -r osx-arm64 --self-contained true \
-  -p:PublishSingleFile=true \
-  -p:EnableCompressionInSingleFile=true \
-  -o ./publish
-cp publish/MenuGDIBuilder ../../Katana/Resources/Helpers/
+# Requires: brew install dotnet
+dotnet run -c Release -- \
+  --kind gdMenu --list LIST.INI --assets ./assets/gdMenu --out ./menu_gdi
 ```
 
-## Usage
+Or use a previously published binary:
 
 ```
 MenuGDIBuilder --kind gdMenu --list LIST.INI --assets ./assets/gdMenu --out ./menu_gdi

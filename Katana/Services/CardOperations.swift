@@ -172,6 +172,361 @@ enum CardOperations: Sendable {
         }
     }
 
+    // MARK: - Import (add discs)
+
+    /// A resolved disc package ready to copy onto the card.
+    struct DiscImportSource: Sendable, Hashable {
+        /// Directory whose contents form the GDEMU game folder (or parent of a lone image).
+        var packageURL: URL
+        /// When set, only these file names (relative to `packageURL`) are copied — e.g. a single CDI.
+        var fileNames: [String]?
+        var imageFileName: String
+        var hintName: String
+    }
+
+    struct ImportResult: Sendable {
+        /// Full game list after import (existing renumbered if width grew + new slots).
+        var games: [GameEntry]
+        var added: [GameEntry]
+        var skipped: [(url: URL, reason: String)]
+    }
+
+    /// Copy disc packages/images into the next free slots. Existing folders are renumbered
+    /// first when digit width must grow (e.g. 99 → 100).
+    nonisolated static func importDiscs(
+        sources: [URL],
+        games: [GameEntry],
+        rootURL: URL,
+        progress: (@Sendable (String) -> Void)? = nil
+    ) throws -> ImportResult {
+        guard !sources.isEmpty else {
+            return ImportResult(games: games, added: [], skipped: [])
+        }
+
+        var resolved: [DiscImportSource] = []
+        var skipped: [(URL, String)] = []
+        var seenPackages = Set<String>()
+
+        for url in sources {
+            do {
+                let source = try resolveImportSource(url)
+                let key = source.packageURL.standardizedFileURL.path
+                    + "|" + (source.fileNames?.sorted().joined(separator: ",") ?? "*")
+                if seenPackages.contains(key) {
+                    skipped.append((url, "Duplicate selection"))
+                    continue
+                }
+                // Refuse importing from the open card itself.
+                let rootPath = rootURL.standardizedFileURL.path
+                let pkgPath = source.packageURL.standardizedFileURL.path
+                if pkgPath == rootPath || pkgPath.hasPrefix(rootPath + "/") {
+                    skipped.append((url, "Source is already on this card"))
+                    continue
+                }
+                seenPackages.insert(key)
+                resolved.append(source)
+            } catch {
+                skipped.append((url, error.localizedDescription))
+            }
+        }
+
+        guard !resolved.isEmpty else {
+            return ImportResult(games: games, added: [], skipped: skipped)
+        }
+
+        let fm = FileManager.default
+        let existing = games.sorted { $0.number < $1.number }
+
+        // Next slot must respect **on-disk** numbered folders, not only the in-memory list.
+        // A stale/empty `games` array (or snapshot desync) used to pick "001" while the menu
+        // already occupied that slot → "Destination folder already exists: 001".
+        let occupiedBefore = try occupiedSlotNumbers(on: rootURL)
+        let memoryMax = existing.map(\.number).max() ?? 0
+        let diskMax = occupiedBefore.max() ?? 0
+        let startNumber = max(memoryMax, diskMax, existing.count) + 1
+        let endNumber = startNumber + resolved.count - 1
+        let newTotal = max(endNumber, memoryMax, diskMax, existing.count + resolved.count)
+
+        // Widen folder names if we cross 99 / 999 boundaries.
+        var pathByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0.folderPath) })
+        let desiredExisting = existing.enumerated().map { ($0.element.id, $0.offset + 1) }
+        // Use final card size for digit width (e.g. 99 → 100 forces 01→001 renames).
+        let locations = try renumber(
+            pathByID: &pathByID,
+            desiredNumbers: desiredExisting,
+            rootURL: rootURL,
+            preferCompactPack: false,
+            maxNumber: newTotal,
+            progress: progress
+        )
+
+        var updatedExisting: [GameEntry] = existing.enumerated().map { index, game in
+            var copy = game
+            let number = index + 1
+            copy.number = number
+            if let loc = locations[game.id] {
+                copy.folderPath = loc.path
+                copy.number = loc.number
+            } else {
+                copy.folderPath = rootURL
+                    .appendingPathComponent(
+                        FolderNumbering.format(number, maxNumber: newTotal),
+                        isDirectory: true
+                    )
+                    .path
+            }
+            copy.isMenu = number == 1 || GameEntry.isMenuName(copy.name)
+            return copy
+        }
+
+        var added: [GameEntry] = []
+        added.reserveCapacity(resolved.count)
+        var nextNumber = startNumber
+        // Re-read after renumber so free-slot search sees final names.
+        var occupied = try occupiedSlotNumbers(on: rootURL)
+
+        for (offset, source) in resolved.enumerated() {
+            // Skip any slot still occupied (gaps, stale memory, concurrent mounts).
+            while occupied.contains(nextNumber) {
+                nextNumber += 1
+            }
+            let number = nextNumber
+            nextNumber += 1
+            let widthMax = max(newTotal, number, occupied.max() ?? 0)
+            let folderName = FolderNumbering.format(number, maxNumber: widthMax)
+            progress?("Copying \(offset + 1)/\(resolved.count)… \(source.hintName)")
+
+            let dest = rootURL.appendingPathComponent(folderName, isDirectory: true)
+            if fm.fileExists(atPath: dest.path) {
+                // Extremely unlikely after occupied check; keep a clear error.
+                throw OperationError.destinationExists(folderName)
+            }
+            try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+            occupied.insert(number)
+
+            do {
+                try copyPackage(source: source, to: dest)
+            } catch {
+                try? fm.removeItem(at: dest)
+                throw error
+            }
+
+            // Prefer disc.* names when we copied a single image file.
+            // Resolve display name from the *source* filename first (GCM-style), before rename.
+            var imageName = source.imageFileName
+            let preferred = preferredImageName(for: source.imageFileName)
+            if source.fileNames?.count == 1,
+               preferred != source.imageFileName
+            {
+                let from = dest.appendingPathComponent(source.imageFileName)
+                let to = dest.appendingPathComponent(preferred)
+                if fm.fileExists(atPath: from.path), !fm.fileExists(atPath: to.path) {
+                    try? fm.moveItem(at: from, to: to)
+                    imageName = preferred
+                }
+            }
+
+            let format = discFormat(for: imageName)
+            let ip = IpBinReader.read(
+                folderURL: dest,
+                imageFileName: imageName,
+                format: format
+            )
+            // Like GDMENU Card Manager: default title from source file/folder name so
+            // homebrew variants (same IP.BIN) stay distinct. GameDB/IP are fallbacks only.
+            let resolvedName = importDisplayName(source: source, ip: ip)
+
+            try resolvedName.name.write(
+                to: dest.appendingPathComponent(nameFile),
+                atomically: true,
+                encoding: .utf8
+            )
+            if !resolvedName.serial.isEmpty {
+                try resolvedName.serial.write(
+                    to: dest.appendingPathComponent(serialFile),
+                    atomically: true,
+                    encoding: .utf8
+                )
+            }
+
+            let details = try? CardScanner.loadFolderDetails(folderURL: dest)
+            let entry = GameEntry(
+                id: UUID(),
+                number: number,
+                name: resolvedName.name,
+                serial: resolvedName.serial,
+                format: format,
+                imageFileName: imageName,
+                folderPath: dest.path,
+                byteSize: details?.byteSize ?? 0,
+                payloadByteSize: details?.payloadByteSize ?? 0,
+                contentSHA256: details?.contentSHA256,
+                isMenu: false,
+                detailsLoaded: details != nil
+            )
+            added.append(entry)
+        }
+
+        return ImportResult(
+            games: updatedExisting + added,
+            added: added,
+            skipped: skipped
+        )
+    }
+
+    /// Turn a user-selected file or folder into a copyable disc package.
+    nonisolated static func resolveImportSource(_ url: URL) throws -> DiscImportSource {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else {
+            throw OperationError.importUnreadable(url.lastPathComponent)
+        }
+
+        if isDir.boolValue {
+            let names = try fm.contentsOfDirectory(atPath: url.path)
+                .filter { !$0.hasPrefix(".") }
+            guard let image = detectImageName(in: names) else {
+                throw OperationError.importNoDiscImage(url.lastPathComponent)
+            }
+            return DiscImportSource(
+                packageURL: url.standardizedFileURL,
+                fileNames: nil,
+                imageFileName: image,
+                hintName: url.lastPathComponent
+            )
+        }
+
+        let ext = url.pathExtension.lowercased()
+        let parent = url.deletingLastPathComponent()
+        let name = url.lastPathComponent
+
+        switch ext {
+        case "gdi":
+            // Whole GDI set lives next to the cue file.
+            let names = try fm.contentsOfDirectory(atPath: parent.path)
+                .filter { !$0.hasPrefix(".") }
+            return DiscImportSource(
+                packageURL: parent.standardizedFileURL,
+                fileNames: nil,
+                imageFileName: name,
+                hintName: (name as NSString).deletingPathExtension
+            )
+        case "cdi":
+            return DiscImportSource(
+                packageURL: parent.standardizedFileURL,
+                fileNames: [name],
+                imageFileName: name,
+                hintName: (name as NSString).deletingPathExtension
+            )
+        case "ccd":
+            // CloneCCD-style: .ccd + .img + optional .sub
+            let base = (name as NSString).deletingPathExtension
+            var files = [name]
+            for companion in ["\(base).img", "\(base).sub", "\(base).cue"] {
+                if fm.fileExists(atPath: parent.appendingPathComponent(companion).path) {
+                    files.append(companion)
+                }
+            }
+            return DiscImportSource(
+                packageURL: parent.standardizedFileURL,
+                fileNames: files,
+                imageFileName: name,
+                hintName: base
+            )
+        default:
+            throw OperationError.importUnsupported(url.lastPathComponent)
+        }
+    }
+
+    nonisolated private static func copyPackage(source: DiscImportSource, to dest: URL) throws {
+        let fm = FileManager.default
+        if let fileNames = source.fileNames {
+            for name in fileNames {
+                let from = source.packageURL.appendingPathComponent(name)
+                let to = dest.appendingPathComponent(name)
+                guard fm.fileExists(atPath: from.path) else {
+                    throw OperationError.importUnreadable(name)
+                }
+                try fm.copyItem(at: from, to: to)
+            }
+            return
+        }
+
+        let names = try fm.contentsOfDirectory(atPath: source.packageURL.path)
+            .filter { !$0.hasPrefix(".") }
+        for name in names {
+            // Skip nested manager trash/tmp if someone selected a card root by mistake
+            // (already blocked) or odd packages.
+            if name == trashFolderName || name == tmpFolderName { continue }
+            let from = source.packageURL.appendingPathComponent(name)
+            let to = dest.appendingPathComponent(name)
+            try fm.copyItem(at: from, to: to)
+        }
+    }
+
+    nonisolated private static func detectImageName(in names: [String]) -> String? {
+        let byLower = Dictionary(uniqueKeysWithValues: names.map { ($0.lowercased(), $0) })
+        for preferred in ["disc.gdi", "disc.cdi", "disc.ccd"] {
+            if let name = byLower[preferred] { return name }
+        }
+        let priority: [String: Int] = ["gdi": 0, "cdi": 1, "ccd": 2]
+        let ranked = names.compactMap { name -> (String, Int)? in
+            let ext = (name as NSString).pathExtension.lowercased()
+            guard let rank = priority[ext] else { return nil }
+            return (name, rank)
+        }
+        return ranked.sorted { $0.1 < $1.1 }.first?.0
+    }
+
+    nonisolated private static func preferredImageName(for fileName: String) -> String {
+        switch (fileName as NSString).pathExtension.lowercased() {
+        case "gdi": return "disc.gdi"
+        case "cdi": return "disc.cdi"
+        case "ccd": return "disc.ccd"
+        default: return fileName
+        }
+    }
+
+    nonisolated private static func discFormat(for fileName: String) -> DiscFormat {
+        switch (fileName as NSString).pathExtension.lowercased() {
+        case "gdi": return .gdi
+        case "cdi": return .cdi
+        case "ccd": return .ccd
+        default: return .unknown
+        }
+    }
+
+    /// Import naming: source file / folder first (distinguishes variants), then GameDB / IP.BIN.
+    nonisolated static func importDisplayName(
+        source: DiscImportSource,
+        ip: IpBinInfo?
+    ) -> (name: String, serial: String) {
+        let serial = ip?.productNumber.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        // Original image base name (before any rename to disc.*).
+        let fileBase = (source.imageFileName as NSString)
+            .deletingPathExtension
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !fileBase.isEmpty, fileBase.lowercased() != "disc" {
+            return (fileBase, serial)
+        }
+
+        // Package / selection folder name (e.g. BELTRUNNER-SHIPPLAY-DC).
+        let hint = source.hintName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !hint.isEmpty, FolderNumbering.parse(hint) == nil {
+            return (hint, serial)
+        }
+
+        // Fallback: GameDB → IP.BIN → leftovers.
+        return GameDatabase.resolveDisplayName(
+            nameTxt: nil,
+            serialTxt: nil,
+            ip: ip,
+            imageFileName: source.imageFileName,
+            folderName: source.hintName
+        )
+    }
+
     // MARK: - Reorder
 
     /// Apply a new full order. Returns updated game list (no disk rescan needed).
@@ -225,6 +580,24 @@ enum CardOperations: Sendable {
         var path: String
     }
 
+    /// Slot numbers that already have a folder on the card root (e.g. `001`, `02`).
+    nonisolated static func occupiedSlotNumbers(on rootURL: URL) throws -> Set<Int> {
+        let children = try FileManager.default.contentsOfDirectory(
+            at: rootURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+        var slots = Set<Int>()
+        for child in children {
+            let isDir = (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            guard isDir else { continue }
+            if let n = FolderNumbering.parse(child.lastPathComponent) {
+                slots.insert(n)
+            }
+        }
+        return slots
+    }
+
     /// Renumber folders. Returns final number+path for every id in `desiredNumbers`.
     ///
     /// - `preferCompactPack`: after deletes, remaining games only move *down* into freed slots.
@@ -236,9 +609,10 @@ enum CardOperations: Sendable {
         desiredNumbers: [(UUID, Int)],
         rootURL: URL,
         preferCompactPack: Bool,
+        maxNumber maxNumberOverride: Int? = nil,
         progress: (@Sendable (String) -> Void)? = nil
     ) throws -> [UUID: FolderLocation] {
-        let maxNumber = desiredNumbers.map(\.1).max() ?? 1
+        let maxNumber = maxNumberOverride ?? desiredNumbers.map(\.1).max() ?? 1
 
         struct Planned {
             var id: UUID
@@ -419,15 +793,25 @@ enum OperationError: LocalizedError {
     case destinationExists(String)
     case noVolume
     case busy
+    case importNoDiscImage(String)
+    case importUnsupported(String)
+    case importUnreadable(String)
 
     var errorDescription: String? {
         switch self {
         case .emptyName: return "Name cannot be empty."
         case .gameNotFound: return "Game not found."
         case .invalidOrder: return "Invalid reorder."
-        case .destinationExists(let name): return "Destination folder already exists: \(name)"
+        case .destinationExists(let name):
+            return "Could not create slot \(name) — that folder already exists on the card. Try Rescan, then add again."
         case .noVolume: return "No card open."
         case .busy: return "Another operation is in progress."
+        case .importNoDiscImage(let name):
+            return "No disc image (.gdi / .cdi / .ccd) found in “\(name)”."
+        case .importUnsupported(let name):
+            return "Unsupported file “\(name)”. Choose a .gdi, .cdi, .ccd, or a game folder."
+        case .importUnreadable(let name):
+            return "Cannot read “\(name)”."
         }
     }
 }

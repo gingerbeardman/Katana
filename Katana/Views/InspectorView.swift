@@ -2,10 +2,15 @@ import AppKit
 import SwiftUI
 
 /// Trailing inspector (~280pt) following macOS iWork inspector layout patterns.
+/// Single-game: Title → IP.BIN → Cover → On Card → Actions (no repeated fields).
 struct InspectorView: View {
     @Bindable var state: AppState
 
     @State private var draftName: String = ""
+    @State private var ipInfo: IpBinInfo?
+    @State private var gdtexImage: NSImage?
+    @State private var gdtexStatus: String = ""
+    @State private var detailLoadToken: UUID = UUID()
     @FocusState private var nameFieldFocused: Bool
 
     private var maxNumber: Int {
@@ -36,24 +41,47 @@ struct InspectorView: View {
     private func singleInspector(_ game: GameEntry) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                titleSection(game)
+                collapsible(.title) {
+                    titleSectionBody(game)
+                }
                 if let dup = state.duplicateInfo(for: game.id) {
                     sectionDivider
-                    duplicateSection(game, info: dup)
+                    collapsible(.duplicate) {
+                        duplicateSectionBody(game, info: dup)
+                    }
+                } else if state.isMarkedNotDuplicate(game) {
+                    sectionDivider
+                    collapsible(.duplicate) {
+                        notDuplicateMarkedBody(game)
+                    }
                 }
                 sectionDivider
-                detailsSection(game)
+                collapsible(.ipBin) {
+                    ipBinSectionBody(game)
+                }
                 sectionDivider
-                filesSection(game)
+                collapsible(.gdtex) {
+                    gdtexSectionBody
+                }
                 sectionDivider
-                actionsSection(game)
+                collapsible(.onCard) {
+                    onCardSectionBody(game)
+                }
+                sectionDivider
+                collapsible(.actions) {
+                    actionsSectionBody(game)
+                }
             }
         }
         .background(Color(nsColor: .controlBackgroundColor))
         .disabled(state.isBusy)
-        .onAppear { syncDraft(from: game) }
+        .onAppear {
+            syncDraft(from: game)
+            loadDiscDetails(for: game)
+        }
         .onChange(of: game.id) { _, _ in
             syncDraft(from: game)
+            loadDiscDetails(for: game)
         }
         .onChange(of: game.name) { _, new in
             if !nameFieldFocused, draftName != new {
@@ -70,77 +98,101 @@ struct InspectorView: View {
     private func multiInspector(_ games: [GameEntry]) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                VStack(alignment: .leading, spacing: 10) {
-                    sectionHeader("Selection")
+                collapsible(.selection) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("\(games.count) games")
+                            .font(.title3.weight(.semibold).monospacedDigit())
 
-                    Text("\(games.count) games")
-                        .font(.title3.weight(.semibold))
+                        Text(ByteCount.string(for: state.selectedBytes))
+                            .font(.callout.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity)
+                            .multilineTextAlignment(.center)
 
-                    Text(ByteCount.string(for: state.selectedBytes))
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                        .frame(maxWidth: .infinity)
-                        .multilineTextAlignment(.center)
-
-                    // Compact list of names (read-only).
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(games.prefix(12)) { g in
-                            HStack(spacing: 8) {
-                                Text(FolderNumbering.format(g.number, maxNumber: maxNumber))
-                                    .font(.caption.monospaced())
-                                    .foregroundStyle(.secondary)
-                                    .frame(width: 36, alignment: .trailing)
-                                Text(g.name)
-                                    .font(.callout)
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                                Spacer(minLength: 0)
-                                FormatBadge(format: g.format)
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(games.prefix(12)) { g in
+                                HStack(spacing: 8) {
+                                    Text(FolderNumbering.format(g.number, maxNumber: maxNumber))
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 36, alignment: .trailing)
+                                    Text(g.name)
+                                        .font(.callout)
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
+                                    Spacer(minLength: 0)
+                                    FormatBadge(format: g.format)
+                                }
                             }
-                        }
-                        if games.count > 12 {
-                            Text("+\(games.count - 12) more")
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
+                            if games.count > 12 {
+                                Text("+\(games.count - 12) more")
+                                    .font(.callout.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 14)
 
                 sectionDivider
 
-                VStack(alignment: .leading, spacing: 10) {
-                    sectionHeader("Actions")
+                collapsible(.actions) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 8) {
+                            Button {
+                                state.sentenceCaseSelection()
+                            } label: {
+                                Text("Sentence Case")
+                                    .frame(maxWidth: .infinity)
+                            }
 
-                    HStack(spacing: 8) {
-                        Button {
-                            state.sentenceCaseSelection()
-                        } label: {
-                            Text("Sentence Case")
-                                .frame(maxWidth: .infinity)
+                            Button {
+                                let urls = games.map(\.folderURL)
+                                NSWorkspace.shared.activateFileViewerSelecting(urls)
+                            } label: {
+                                Text("Reveal")
+                                    .frame(maxWidth: .infinity)
+                            }
                         }
 
-                        Button {
-                            let urls = games.map(\.folderURL)
-                            NSWorkspace.shared.activateFileViewerSelecting(urls)
+                        Menu("Automatically Rename") {
+                            ForEach(AutoRenameSource.allCases) { source in
+                                Button(source.menuTitle) {
+                                    state.autoRenameSelection(from: source)
+                                }
+                                .help(source.helpText)
+                            }
+                        }
+                        .disabled(state.isBusy)
+
+                        let anyDup = games.contains { state.duplicateInfo(for: $0.id) != nil }
+                        let anyMarked = games.contains { state.isMarkedNotDuplicate($0) }
+                        if anyDup {
+                            Button {
+                                state.markNotDuplicate(ids: Set(games.map(\.id)))
+                            } label: {
+                                Text("Mark Not Duplicates")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .help("Stop flagging these games as duplicates on this card")
+                        }
+                        if anyMarked {
+                            Button {
+                                state.clearNotDuplicateMark(ids: Set(games.map(\.id)))
+                            } label: {
+                                Text("Restore Duplicate Detection")
+                                    .frame(maxWidth: .infinity)
+                            }
+                        }
+
+                        Button(role: .destructive) {
+                            state.deleteSelected()
                         } label: {
-                            Text("Reveal")
+                            Text("Delete \(games.count) Games")
                                 .frame(maxWidth: .infinity)
                         }
+                        .disabled(state.isBusy)
                     }
-
-                    Button(role: .destructive) {
-                        state.deleteSelected()
-                    } label: {
-                        Text("Delete \(games.count) Games")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .disabled(state.isBusy)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 14)
             }
         }
         .background(Color(nsColor: .controlBackgroundColor))
@@ -149,10 +201,8 @@ struct InspectorView: View {
 
     // MARK: - Title
 
-    private func titleSection(_ game: GameEntry) -> some View {
+    private func titleSectionBody(_ game: GameEntry) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("Title")
-
             TextField("Game name", text: $draftName)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1)
@@ -164,34 +214,30 @@ struct InspectorView: View {
                 .help("Displayed name (name.txt). Press Return to save.")
 
             Text(titleStatusLine(for: game))
-                .font(.callout)
+                .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .monospacedDigit()
                 .frame(maxWidth: .infinity)
                 .multilineTextAlignment(.center)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
     }
 
     private func titleStatusLine(for game: GameEntry) -> String {
         let slot = FolderNumbering.format(game.number, maxNumber: maxNumber)
+        let size = ByteCount.string(for: game.byteSize)
         if game.isMenu {
-            return "Slot \(slot) · \(state.menuKind.displayName)"
+            return "Slot \(slot) · \(state.menuKind.displayName) · \(size)"
         }
-        return "Slot \(slot)"
+        return "Slot \(slot) · \(game.format.displayName) · \(size)"
     }
 
     // MARK: - Duplicates
 
-    private func duplicateSection(_ game: GameEntry, info: DuplicateInfo) -> some View {
+    private func duplicateSectionBody(_ game: GameEntry, info: DuplicateInfo) -> some View {
         let peers = state.games.filter {
             state.duplicateInfo(for: $0.id)?.groupKey == info.groupKey
         }
 
         return VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("Duplicate")
-
             Text(info.grade.label)
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -205,7 +251,7 @@ struct InspectorView: View {
             Text(info.isPrimary
                  ? "Copy \(info.indexInGroup) of \(info.groupSize) · lowest slot (keep)"
                  : "Copy \(info.indexInGroup) of \(info.groupSize) · redundant")
-                .font(.callout)
+                .font(.callout.monospacedDigit())
                 .foregroundStyle(info.isPrimary ? .orange : .red)
                 .frame(maxWidth: .infinity)
                 .multilineTextAlignment(.center)
@@ -219,7 +265,7 @@ struct InspectorView: View {
                 ForEach(peers) { peer in
                     HStack(spacing: 8) {
                         Text(FolderNumbering.format(peer.number, maxNumber: maxNumber))
-                            .font(.caption.monospaced())
+                            .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                             .frame(width: 36, alignment: .trailing)
                         Text(peer.name)
@@ -246,7 +292,6 @@ struct InspectorView: View {
 
             if info.isRedundant || peers.count > 1 {
                 Button {
-                    // Select other members of this group that are not the primary.
                     let group = peers.compactMap { g -> GameEntry? in
                         guard let d = state.duplicateInfo(for: g.id), d.isRedundant else { return nil }
                         return g
@@ -257,66 +302,143 @@ struct InspectorView: View {
                         .frame(maxWidth: .infinity)
                 }
             }
+
+            Button {
+                state.markNotDuplicate(ids: [game.id])
+            } label: {
+                Text("Not a Duplicate")
+                    .frame(maxWidth: .infinity)
+            }
+            .help("Stop flagging this game as a duplicate on this card (saved with the card)")
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
     }
 
-    // MARK: - Details
-
-    private func detailsSection(_ game: GameEntry) -> some View {
+    private func notDuplicateMarkedBody(_ game: GameEntry) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("Details")
+            Text("Marked not a duplicate on this card.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
-            inspectorRow("Serial") {
-                Text(game.serial.isEmpty ? "—" : game.serial)
+            Button {
+                state.clearNotDuplicateMark(ids: [game.id])
+            } label: {
+                Text("Restore Duplicate Detection")
+                    .frame(maxWidth: .infinity)
+            }
+        }
+    }
+
+    // MARK: - IP.BIN (disc header only — no name/folder/format overlap with Title / On Card)
+
+    private func ipBinSectionBody(_ game: GameEntry) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let ip = ipInfo {
+                // Product title only when it differs from the editable name.txt value.
+                let ipTitle = ip.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                let displayTitle = game.name.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !ipTitle.isEmpty, ipTitle.caseInsensitiveCompare(displayTitle) != .orderedSame {
+                    Text(ipTitle)
+                        .font(.body.weight(.semibold))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .help("Product name from IP.BIN (differs from the display name)")
+                }
+
+                Text(ipBinMetaLine(ip))
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                let serial = preferredSerial(game: game, ip: ip)
+                inspectorRow("Serial") {
+                    Text(serial)
+                        .font(.body.monospaced())
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+
+                inspectorRow("Region") {
+                    Text(ip.region.isEmpty ? "—" : ip.region)
+                        .font(.body.monospaced())
+                        .lineLimit(1)
+                }
+
+                inspectorRow("CRC") {
+                    Text(ip.crc.isEmpty ? "—" : ip.crc)
+                        .font(.body.monospaced())
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                }
+
+                if ip.isCodeBreaker {
+                    Text("Detected as Code Breaker")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
+            } else {
+                Text("Reading header…")
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity)
+                    .multilineTextAlignment(.center)
+            }
+        }
+    }
+
+    private func ipBinMetaLine(_ ip: IpBinInfo) -> String {
+        var parts = [ip.version, "DISC \(ip.disc)"]
+        if ip.vga { parts.append("VGA") }
+        return parts.joined(separator: " · ")
+    }
+
+    private func preferredSerial(game: GameEntry, ip: IpBinInfo) -> String {
+        if !ip.productNumber.isEmpty { return ip.productNumber }
+        if !game.serial.isEmpty { return game.serial }
+        return "—"
+    }
+
+    // MARK: - Cover (0GDTEX.PVR)
+
+    private var gdtexSectionBody: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.35))
+                    .aspectRatio(1, contentMode: .fit)
+                    .frame(maxWidth: .infinity)
+
+                if let gdtexImage {
+                    Image(nsImage: gdtexImage)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .padding(8)
+                } else {
+                    Text(gdtexStatus.isEmpty ? "Loading…" : gdtexStatus)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(12)
+                }
+            }
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    // MARK: - On Card (path + image only; slot lives under Title)
+
+    private func onCardSectionBody(_ game: GameEntry) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            inspectorRow("Image") {
+                Text(game.imageFileName)
                     .font(.body.monospaced())
                     .textSelection(.enabled)
                     .lineLimit(1)
                     .truncationMode(.middle)
-            }
-
-            inspectorRow("Format") {
-                FormatBadge(format: game.format)
-            }
-
-            inspectorRow("Size") {
-                Text(ByteCount.string(for: game.byteSize))
-                    .font(.body)
-                    .monospacedDigit()
-                    .lineLimit(1)
-            }
-
-            if game.isMenu {
-                inspectorRow("Role") {
-                    Text("Menu")
-                        .lineLimit(1)
-                }
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
-    }
-
-    // MARK: - Files
-
-    private func filesSection(_ game: GameEntry) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("Files")
-
-            inspectorRow("Image") {
-                Text(game.imageFileName)
-                    .font(.callout.monospaced())
-                    .textSelection(.enabled)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-
-            inspectorRow("Folder") {
-                Text(game.folderURL.lastPathComponent)
-                    .font(.callout.monospaced())
-                    .textSelection(.enabled)
-                    .lineLimit(1)
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -332,16 +454,12 @@ struct InspectorView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
     }
 
     // MARK: - Actions (single)
 
-    private func actionsSection(_ game: GameEntry) -> some View {
+    private func actionsSectionBody(_ game: GameEntry) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            sectionHeader("Actions")
-
             HStack(spacing: 8) {
                 Button {
                     applySentenceCase(to: game)
@@ -358,6 +476,20 @@ struct InspectorView: View {
                 }
             }
 
+            Menu("Automatically Rename") {
+                ForEach(AutoRenameSource.allCases) { source in
+                    Button(source.menuTitle) {
+                        state.selection = [game.id]
+                        state.autoRename(ids: [game.id], from: source)
+                        if let updated = state.games.first(where: { $0.id == game.id }) {
+                            draftName = updated.name
+                        }
+                    }
+                    .help(source.helpText)
+                }
+            }
+            .disabled(state.isBusy)
+
             Button(role: .destructive) {
                 state.delete(id: game.id)
             } label: {
@@ -366,8 +498,6 @@ struct InspectorView: View {
             }
             .disabled(state.isBusy)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
     }
 
     // MARK: - Empty
@@ -392,10 +522,41 @@ struct InspectorView: View {
 
     // MARK: - Chrome
 
-    private func sectionHeader(_ title: String) -> some View {
-        Text(title)
-            .font(.headline)
-            .foregroundStyle(.primary)
+    /// Collapsible section with persisted expand/collapse (iWork-style chevron header).
+    @ViewBuilder
+    private func collapsible<Content: View>(
+        _ section: InspectorSection,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        let expanded = state.isInspectorSectionExpanded(section)
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    state.toggleInspectorSection(section)
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    Text(section.title)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                content()
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 14)
+            }
+        }
     }
 
     private var sectionDivider: some View {
@@ -424,6 +585,39 @@ struct InspectorView: View {
 
     private func syncDraft(from game: GameEntry) {
         draftName = game.name
+    }
+
+    /// Load IP.BIN + 0GDTEX off the main actor when selection changes.
+    private func loadDiscDetails(for game: GameEntry) {
+        let token = UUID()
+        detailLoadToken = token
+        ipInfo = nil
+        gdtexImage = nil
+        gdtexStatus = "Loading…"
+
+        let folder = game.folderURL
+        let imageName = game.imageFileName
+        let format = game.format
+        let entry = game
+
+        Task.detached(priority: .userInitiated) {
+            let ip = IpBinReader.read(
+                folderURL: folder,
+                imageFileName: imageName,
+                format: format
+            ) ?? IpBinInfo.fallback(name: entry.name, serial: entry.serial)
+
+            let tex = GdtexLoader.load(for: entry)
+
+            await MainActor.run {
+                guard detailLoadToken == token else { return }
+                ipInfo = ip
+                gdtexImage = tex.image
+                gdtexStatus = tex.image == nil
+                    ? (tex.status.isEmpty ? "File not found" : tex.status)
+                    : ""
+            }
+        }
     }
 
     private func commitName(for game: GameEntry) {
