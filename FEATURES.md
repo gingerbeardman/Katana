@@ -162,6 +162,8 @@ Collapsible sections, each remembering its expanded state:
 
 [GDMENU Card Manager](https://github.com/sonik-br/GDMENUCardManager) by sonik-br is the primary inspiration and reference implementation, and remains the multi-platform tool of choice. Katana is a separate native macOS app that follows the same on-disk conventions.
 
+**No GDMENUCardManager source code is used in Katana.** Katana is written from scratch in Swift. What the two share is the on-disk format — folder layout, file names, and list syntax that GDmenu and openMenu themselves define, and which any manager has to match for the console to boot. The menu GDI writer derives from the MIT-licensed DiscUtils / GDIbuilder community lineage, not from GDMENUCardManager.
+
 | | Katana | GDMENU Card Manager |
 |---|---|---|
 | Platform | macOS only | Windows, Linux, macOS |

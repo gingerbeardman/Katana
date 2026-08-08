@@ -9,8 +9,8 @@ import UniformTypeIdentifiers
 final class AppState {
     var volume: CardVolume? {
         didSet {
-            // Empty / no-remount state lives in the sidebar (Open / Reopen). Always show it
-            // when nothing is open — macOS may have left the column collapsed from last session.
+            // Blank window only: Open / Reopen live in the sidebar. Force it open when
+            // nothing is mounted — not when a volume successfully restores on launch.
             if volume == nil {
                 splitColumnVisibility = .all
             }
@@ -26,8 +26,10 @@ final class AppState {
     /// Inspector-only snapshot — updated when selection or *selected* row data changes,
     /// not on every background size-enrichment write to unrelated rows.
     private(set) var inspectorSnapshot: InspectorSnapshot = .empty
-    /// Leading sidebar column visibility (`NavigationSplitView`). Forced `.all` when no card is open.
-    var splitColumnVisibility: NavigationSplitViewVisibility = .all
+    /// Leading sidebar column visibility (`NavigationSplitView`).
+    /// Starts `.automatic` so a successful restore does not force the sidebar open;
+    /// forced to `.all` only for blank windows (no card open / remount failed).
+    var splitColumnVisibility: NavigationSplitViewVisibility = .automatic
     /// Multi-select (⌘/⇧ click). Empty when nothing selected.
     var selection: Set<GameEntry.ID> = [] {
         didSet {
@@ -875,7 +877,7 @@ final class AppState {
         }
         guard let remembered = try? await VolumeStore.shared.lastRemembered() else {
             statusText = "Open a GDEMU SD card to begin"
-            // No card remounted — keep Open / Reopen reachable.
+            // Blank window — no volume to restore; open sidebar for Open / Reopen.
             splitColumnVisibility = .all
             LaunchTrace.mark("restoreSessionIfNeeded: no remembered volume")
             return
@@ -885,9 +887,10 @@ final class AppState {
         LaunchTrace.mark("restoreSessionIfNeeded → openRemembered(\(remembered.volumeName))")
         await openRemembered(remembered, showErrorIfMissing: false)
         if volume == nil {
-            // Remount failed (card not present) — empty state needs the sidebar.
+            // Remount failed (card not present) — blank window needs the sidebar.
             splitColumnVisibility = .all
         }
+        // Successful restore: leave splitColumnVisibility alone (user / system preference).
         LaunchTrace.mark("restoreSessionIfNeeded end")
     }
 

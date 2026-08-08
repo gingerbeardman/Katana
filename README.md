@@ -87,7 +87,7 @@ Katana stands on the shoulders of the Dreamcast homebrew community.
 
 **Primary inspiration and reference implementation.**
 
-Katana is a separate native macOS app, but it follows the same on-disk conventions and menu-rebuild approach, including:
+**No GDMENUCardManager source code is used in Katana.** Katana is an independent implementation written from scratch in Swift. What is shared is the *on-disk format* — the layout GDmenu and openMenu themselves define, which any manager must match for the console to boot:
 
 - Numbered game folders and `name.txt` / `serial.txt`
 - GDmenu `LIST.INI` and openMenu `OPENMENU.INI`
@@ -101,7 +101,7 @@ For Windows/Linux, archive import, GDI shrinking, or the original Avalonia UI, u
 
 ### DiscUtils & GDI tooling lineage
 
-Menu GDI construction is a **Swift port** of the multi-track path used by GDMENUCardManager (itself built on community GDI tools), notably:
+Menu GDI construction is a **Swift port of the community GDI tooling lineage** — the same multi-track path GDMENUCardManager also builds on, taken from its **MIT-licensed** upstream rather than from GDMENUCardManager:
 
 - **[DiscUtils](https://github.com/DiscUtils/DiscUtils)** (Kenneth Bell) — MIT (see `Tools/licenses/DiscUtils-LICENSE.txt`)
 - [GdiBuilder](https://github.com/Sappharad/GDIbuilder/) (Sappharad) and related GDI / ISO tooling
@@ -130,7 +130,7 @@ As also credited by GDMENUCardManager:
 
 - Menu GDI bake is a **Swift port** of the DiscUtils / GDromBuilder multi-track path (no Joliet, LBA 45000, truncated high-density tracks with CDDA).
 - **DiscUtils** lineage is **MIT** (Kenneth Bell); license text in `Tools/licenses/DiscUtils-LICENSE.txt`.
-- **GDMENUCardManager** is **GPL-3.0**; Katana’s menu rebuild design and list formats are adapted from that project’s public behaviour and documented layouts.
+- **GDMENUCardManager** is **GPL-3.0**. **No GDMENUCardManager source code is used in Katana.** Katana’s menu rebuild design and list formats are derived from that project’s *publicly observable behaviour* and the *documented on-disk layouts* — the file names, list syntax, and folder conventions that GDmenu and openMenu require — not from its implementation.
 - Bundled **GameDB-Dreamcast** title data is **GPL-3.0**.
 - Bundled **GDmenu** / **openMenu** binary assets are third-party menu images for rebuild; they are not original Katana content. Respect their original authors’ terms when redistributing.
 
