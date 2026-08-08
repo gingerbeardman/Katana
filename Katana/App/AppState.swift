@@ -1002,24 +1002,17 @@ final class AppState {
             volume = resolved
         }
 
-        // Let SwiftUI paint the empty/disabled table before heavy work begins.
+        // Let SwiftUI paint chrome before scan work.
         await Task.yield()
 
-        // Prefer a fresh bookmark while we hold access (sandbox re-open).
-        // Bookmark creation can stall briefly on some volumes — keep it off the main actor.
-        let preexisting = preexistingBookmark
-        let freshBookmark = await LaunchTrace.measureAsync("makeBookmark (detached)") {
-            await Task.detached(priority: .utility) {
-                VolumeStore.makeBookmark(for: url) ?? preexisting
-            }.value
-        }
-        if let freshBookmark {
-            bookmarkData = freshBookmark
+        // Keep any preexisting security-scope bookmark for this open; refresh off the
+        // critical path (bookmark creation can stall seconds on some SD readers).
+        if bookmarkData == nil {
+            bookmarkData = preexistingBookmark
         }
 
         do {
-            // Recent / reopen: if the saved cache still lists the same slot folders, skip
-            // per-folder I/O and paint the table from the snapshot.
+            // Recent / reopen: paint from Application Support cache without waiting on SD readdir.
             let preferSnapshot = !forceRescan
             if preferSnapshot {
                 statusText = "Opening \(url.lastPathComponent)…"
@@ -1042,8 +1035,11 @@ final class AppState {
                     let uiStart = CFAbsoluteTimeGetCurrent()
                     await MainActor.run {
                         self.insertScannedEntries(event.entries)
-                        self.scanProgress = (event.completed, event.total)
-                        self.statusText = "Scanning… \(event.completed)/\(event.total)"
+                        // Full-list first paint (cache trust) — don't show "Scanning… n/n".
+                        if event.completed < event.total {
+                            self.scanProgress = (event.completed, event.total)
+                            self.statusText = "Scanning… \(event.completed)/\(event.total)"
+                        }
                     }
                     let uiMs = Int((CFAbsoluteTimeGetCurrent() - uiStart) * 1000)
                     if uiMs >= 16 || event.entries.count >= 50 {
@@ -1075,42 +1071,53 @@ final class AppState {
             } else {
                 lastScanStats = "\(result.cacheHits) cached · \(result.cacheMisses) scanned · \(result.durationMilliseconds) ms"
             }
-            // Let Table finish applying the bulk insert before more MainActor work
-            // (avoids NSTableView reentrant-delegate warnings during open).
-            await Task.yield()
 
-            await LaunchTrace.measureAsync("resolveMenuKind") {
-                await resolveMenuKind(for: result.volume.volumeUUID, games: result.entries)
-            }
-            await loadCachedHashRate(for: result.volume.volumeUUID)
-            await loadNotDuplicateKeys(for: result.volume.volumeUUID)
-            refreshStatus()
-            refreshTrashSummary()
-            if result.volume.isReadOnly {
-                flash("Card is read-only — check the SD lock switch")
-            }
+            // List is interactive as soon as rows are assigned — do not block on menu
+            // detection (IP.BIN), trash summary, or bookmark refresh.
             scanProgress = nil
             isScanning = false
+            refreshStatus()
+            LaunchTrace.mark("open list interactive")
 
             // Serial/name dups first; size/hash grades refine after lazy details.
             scheduleDuplicateRecompute()
-            LaunchTrace.mark("scheduleDuplicateRecompute")
             startLazyDetailEnrichment(volumeUUID: result.volume.volumeUUID)
-            LaunchTrace.mark("startLazyDetailEnrichment")
 
-            // Persist recents off the critical “list is ready” path.
             let rememberVolume = result.volume
             let rememberRoot = url
             let rememberBookmark = bookmarkData
+            let needsNotDup = notDuplicateKeys.isEmpty
             Task {
+                // Bookmark refresh can stall; never gate first paint on it.
+                let freshBookmark = await LaunchTrace.measureAsync("makeBookmark (deferred)") {
+                    await Task.detached(priority: .utility) {
+                        VolumeStore.makeBookmark(for: rememberRoot) ?? rememberBookmark
+                    }.value
+                }
+                if let freshBookmark {
+                    await MainActor.run { self.bookmarkData = freshBookmark }
+                }
+                await LaunchTrace.measureAsync("resolveMenuKind (deferred)") {
+                    await self.resolveMenuKind(for: rememberVolume.volumeUUID, games: result.entries)
+                }
+                await self.loadCachedHashRate(for: rememberVolume.volumeUUID)
+                if needsNotDup {
+                    await self.loadNotDuplicateKeys(for: rememberVolume.volumeUUID)
+                }
+                await MainActor.run {
+                    self.refreshTrashSummary()
+                    if rememberVolume.isReadOnly {
+                        self.flash("Card is read-only — check the SD lock switch")
+                    }
+                }
                 await LaunchTrace.measureAsync("VolumeStore.remember (deferred)") {
                     try? await VolumeStore.shared.remember(
                         volume: rememberVolume,
                         rootURL: rememberRoot,
-                        existingBookmark: rememberBookmark
+                        existingBookmark: freshBookmark ?? rememberBookmark
                     )
                 }
-                await reloadRecents()
+                await self.reloadRecents()
             }
             LaunchTrace.mark("open end OK (list ready)")
             // Content hashing is never automatic — user starts it from Duplicates / Card menu.
