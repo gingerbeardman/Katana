@@ -144,6 +144,9 @@ final class AppState {
     /// Background fill of folder sizes / stored hashes after a fast scan.
     private var detailEnrichmentTask: Task<Void, Never>?
     private var detailEnrichmentGeneration: UInt64 = 0
+    /// NSWorkspace volume rename / app-activate observers (Finder label changes).
+    private var workspaceObserverTokens: [NSObjectProtocol] = []
+    private var didInstallWorkspaceObservers = false
 
     private static let duplicatesEnabledKey = "duplicatesEnabled"
     private static let showDuplicateMarkersKey = "showDuplicateMarkers"
@@ -798,6 +801,7 @@ final class AppState {
     func restoreSessionIfNeeded() async {
         guard !didAttemptRestore else { return }
         didAttemptRestore = true
+        installWorkspaceVolumeObserversIfNeeded()
         LaunchTrace.mark("restoreSessionIfNeeded begin")
         await LaunchTrace.measureAsync("reloadRecents") {
             await reloadRecents()
@@ -844,9 +848,10 @@ final class AppState {
     }
 
     func openRemembered(_ remembered: RememberedVolume, showErrorIfMissing: Bool = true) async {
-        // Already showing this card — don't wipe the list and rescan.
+        // Already showing this card — don't wipe the list and rescan, but refresh
+        // name/path/free space in case Finder renamed the volume while we were open.
         if volume?.volumeUUID == remembered.volumeUUID, !isScanning {
-            await loadCachedHashRate(for: remembered.volumeUUID)
+            await refreshOpenVolumeIdentity(preferredUUID: remembered.volumeUUID)
             return
         }
 
@@ -941,7 +946,7 @@ final class AppState {
         // Same card already open (sidebar / Open panel / restore) — keep list, no rescan.
         // Explicit Rescan / Clear Cache still passes forceRescan: true.
         if !forceRescan, !isScanning, isSameOpenVolume(as: url) {
-            await refreshOpenVolumeChrome(for: url)
+            await refreshOpenVolumeChrome(for: url, persistRecents: true)
             LaunchTrace.mark("open early-return same volume")
             return
         }
@@ -1543,13 +1548,129 @@ final class AppState {
         return false
     }
 
-    /// Refresh free-space chrome + hash-rate seed when re-selecting the open card.
-    private func refreshOpenVolumeChrome(for url: URL) async {
+    /// Refresh free-space chrome, display name, and root path from the live volume.
+    /// - Parameter persistRecents: When true, update `volumes.json` so Reopen / Recent show the new label.
+    private func refreshOpenVolumeChrome(for url: URL, persistRecents: Bool = false) async {
         let preferred = volume?.volumeUUID
-        if let resolved = try? VolumeIdentity.resolve(rootURL: url, preferredUUID: preferred) {
-            volume = resolved
-            await loadCachedHashRate(for: resolved.volumeUUID)
+        // Resolve off main — capacity / name queries can stall on slow SD.
+        let resolved = await Task.detached(priority: .utility) {
+            try? VolumeIdentity.resolve(rootURL: url, preferredUUID: preferred)
+        }.value
+        guard let resolved else { return }
+
+        let nameChanged = volume?.volumeName != resolved.volumeName
+        let pathChanged = volume?.rootURL.standardizedFileURL != resolved.rootURL.standardizedFileURL
+        volume = resolved
+        // Keep security-scope URL aligned when Finder renames /Volumes/Old → /Volumes/New.
+        if pathChanged {
+            accessURL = resolved.rootURL
         }
+        await loadCachedHashRate(for: resolved.volumeUUID)
+
+        if persistRecents || nameChanged || pathChanged {
+            let rememberVolume = resolved
+            let rememberRoot = resolved.rootURL
+            let rememberBookmark = bookmarkData
+            Task {
+                try? await VolumeStore.shared.remember(
+                    volume: rememberVolume,
+                    rootURL: rememberRoot,
+                    existingBookmark: rememberBookmark
+                )
+                await reloadRecents()
+            }
+            if nameChanged {
+                LaunchTrace.mark("volume name refreshed → \(resolved.volumeName)")
+            }
+        }
+    }
+
+    /// Re-resolve the open card’s path/name (bookmark or current root) after external renames.
+    private func refreshOpenVolumeIdentity(preferredUUID: String? = nil) async {
+        guard let volume, !isScanning else { return }
+        let uuid = preferredUUID ?? volume.volumeUUID
+
+        // Prefer live root if it still exists (same mount point path).
+        if FileManager.default.fileExists(atPath: volume.rootURL.path) {
+            await refreshOpenVolumeChrome(for: volume.rootURL, persistRecents: true)
+            return
+        }
+
+        // Path gone after rename — recover via remembered bookmark / /Volumes/<name>.
+        if let remembered = try? await VolumeStore.shared.remembered(uuid: uuid)
+            ?? recentVolumes.first(where: { $0.volumeUUID == uuid })
+        {
+            do {
+                let resolved = try await Task.detached(priority: .userInitiated) {
+                    try VolumeStore.resolveURL(from: remembered)
+                }.value
+                if resolved.isSecurityScoped {
+                    _ = resolved.url.startAccessingSecurityScopedResource()
+                    accessURL = resolved.url
+                    bookmarkData = remembered.bookmarkData
+                }
+                await refreshOpenVolumeChrome(for: resolved.url, persistRecents: true)
+                return
+            } catch {
+                LaunchTrace.mark("refreshOpenVolumeIdentity resolve failed: \(error.localizedDescription)")
+            }
+        }
+
+        await loadCachedHashRate(for: uuid)
+    }
+
+    /// Finder volume renames + return-to-app: keep title/sidebar name in sync without rescan.
+    private func installWorkspaceVolumeObserversIfNeeded() {
+        guard !didInstallWorkspaceObservers else { return }
+        didInstallWorkspaceObservers = true
+        let nc = NSWorkspace.shared.notificationCenter
+
+        let rename = nc.addObserver(
+            forName: NSWorkspace.didRenameVolumeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let newURL = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
+            let oldURL = note.userInfo?[NSWorkspace.oldVolumeURLUserInfoKey] as? URL
+            Task { @MainActor in
+                await self.handleWorkspaceVolumeRename(oldURL: oldURL, newURL: newURL)
+            }
+        }
+        let activate = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                // Cheap when name/path unchanged; fixes renames that happened while we were in the background.
+                await self.refreshOpenVolumeIdentity()
+            }
+        }
+        workspaceObserverTokens = [rename, activate]
+    }
+
+    private func handleWorkspaceVolumeRename(oldURL: URL?, newURL: URL?) async {
+        guard let volume, let newURL, !isScanning, !isBusy else { return }
+        let our = volume.rootURL.standardizedFileURL
+        let old = oldURL?.standardizedFileURL
+        let matchesOld = old == our
+        let matchesNew = newURL.standardizedFileURL == our
+        // Same card under a new /Volumes/name (bookmark identity).
+        let matchesUUID: Bool = {
+            guard let resolved = try? VolumeIdentity.resolve(
+                rootURL: newURL,
+                preferredUUID: volume.volumeUUID
+            ) else { return false }
+            return resolved.volumeUUID == volume.volumeUUID
+        }()
+
+        guard matchesOld || matchesNew || matchesUUID else { return }
+        LaunchTrace.mark(
+            "workspace volume rename \(old?.path ?? "?") → \(newURL.path)"
+        )
+        await refreshOpenVolumeChrome(for: newURL, persistRecents: true)
     }
 
     /// Permanently remove soft-deleted games from `.katana-trash` (with confirmation).
