@@ -46,7 +46,9 @@ struct GameRowView: View {
 
             FormatBadge(format: game.format)
 
-            Text(ByteCount.gameSizeString(for: game.byteSize, integerMegabytes: true))
+            Text(game.needsDetailEnrichment && game.byteSize < 1_000_000
+                 ? "—"
+                 : ByteCount.gameSizeString(for: game.byteSize, integerMegabytes: true))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 72, alignment: .trailing)

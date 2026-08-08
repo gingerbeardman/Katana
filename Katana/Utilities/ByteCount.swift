@@ -17,6 +17,10 @@ enum ByteCount: Sendable {
     nonisolated static func gameSizeString(for bytes: Int64, integerMegabytes: Bool = true) -> String {
         let value = max(0, bytes)
         if integerMegabytes {
+            // Decimal MB; values under ~0.5 MB would round to “0 MB” — show a floor instead.
+            if value > 0, value < 500_000 {
+                return "< 1 MB"
+            }
             let mb = Int((Double(value) / bytesPerMB).rounded())
             return "\(mb.formatted()) MB"
         }

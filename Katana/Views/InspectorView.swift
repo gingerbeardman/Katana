@@ -234,7 +234,7 @@ struct InspectorView: View {
 
     private func titleStatusLine(for game: GameEntry) -> String {
         let slot = FolderNumbering.format(game.number, maxNumber: maxNumber)
-        let size = state.formatSize(game.byteSize)
+        let size = state.formatGameSize(game)
         if game.isMenu {
             return "Slot \(slot) · \(state.menuKind.displayName) · \(size)"
         }

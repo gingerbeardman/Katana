@@ -11,7 +11,7 @@ struct SettingsView: View {
                 .tabItem { Label("General", systemImage: "gearshape") }
 
             CardSettingsPanel(state: state)
-                .tabItem { Label("Card", systemImage: "sdcard") }
+                .tabItem { Label("SD Card", systemImage: "sdcard") }
         }
         .frame(width: 480)
         .fixedSize(horizontal: false, vertical: true)
@@ -67,13 +67,13 @@ private struct GeneralSettingsPanel: View {
 
             SettingsSeparator()
 
-            SettingsSection(title: "Sizes:") {
+            SettingsSection(title: "Units:") {
                 SettingsToggle(
                     "Show sizes as whole megabytes",
                     isOn: $state.sizesAsIntegerMB
                 )
                 SettingsDescription(
-                    "Size column and inspector use whole MB (e.g. 1,188 MB).\nOff uses adaptive KB/MB. Title bar and sidebar free/capacity use GB when large."
+                    "Size column and inspector use whole MB (e.g. 1,188 MB). Off uses adaptive KB/MB. Title bar and sidebar free/capacity use GB when large."
                 )
             }
         }
@@ -122,7 +122,7 @@ private struct CardSettingsPanel: View {
                     isOn: $state.manageMultipleCards
                 )
                 SettingsDescription(
-                    "Show a Recent list in the sidebar to switch between SD cards.\nOff by default — one card at a time; the last card still reopens on launch."
+                    "Show a Recent list in the sidebar to switch between SD cards. Off by default — one card at a time; the last card still reopens on launch."
                 )
             }
 

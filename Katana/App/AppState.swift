@@ -178,6 +178,14 @@ final class AppState {
         ByteCount.gameSizeString(for: bytes, integerMegabytes: sizesAsIntegerMB)
     }
 
+    /// Size column / inspector: “—” while folder walk is still pending (avoids “0 MB” for GDI).
+    func formatGameSize(_ game: GameEntry) -> String {
+        if game.needsDetailEnrichment, game.byteSize < 1_000_000 {
+            return "—"
+        }
+        return formatSize(game.byteSize)
+    }
+
     /// Volume chrome: sidebar free/capacity/trash and title-bar totals — **GB** when large.
     func formatSize(_ bytes: Int64, capacityHint: Int64?) -> String {
         ByteCount.volumeSizeString(for: bytes, integerMegabytes: sizesAsIntegerMB, capacityHint: capacityHint)
@@ -823,34 +831,64 @@ final class AppState {
             return
         }
 
+        // Paint restore chrome before any SD / bookmark I/O (bookmark resolve can stall).
+        if volume == nil {
+            statusText = "Restoring \(remembered.volumeName)…"
+        }
+
         do {
-            let resolved = try LaunchTrace.measure("resolveURL bookmark") {
-                try VolumeStore.resolveURL(from: remembered)
+            // Bookmark resolve, security scope, and existence check can hit a slow SD reader —
+            // never block the main actor while waiting.
+            struct PreparedOpen: Sendable {
+                var url: URL
+                var accessStarted: Bool
+                var bookmarkData: Data?
             }
-            let url = resolved.url
-            LaunchTrace.mark("resolved URL: \(url.path)")
+            let prepared: PreparedOpen = try await LaunchTrace.measureAsync("openRemembered prepare (detached)") {
+                try await Task.detached(priority: .userInitiated) {
+                    let resolved = try LaunchTrace.measure("resolveURL bookmark") {
+                        try VolumeStore.resolveURL(from: remembered)
+                    }
+                    let url = resolved.url
+                    LaunchTrace.mark("resolved URL: \(url.path)")
 
-            // Must start security scope before touching the card under sandbox.
-            if resolved.isSecurityScoped {
-                let ok = LaunchTrace.measure("startAccessingSecurityScopedResource") {
-                    url.startAccessingSecurityScopedResource()
-                }
-                if ok {
-                    accessURL = url
-                    bookmarkData = remembered.bookmarkData
-                } else if !FileManager.default.fileExists(atPath: url.path) {
-                    throw VolumeStoreError.notMounted(remembered.volumeName)
-                }
+                    var accessStarted = false
+                    if resolved.isSecurityScoped {
+                        let ok = LaunchTrace.measure("startAccessingSecurityScopedResource") {
+                            url.startAccessingSecurityScopedResource()
+                        }
+                        if ok {
+                            accessStarted = true
+                        } else if !FileManager.default.fileExists(atPath: url.path) {
+                            throw VolumeStoreError.notMounted(remembered.volumeName)
+                        }
+                    }
+
+                    let exists = LaunchTrace.measure("fileExists card root") {
+                        FileManager.default.fileExists(atPath: url.path)
+                    }
+                    guard exists else {
+                        throw VolumeStoreError.notMounted(remembered.volumeName)
+                    }
+                    return PreparedOpen(
+                        url: url,
+                        accessStarted: accessStarted,
+                        bookmarkData: remembered.bookmarkData
+                    )
+                }.value
             }
 
-            let exists = LaunchTrace.measure("fileExists card root") {
-                FileManager.default.fileExists(atPath: url.path)
-            }
-            guard exists else {
-                throw VolumeStoreError.notMounted(remembered.volumeName)
+            if prepared.accessStarted {
+                accessURL = prepared.url
+                bookmarkData = prepared.bookmarkData
             }
 
-            await open(url: url, preexistingBookmark: remembered.bookmarkData)
+            // Pass remembered identity so path-only roots keep the same cache key after renames.
+            await open(
+                url: prepared.url,
+                preexistingBookmark: remembered.bookmarkData,
+                preferredVolumeUUID: remembered.volumeUUID
+            )
         } catch {
             LaunchTrace.mark("openRemembered failed: \(error.localizedDescription)")
             if showErrorIfMissing {
@@ -872,8 +910,15 @@ final class AppState {
         Task { await openRemembered(remembered, showErrorIfMissing: true) }
     }
 
-    func open(url: URL, preexistingBookmark: Data? = nil, forceRescan: Bool = false) async {
-        LaunchTrace.mark("open begin forceRescan=\(forceRescan) path=\(url.path)")
+    func open(
+        url: URL,
+        preexistingBookmark: Data? = nil,
+        forceRescan: Bool = false,
+        preferredVolumeUUID: String? = nil
+    ) async {
+        LaunchTrace.mark(
+            "open begin forceRescan=\(forceRescan) preferred=\(preferredVolumeUUID ?? "nil") path=\(url.path)"
+        )
         // Same card already open (sidebar / Open panel / restore) — keep list, no rescan.
         // Explicit Rescan / Clear Cache still passes forceRescan: true.
         if !forceRescan, !isScanning, isSameOpenVolume(as: url) {
@@ -902,14 +947,20 @@ final class AppState {
         scanProgress = nil
         statusText = "Scanning \(url.lastPathComponent)…"
 
+        // Lock identity for this open: disk UUID, else remembered/preferred, else mint once.
+        // Reuse that same id for chrome resolve, cache load, and scan (no path: keys).
+        var lockedVolumeUUID = preferredVolumeUUID
+        let preferredForEarly = lockedVolumeUUID
+
         // Show volume chrome immediately; table fills as folders are identified.
         // Resolve off main — capacity/read-only queries can stall on slow SD readers.
         let earlyVolume = await LaunchTrace.measureAsync("VolumeIdentity.resolve (detached)") {
             await Task.detached(priority: .userInitiated) {
-                try? VolumeIdentity.resolve(rootURL: url)
+                try? VolumeIdentity.resolve(rootURL: url, preferredUUID: preferredForEarly)
             }.value
         }
         if let resolved = earlyVolume {
+            lockedVolumeUUID = resolved.volumeUUID
             volume = resolved
             await LaunchTrace.measureAsync("loadDisplaySort") {
                 await loadDisplaySort(for: resolved.volumeUUID)
@@ -942,11 +993,13 @@ final class AppState {
                 statusText = "Opening \(url.lastPathComponent)…"
             }
 
+            let preferredForScan = lockedVolumeUUID
             var firstProgressAt: CFAbsoluteTime?
             let result = try await LaunchTrace.measureAsync("CardScanner.scan preferSnapshot=\(preferSnapshot)") {
                 try await CardScanner.scan(
                     rootURL: url,
-                    preferSnapshotCache: preferSnapshot
+                    preferSnapshotCache: preferSnapshot,
+                    preferredVolumeUUID: preferredForScan
                 ) { event in
                     if firstProgressAt == nil {
                         firstProgressAt = CFAbsoluteTimeGetCurrent()
@@ -1049,7 +1102,7 @@ final class AppState {
     /// After a fast scan, fill folder/payload sizes and stored hash sidecars off the main actor.
     private func startLazyDetailEnrichment(volumeUUID: String) {
         cancelLazyDetailEnrichment()
-        let pending = games.filter { !$0.detailsLoaded }
+        let pending = games.filter(\.needsDetailEnrichment)
         guard !pending.isEmpty else { return }
 
         detailEnrichmentGeneration &+= 1
@@ -1404,16 +1457,27 @@ final class AppState {
 
     func rescan() async {
         guard let volume else { return }
-        await open(url: volume.rootURL, preexistingBookmark: bookmarkData, forceRescan: true)
+        await open(
+            url: volume.rootURL,
+            preexistingBookmark: bookmarkData,
+            forceRescan: true,
+            preferredVolumeUUID: volume.volumeUUID
+        )
     }
 
     /// Drop the Application Support scan cache for the open volume and re-read the card.
     func clearCacheAndRescan() async {
         guard let volume, !isBusy else { return }
         let name = volume.volumeName
-        try? await CardCacheStore.shared.clear(volumeUUID: volume.volumeUUID)
+        let uuid = volume.volumeUUID
+        try? await CardCacheStore.shared.clear(volumeUUID: uuid)
         flash("Cleared cache for \(name)")
-        await open(url: volume.rootURL, preexistingBookmark: bookmarkData, forceRescan: true)
+        await open(
+            url: volume.rootURL,
+            preexistingBookmark: bookmarkData,
+            forceRescan: true,
+            preferredVolumeUUID: uuid
+        )
     }
 
     /// True when `url` is the card currently loaded (by volume UUID or standardized path).
@@ -1422,7 +1486,11 @@ final class AppState {
         if volume.rootURL.standardizedFileURL == url.standardizedFileURL {
             return true
         }
-        if let resolved = try? VolumeIdentity.resolve(rootURL: url),
+        // Prefer current identity so path-only roots don't mint a new id on compare.
+        if let resolved = try? VolumeIdentity.resolve(
+            rootURL: url,
+            preferredUUID: volume.volumeUUID
+        ),
            resolved.volumeUUID == volume.volumeUUID
         {
             return true
@@ -1432,7 +1500,8 @@ final class AppState {
 
     /// Refresh free-space chrome + hash-rate seed when re-selecting the open card.
     private func refreshOpenVolumeChrome(for url: URL) async {
-        if let resolved = try? VolumeIdentity.resolve(rootURL: url) {
+        let preferred = volume?.volumeUUID
+        if let resolved = try? VolumeIdentity.resolve(rootURL: url, preferredUUID: preferred) {
             volume = resolved
             await loadCachedHashRate(for: resolved.volumeUUID)
         }
@@ -1486,7 +1555,8 @@ final class AppState {
                 let result = try await Task.detached(priority: .userInitiated) {
                     try CardOperations.emptyTrash(rootURL: root, progress: progress)
                 }.value
-                if let resolved = try? VolumeIdentity.resolve(rootURL: root) {
+                let preferred = self.volume?.volumeUUID
+                if let resolved = try? VolumeIdentity.resolve(rootURL: root, preferredUUID: preferred) {
                     self.volume = resolved
                 }
                 refreshTrashSummary()
@@ -1512,6 +1582,7 @@ final class AppState {
 
         let root = volume.rootURL
         let name = volume.volumeName
+        let uuid = volume.volumeUUID
         do {
             // Keep last volume + recents so remount/relaunch can restore access.
             stopAccess()
@@ -1533,7 +1604,11 @@ final class AppState {
             // Re-open if eject failed (still mounted).
             lastError = error.localizedDescription
             statusText = "Eject failed"
-            await open(url: root, preexistingBookmark: bookmarkData)
+            await open(
+                url: root,
+                preexistingBookmark: bookmarkData,
+                preferredVolumeUUID: uuid
+            )
         }
     }
 
@@ -1593,7 +1668,8 @@ final class AppState {
             refreshStatus()
             invalidateCacheAsync()
             // Free space may have changed after large copies.
-            if let resolved = try? VolumeIdentity.resolve(rootURL: root) {
+            let preferred = self.volume?.volumeUUID
+            if let resolved = try? VolumeIdentity.resolve(rootURL: root, preferredUUID: preferred) {
                 self.volume = resolved
             }
 
@@ -1645,8 +1721,8 @@ final class AppState {
                 games[index].isMenu = GameEntry.isMenuName(trimmed) || games[index].number == 1
                 markMenuNeedsRebuild()
             }
-            // Status line does not include game names; skip refreshStatus() churn.
-            invalidateCacheAsync()
+            // Name-only change: patch cache in place so the next launch can still snapshot.
+            persistNameCacheUpdates(for: [games[index]])
 
             undoManager.registerUndo(withTarget: self) { target in
                 target.rename(id: id, to: previous)
@@ -1735,7 +1811,8 @@ final class AppState {
         withTransaction(transaction) {
             markMenuNeedsRebuild()
         }
-        invalidateCacheAsync()
+        let renamed = undos.compactMap { id, _ in games.first(where: { $0.id == id }) }
+        persistNameCacheUpdates(for: renamed)
         flash(undos.count == 1 ? "Renamed" : "Renamed \(undos.count) games")
 
         undoManager.registerUndo(withTarget: self) { target in
@@ -2245,6 +2322,25 @@ final class AppState {
         guard let volume else { return }
         Task {
             try? await CardCacheStore.shared.clear(volumeUUID: volume.volumeUUID)
+        }
+    }
+
+    /// After name-only renames, update the on-disk scan cache instead of deleting it.
+    /// Folder set is unchanged — next open can still take the snapshot path.
+    private func persistNameCacheUpdates(for games: [GameEntry]) {
+        guard let volume, !games.isEmpty else { return }
+        let uuid = volume.volumeUUID
+        var namesByFolder: [String: (name: String, isMenu: Bool)] = [:]
+        namesByFolder.reserveCapacity(games.count)
+        for game in games {
+            let folder = game.folderURL.lastPathComponent
+            namesByFolder[folder] = (name: game.name, isMenu: game.isMenu)
+        }
+        Task {
+            try? await CardCacheStore.shared.applyNameUpdates(
+                volumeUUID: uuid,
+                namesByFolder: namesByFolder
+            )
         }
     }
 

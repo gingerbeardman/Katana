@@ -64,7 +64,7 @@ struct GameListView: View {
                 .width(min: 52, ideal: 64, max: 80)
 
                 TableColumn("Size", value: \.byteSize) { game in
-                    Text(state.formatSize(game.byteSize))
+                    Text(state.formatGameSize(game))
                         .font(.body.monospacedDigit())
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .trailing)

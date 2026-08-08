@@ -19,7 +19,8 @@ nonisolated struct GameEntry: Identifiable, Codable, Hashable, Sendable {
     var contentSHA256: String?
     var isMenu: Bool
     /// False after a fast scan until sizes / stored hashes are filled in the background.
-    var detailsLoaded: Bool = true
+    /// Default **false** so missing JSON keys (older caches) re-enrich instead of sticking at 0 MB.
+    var detailsLoaded: Bool = false
 
     var folderURL: URL {
         URL(fileURLWithPath: folderPath, isDirectory: true)
@@ -30,6 +31,18 @@ nonisolated struct GameEntry: Identifiable, Codable, Hashable, Sendable {
 
     var hasContentHash: Bool {
         contentSHA256 != nil && !(contentSHA256?.isEmpty ?? true)
+    }
+
+    /// Whether lazy folder walk should still run for sizes / hash sidecars.
+    ///
+    /// GDI `disc.gdi` is a tiny cue file; provisional fast-scan size is often &lt; 1 MB and
+    /// used to be mistaken for “fully loaded,” leaving the Size column at **0 MB**.
+    var needsDetailEnrichment: Bool {
+        if !detailsLoaded { return true }
+        if byteSize <= 0 { return true }
+        // Provisional GDI image-only size (cue text), not full track payload.
+        if format == .gdi, byteSize < 1_000_000 { return true }
+        return false
     }
 
     nonisolated static func isMenuName(_ name: String) -> Bool {

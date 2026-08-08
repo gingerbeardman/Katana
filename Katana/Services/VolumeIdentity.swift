@@ -1,8 +1,28 @@
 import Foundation
 
 enum VolumeIdentity: Sendable {
+    /// Prefix for minted IDs when the filesystem exposes no volume UUID.
+    /// Survives path/name renames when persisted on `RememberedVolume`.
+    nonisolated static let stableIDPrefix = "stable:"
+
+    /// Legacy path-based keys (pre-stable-ID). Still recognized for continuity.
+    nonisolated static let pathIDPrefix = "path:"
+
     /// Resolve volume metadata for a user-selected card root.
-    nonisolated static func resolve(rootURL: URL) throws -> CardVolume {
+    ///
+    /// Identity priority (bookmark = access; this = cache/recents key):
+    /// 1. Disk volume UUID when the OS provides one (survives Finder renames)
+    /// 2. `preferredUUID` from a prior open / remembered card (survives path renames
+    ///    when the disk has no UUID — e.g. some FAT fixtures)
+    /// 3. Mint `stable:<uuid>` once — caller must persist via `VolumeStore.remember`
+    ///
+    /// Never keys on volume *name*. Path is not used as a new identity.
+    /// - Parameter preferredUUID: Known identity from recents / an earlier resolve in the
+    ///   same open so path-only roots keep one key across renames and double resolves.
+    nonisolated static func resolve(
+        rootURL: URL,
+        preferredUUID: String? = nil
+    ) throws -> CardVolume {
         let values = try rootURL.resourceValues(forKeys: [
             .volumeUUIDStringKey,
             .volumeNameKey,
@@ -16,9 +36,10 @@ enum VolumeIdentity: Sendable {
             throw ScanError.notADirectory(rootURL)
         }
 
-        // Prefer volume UUID; fall back to a stable path-based key for non-volume folders (dev fixtures).
-        let uuid = values.volumeUUIDString
-            ?? "path:" + rootURL.standardizedFileURL.path
+        let uuid = stableVolumeUUID(
+            diskUUID: values.volumeUUIDString,
+            preferredUUID: preferredUUID
+        )
 
         let name = values.volumeName
             ?? rootURL.lastPathComponent
@@ -40,6 +61,32 @@ enum VolumeIdentity: Sendable {
             totalBytes: values.volumeTotalCapacity.map { Int64($0) },
             isReadOnly: isReadOnly
         )
+    }
+
+    /// Choose a durable cache/recents key. Disk UUID wins; otherwise keep preferred; else mint.
+    nonisolated static func stableVolumeUUID(
+        diskUUID: String?,
+        preferredUUID: String?
+    ) -> String {
+        if let disk = diskUUID?.trimmingCharacters(in: .whitespacesAndNewlines), !disk.isEmpty {
+            return disk
+        }
+        if let preferred = preferredUUID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !preferred.isEmpty
+        {
+            return preferred
+        }
+        return stableIDPrefix + UUID().uuidString
+    }
+
+    /// True when `id` was minted locally (no OS volume UUID).
+    nonisolated static func isMintedStableID(_ id: String) -> Bool {
+        id.hasPrefix(stableIDPrefix)
+    }
+
+    /// True when `id` is a legacy path-derived key.
+    nonisolated static func isPathDerivedID(_ id: String) -> Bool {
+        id.hasPrefix(pathIDPrefix)
     }
 }
 

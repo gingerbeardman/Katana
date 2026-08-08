@@ -50,6 +50,37 @@ actor CardCacheStore {
         try clearDuplicates(volumeUUID: volumeUUID)
     }
 
+    /// Patch display names after a name-only rename without dropping the rest of the cache.
+    ///
+    /// Folder set is unchanged, so the next launch can still take the snapshot path.
+    /// Updates both `entry.name` / `isMenu` and `fingerprint.nameTxt` so per-folder
+    /// fingerprint hits still match `name.txt` on disk.
+    func applyNameUpdates(
+        volumeUUID: String,
+        namesByFolder: [String: (name: String, isMenu: Bool)]
+    ) throws {
+        guard !namesByFolder.isEmpty else { return }
+        guard var cache = try load(volumeUUID: volumeUUID), !cache.entries.isEmpty else { return }
+
+        var changed = false
+        for i in cache.entries.indices {
+            let folder = cache.entries[i].fingerprint.folderName
+            guard let update = namesByFolder[folder] else { continue }
+            if cache.entries[i].entry.name != update.name
+                || cache.entries[i].entry.isMenu != update.isMenu
+                || cache.entries[i].fingerprint.nameTxt != update.name
+            {
+                cache.entries[i].entry.name = update.name
+                cache.entries[i].entry.isMenu = update.isMenu
+                cache.entries[i].fingerprint.nameTxt = update.name
+                changed = true
+            }
+        }
+        guard changed else { return }
+        cache.scannedAt = Date()
+        try save(cache)
+    }
+
     // MARK: - Duplicate analysis cache
 
     private func duplicateCacheURL(for volumeUUID: String) -> URL {

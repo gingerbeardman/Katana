@@ -45,33 +45,62 @@ enum CardScanner: Sendable {
     /// - Parameter preferSnapshotCache: When true (default), if a saved `CardCache` for this volume
     ///   lists the exact same slot folders as the live card, return that snapshot without per-folder I/O.
     ///   Pass false for Rescan / Clear Cache so fingerprints and names are refreshed from disk.
+    /// - Parameter preferredVolumeUUID: Identity from recents / an earlier resolve in the same open so
+    ///   path-only roots keep one cache key across renames (see `VolumeIdentity.resolve`).
     /// - Parameter onProgress: Invoked in batches as folders are identified (UI should insert by slot).
     nonisolated static func scan(
         rootURL: URL,
         maxConcurrent: Int = defaultMaxConcurrent,
         preferSnapshotCache: Bool = true,
+        preferredVolumeUUID: String? = nil,
         onProgress: (@Sendable (ProgressEvent) async -> Void)? = nil
     ) async throws -> ScanResult {
-        try await performScan(
-            rootURL: rootURL,
-            maxConcurrent: maxConcurrent,
-            preferSnapshotCache: preferSnapshotCache,
-            onProgress: onProgress
-        )
+        // Explicit detach: default MainActor isolation + SD I/O must never beachball the UI
+        // during resolve / root listing / cache decode before first progress.
+        try await Task.detached(priority: .userInitiated) {
+            try await performScan(
+                rootURL: rootURL,
+                maxConcurrent: maxConcurrent,
+                preferSnapshotCache: preferSnapshotCache,
+                preferredVolumeUUID: preferredVolumeUUID,
+                onProgress: onProgress
+            )
+        }.value
     }
 
     /// Load a previously saved card cache if the live slot-folder set still matches.
     /// Used for recent-card reopen — one root directory listing, no per-game stats.
-    nonisolated static func loadSnapshotIfValid(rootURL: URL) async throws -> ScanResult? {
+    nonisolated static func loadSnapshotIfValid(
+        rootURL: URL,
+        preferredVolumeUUID: String? = nil
+    ) async throws -> ScanResult? {
         let started = Date()
-        let volume = try VolumeIdentity.resolve(rootURL: rootURL)
-        guard let cache = try? await CardCacheStore.shared.load(volumeUUID: volume.volumeUUID),
-              !cache.entries.isEmpty
-        else { return nil }
-
+        let volume = try VolumeIdentity.resolve(rootURL: rootURL, preferredUUID: preferredVolumeUUID)
         let liveFolders = try numberedFolderNames(at: rootURL)
+        guard let cache = try? await CardCacheStore.shared.load(volumeUUID: volume.volumeUUID) else {
+            return nil
+        }
+        guard let result = snapshotResultIfValid(
+            rootURL: rootURL,
+            volume: volume,
+            cache: cache,
+            liveFolderNames: liveFolders,
+            started: started
+        ) else { return nil }
+        return result
+    }
+
+    /// Build a snapshot scan result when the on-disk slot-folder set matches the cache.
+    nonisolated private static func snapshotResultIfValid(
+        rootURL: URL,
+        volume: CardVolume,
+        cache: CardCache,
+        liveFolderNames: Set<String>,
+        started: Date
+    ) -> ScanResult? {
+        guard !cache.entries.isEmpty else { return nil }
         let cachedFolders = Set(cache.entries.map(\.fingerprint.folderName))
-        guard liveFolders == cachedFolders else { return nil }
+        guard liveFolderNames == cachedFolders else { return nil }
 
         let entries: [GameEntry] = cache.entries.compactMap { cached in
             var entry = cached.entry
@@ -79,15 +108,13 @@ enum CardScanner: Sendable {
             guard let number = FolderNumbering.parse(folderName) else { return nil }
             entry.number = number
             entry.folderPath = rootURL.appendingPathComponent(folderName, isDirectory: true).path
-            // Snapshot rows are treated as fully loaded when sizes/hash were cached.
-            if entry.byteSize > 0 {
-                entry.detailsLoaded = true
-            }
+            // Keep stored `detailsLoaded` — do not treat provisional image-only sizes
+            // (tiny GDI cue files) as final, or Size stays at 0 MB forever.
             return entry
         }
         .sorted { $0.number < $1.number }
 
-        guard entries.count == liveFolders.count, !entries.isEmpty else { return nil }
+        guard entries.count == liveFolderNames.count, !entries.isEmpty else { return nil }
 
         let ms = Int(Date().timeIntervalSince(started) * 1000)
         return ScanResult(
@@ -103,18 +130,36 @@ enum CardScanner: Sendable {
         rootURL: URL,
         maxConcurrent: Int,
         preferSnapshotCache: Bool,
+        preferredVolumeUUID: String?,
         onProgress: (@Sendable (ProgressEvent) async -> Void)?
     ) async throws -> ScanResult {
         let started = Date()
         LaunchTrace.mark("CardScanner.performScan begin preferSnapshot=\(preferSnapshotCache)")
         let volume = try LaunchTrace.measure("CardScanner VolumeIdentity.resolve") {
-            try VolumeIdentity.resolve(rootURL: rootURL)
+            try VolumeIdentity.resolve(rootURL: rootURL, preferredUUID: preferredVolumeUUID)
         }
-        let fm = FileManager.default
 
-        if preferSnapshotCache {
-            let snapshot = try await LaunchTrace.measureAsync("CardScanner.loadSnapshotIfValid") {
-                try await loadSnapshotIfValid(rootURL: rootURL)
+        // One root inventory + one cache load — shared by snapshot check and full scan.
+        let numbered = try LaunchTrace.measure("CardScanner.numberedFolderURLs") {
+            try numberedFolderURLs(at: rootURL)
+        }
+        let liveFolderNames = Set(numbered.map { $0.1.lastPathComponent })
+        LaunchTrace.mark("CardScanner numbered folders=\(numbered.count)")
+
+        let cached = try await LaunchTrace.measureAsync("CardCacheStore.load") {
+            try? await CardCacheStore.shared.load(volumeUUID: volume.volumeUUID)
+        }
+        LaunchTrace.mark("CardCacheStore.load entries=\(cached?.entries.count ?? 0)")
+
+        if preferSnapshotCache, let cached {
+            let snapshot = LaunchTrace.measure("CardScanner snapshot check") {
+                snapshotResultIfValid(
+                    rootURL: rootURL,
+                    volume: volume,
+                    cache: cached,
+                    liveFolderNames: liveFolderNames,
+                    started: started
+                )
             }
             if let snapshot {
                 LaunchTrace.mark("CardScanner snapshot HIT \(snapshot.entries.count) entries")
@@ -133,10 +178,6 @@ enum CardScanner: Sendable {
             LaunchTrace.mark("CardScanner snapshot MISS")
         }
 
-        let cached = try await LaunchTrace.measureAsync("CardCacheStore.load") {
-            try? await CardCacheStore.shared.load(volumeUUID: volume.volumeUUID)
-        }
-        LaunchTrace.mark("CardCacheStore.load entries=\(cached?.entries.count ?? 0)")
         // uniquingKeysWith: corrupt caches may repeat folder names after partial renumbers.
         let cacheByFolder: [String: CachedEntry] = {
             guard let cached else { return [:] }
@@ -146,12 +187,7 @@ enum CardScanner: Sendable {
             )
         }()
 
-        let numbered = try LaunchTrace.measure("CardScanner.numberedFolderURLs") {
-            try numberedFolderURLs(at: rootURL)
-        }
-
         let total = numbered.count
-        LaunchTrace.mark("CardScanner numbered folders=\(total)")
         var hits = 0
         var misses = 0
         var collected: [GameEntry] = []
@@ -184,7 +220,7 @@ enum CardScanner: Sendable {
                     if var entry = cacheByFolder[folderName]?.entry {
                         entry.number = number
                         entry.folderPath = url.path
-                        if entry.byteSize > 0 { entry.detailsLoaded = true }
+                        // Respect stored detailsLoaded (provisional GDI sizes stay pending).
                         return entry
                     }
                     return GameEntry(
@@ -331,14 +367,12 @@ enum CardScanner: Sendable {
             fileCount: fileCount
         )
 
-        // Cache hit: reuse full sizes/hash from last scan without re-walking the folder.
+        // Cache hit: reuse entry fields; only trust sizes when details were fully enriched.
         if let cached, cached.fingerprint == fingerprint {
             var entry = cached.entry
             entry.number = number
             entry.folderPath = folderURL.path
-            if !entry.detailsLoaded, entry.byteSize > 0 {
-                entry.detailsLoaded = true
-            }
+            // Never promote provisional image-only sizes to “loaded” — GDI cue files are tiny.
             return FolderScan(entry: entry, fingerprint: fingerprint, cacheHit: true)
         }
 
