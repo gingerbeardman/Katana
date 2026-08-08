@@ -159,6 +159,7 @@ struct SidebarView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
+        // Scan keeps the card chrome usable; rebuild and other busy ops lock it.
         .disabled(state.isBusy && !state.isScanning)
     }
 
@@ -375,7 +376,8 @@ struct SidebarView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
-        .disabled(state.isScanning)
+        // Hash / select while rebuild or other card I/O is running is unsafe.
+        .disabled(state.isBusy || state.isScanning)
     }
 
     // MARK: - Scan

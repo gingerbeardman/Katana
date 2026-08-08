@@ -1,6 +1,18 @@
 import Foundation
 
 extension String {
+    /// Entire name uppercased (after trim).
+    /// Example: `Sonic Adventure` → `SONIC ADVENTURE`
+    var uppercasedName: String {
+        trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    }
+
+    /// Entire name lowercased (after trim).
+    /// Example: `SONIC ADVENTURE` → `sonic adventure`
+    var lowercasedName: String {
+        trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
     /// First character uppercased, remainder lowercased (after trim).
     /// Example: `SONIC ADVENTURE` → `Sonic adventure`
     var sentenceCasedTitle: String {

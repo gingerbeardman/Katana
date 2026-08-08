@@ -30,7 +30,7 @@ struct GameListView: View {
         // Bottom insets on NavigationSplitView detail + Table were clipped unless
         // the window was extremely tall — users never saw the bar.
         VStack(spacing: 0) {
-            if state.volume != nil, state.menuNeedsRebuild {
+            if state.volume != nil, state.menuNeedsRebuild, !state.isRebuildingMenu {
                 menuRebuildBar
             }
 
@@ -72,9 +72,14 @@ struct GameListView: View {
                 }
                 .width(min: 72, ideal: 88, max: 110)
             }
-            // Keep rows visible while scanning; block interaction only.
-            .disabled(state.isScanning || state.isBusy)
-            .opacity(state.isScanning ? 0.72 : 1)
+            // Keep rows visible while scanning/rebuilding — block interaction only.
+            // No card: empty chrome only (open from sidebar); don’t allow sort/select.
+            .disabled(state.volume == nil || state.isScanning || state.isRebuildingMenu || state.isBusy)
+            .opacity(
+                state.volume == nil
+                    ? 0.55
+                    : (state.isScanning || state.isRebuildingMenu) ? 0.72 : 1
+            )
             .background {
                 if state.scrollToNewRows {
                     TableSelectionScroller(trigger: state.scrollTargetGameID)
@@ -92,6 +97,7 @@ struct GameListView: View {
                 guard state.renamingGameID == nil,
                       !state.isBusy,
                       !state.isScanning,
+                      !state.isRebuildingMenu,
                       state.selection.count == 1,
                       let id = state.selection.first
                 else { return .ignored }
@@ -99,38 +105,25 @@ struct GameListView: View {
                 return .handled
             }
             .overlay(alignment: .top) {
-                // Subtle edge progress only — count lives in the window subtitle.
+                // Edge progress — scan (accent) or menu rebuild (warning orange).
                 if state.isScanning, let progress = state.scanProgress, progress.total > 0 {
-                    GeometryReader { geo in
-                        let fraction = progress.total > 0
-                            ? min(1, max(0, Double(progress.completed) / Double(progress.total)))
-                            : 0
-                        ZStack(alignment: .leading) {
-                            Rectangle()
-                                .fill(Color.primary.opacity(0.08))
-                            Rectangle()
-                                .fill(Color.accentColor)
-                                .frame(width: geo.size.width * fraction)
-                        }
-                    }
-                    .frame(height: 2)
-                    .allowsHitTesting(false)
+                    edgeProgressBar(
+                        fraction: min(1, max(0, Double(progress.completed) / Double(progress.total))),
+                        color: .accentColor
+                    )
+                } else if state.isRebuildingMenu {
+                    edgeProgressBar(
+                        fraction: state.rebuildProgress ?? 0,
+                        color: .orange
+                    )
                 }
             }
             .overlay {
-                // Do not cover the table while scanning — rows fill in as progress.
-                if let busy = state.busyMessage, !state.isScanning {
+                // Center busy card only for non-scan / non-rebuild ops (import, delete, …).
+                // No-card empty state lives in the sidebar (Open / Reopen) — no overlay on the table.
+                if let busy = state.busyMessage, !state.isScanning, !state.isRebuildingMenu {
                     busyOverlay(busy)
-                } else if state.volume == nil, !state.isScanning {
-                    ContentUnavailableView {
-                        Label("No Card Open", systemImage: "sdcard")
-                    } description: {
-                        Text("Open a GDEMU SD card root (the folder that contains 01, 02, …).")
-                    } actions: {
-                        Button("Open Card…") { state.openCard() }
-                            .buttonStyle(.borderedProminent)
-                    }
-                } else if state.filteredGames.isEmpty, !state.isScanning, state.volume != nil {
+                } else if state.volume != nil, state.filteredGames.isEmpty, !state.isScanning {
                     ContentUnavailableView.search(text: state.searchText)
                 }
             }
@@ -196,7 +189,7 @@ struct GameListView: View {
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
-            Text("— rebuild so the console matches the card")
+            Text("— rebuild so the menu matches the card")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -297,6 +290,14 @@ struct GameListView: View {
                 state.selection = selectedIDs
                 state.titleCaseSelection()
             }
+            Button("Uppercase") {
+                state.selection = selectedIDs
+                state.uppercaseSelection()
+            }
+            Button("Lowercase") {
+                state.selection = selectedIDs
+                state.lowercaseSelection()
+            }
         }
         .disabled(count == 0 || state.isBusy)
 
@@ -353,6 +354,22 @@ struct GameListView: View {
         ProgressView(message)
             .padding(24)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    /// 2pt edge progress (scan accent / rebuild orange).
+    private func edgeProgressBar(fraction: Double, color: Color) -> some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Rectangle()
+                    .fill(Color.primary.opacity(0.08))
+                Rectangle()
+                    .fill(color)
+                    .frame(width: geo.size.width * fraction)
+                    .animation(.linear(duration: 0.2), value: fraction)
+            }
+        }
+        .frame(height: 2)
+        .allowsHitTesting(false)
     }
 }
 

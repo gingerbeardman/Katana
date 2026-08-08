@@ -55,8 +55,8 @@ final class AppState {
             UserDefaults.standard.set(scrollToNewRows, forKey: AppState.scrollToNewRowsKey)
         }
     }
-    /// When true, sizes are whole megabytes (`1,188 MB`). When false, adaptive KB/MB/GB.
-    /// Default on.
+    /// When true, game/list sizes are whole MB (`1,188 MB`). When false, adaptive KB/MB.
+    /// Title bar + sidebar capacity still use GB when large. Default on.
     var sizesAsIntegerMB: Bool = AppState.loadSizesAsIntegerMB() {
         didSet {
             UserDefaults.standard.set(sizesAsIntegerMB, forKey: AppState.sizesAsIntegerMBKey)
@@ -66,6 +66,10 @@ final class AppState {
         }
     }
     var isScanning = false
+    /// True while baking/installing the console menu image (slot 01).
+    var isRebuildingMenu = false
+    /// 0…1 progress for the rebuild edge bar (`nil` when idle).
+    var rebuildProgress: Double?
     /// Trailing inspector visibility (standard macOS `.inspector`). Persisted across launches.
     var isInspectorPresented: Bool = AppState.loadInspectorPresented() {
         didSet {
@@ -84,7 +88,7 @@ final class AppState {
     var busyMessage: String?
     /// Live scan progress for the status line / table chrome (`nil` when idle).
     var scanProgress: (completed: Int, total: Int)?
-    var statusText: String = "Open a GDEMU SD card to begin."
+    var statusText: String = "Open a GDEMU SD card to begin"
     /// Soft-delete trash on the open card (`.katana-trash`).
     var trashSummary: CardOperations.TrashSummary = .empty
     /// Transient status toast — auto-clears; never a modal.
@@ -169,14 +173,14 @@ final class AppState {
         return UserDefaults.standard.bool(forKey: sizesAsIntegerMBKey)
     }
 
-    /// Format a byte count using the user’s size-display preference.
+    /// Game sizes: Size column, inspector, selection totals — **MB only** (never GB).
     func formatSize(_ bytes: Int64) -> String {
-        ByteCount.string(for: bytes, integerMegabytes: sizesAsIntegerMB)
+        ByteCount.gameSizeString(for: bytes, integerMegabytes: sizesAsIntegerMB)
     }
 
-    /// Format used/free/capacity with a shared unit when the card is large (prefer GB).
+    /// Volume chrome: sidebar free/capacity/trash and title-bar totals — **GB** when large.
     func formatSize(_ bytes: Int64, capacityHint: Int64?) -> String {
-        ByteCount.string(for: bytes, integerMegabytes: sizesAsIntegerMB, capacityHint: capacityHint)
+        ByteCount.volumeSizeString(for: bytes, integerMegabytes: sizesAsIntegerMB, capacityHint: capacityHint)
     }
 
     private static func loadInspectorSections() -> [String: Bool] {
@@ -204,29 +208,21 @@ final class AppState {
         inspectorSectionExpanded = next
     }
 
-    var isBusy: Bool { isScanning || busyMessage != nil }
+    var isBusy: Bool { isScanning || isRebuildingMenu || busyMessage != nil }
 
-    /// List-row badge for the `#` column. Only when markers (or “duplicates only”) are on.
+    /// List-row badge for the `#` column. Only real duplicate chips — never a blank “—”.
     func listDuplicateBadge(for id: GameEntry.ID) -> DuplicateListBadge? {
         guard duplicatesEnabled else { return nil }
         let markersWanted = showDuplicateMarkers || showDuplicatesOnly
         guard markersWanted else { return nil }
 
-        // Menu row has its own MENU chip; skip the count placeholder.
+        // Menu row has its own MENU chip.
         if games.first(where: { $0.id == id })?.isMenu == true {
             return nil
         }
 
-        // Pending “—” only while analysis runs *and* markers are on (not during a quiet rescan).
-        if !hasDuplicateAnalysis || isDuplicateInfoComputing {
-            return .pending
-        }
-
-        if let info = duplicateInfoByID[id] {
-            return .ready(info)
-        }
-        // Not in a group — still show “—” so the slot stays stable when markers are on.
-        return .empty
+        guard let info = duplicateInfoByID[id] else { return nil }
+        return .ready(info)
     }
 
     /// Soft-dim non-duplicates when filtering is on (rows stay in place — no list reflow).
@@ -791,7 +787,7 @@ final class AppState {
             return
         }
         guard let remembered = try? await VolumeStore.shared.lastRemembered() else {
-            statusText = "Open a GDEMU SD card to begin."
+            statusText = "Open a GDEMU SD card to begin"
             LaunchTrace.mark("restoreSessionIfNeeded: no remembered volume")
             return
         }
@@ -860,7 +856,7 @@ final class AppState {
             if showErrorIfMissing {
                 lastError = error.localizedDescription
             }
-            statusText = "Open a GDEMU SD card to begin."
+            statusText = "Open a GDEMU SD card to begin"
             await reloadRecents()
         }
     }
@@ -1497,7 +1493,9 @@ final class AppState {
                 if result.itemCount == 0 {
                     flash("Trash was empty")
                 } else {
-                    let sizeNote = result.bytesFreed > 0 ? " · \(formatSize(result.bytesFreed)) freed" : ""
+                    let sizeNote = result.bytesFreed > 0
+                        ? " · \(formatSize(result.bytesFreed, capacityHint: capacity)) freed"
+                        : ""
                     flash("Emptied trash · \(result.itemCount) item\(result.itemCount == 1 ? "" : "s")\(sizeNote)")
                 }
             } catch {
@@ -1521,10 +1519,12 @@ final class AppState {
             games = []
             selection = []
             trashSummary = .empty
+            lastScanStats = nil
             menuContentDirty = false
             bakedMenuKind = .gdMenu
             menuKind = .gdMenu
             undoManager.removeAllActions()
+            resetDuplicateAnalysisState()
             try await VolumeEject.eject(rootURL: root)
             statusText = "Ejected \(name)"
             flash("Ejected")
@@ -1665,6 +1665,16 @@ final class AppState {
     /// Apply title case to every selected game (immediate writes).
     func titleCaseSelection() {
         applyBulkRename(to: selectedGames, actionName: "Title Case") { $0.name.titleCasedName }
+    }
+
+    /// Apply uppercase to every selected game (immediate writes).
+    func uppercaseSelection() {
+        applyBulkRename(to: selectedGames, actionName: "Uppercase") { $0.name.uppercasedName }
+    }
+
+    /// Apply lowercase to every selected game (immediate writes).
+    func lowercaseSelection() {
+        applyBulkRename(to: selectedGames, actionName: "Lowercase") { $0.name.lowercasedName }
     }
 
     /// Auto-rename selection from IP.BIN / folder name / disc file name (GCM-style).
@@ -1966,16 +1976,19 @@ final class AppState {
             return false
         }
         // Allow quit-time rebuild even if `isBusy` was set by the quit handler.
-        guard !isScanning else { return false }
+        guard !isScanning, !isRebuildingMenu else { return false }
         if busyMessage != nil, !isHandlingQuit { return false }
 
         let snapshot = games
         guard let root = volume?.rootURL else { return false }
         let kind = menuKind
-        let progress = makeProgressHandler()
 
-        busyMessage = "Rebuilding \(kind.displayName)…"
+        isRebuildingMenu = true
+        rebuildProgress = 0
+        statusText = "Rebuilding \(kind.displayName)…"
         defer {
+            isRebuildingMenu = false
+            rebuildProgress = nil
             if !isHandlingQuit {
                 busyMessage = nil
             }
@@ -1986,7 +1999,13 @@ final class AppState {
                     games: snapshot,
                     rootURL: root,
                     menuKind: kind,
-                    progress: progress
+                    progress: { [weak self] message, fraction in
+                        Task { @MainActor in
+                            guard let self, self.isRebuildingMenu else { return }
+                            self.rebuildProgress = min(1, max(0, fraction))
+                            self.statusText = message
+                        }
+                    }
                 )
             }.value
 
@@ -2017,6 +2036,7 @@ final class AppState {
             return true
         } catch {
             lastError = error.localizedDescription
+            refreshStatus()
             return false
         }
     }
@@ -2096,9 +2116,8 @@ final class AppState {
     /// Rebuild (optional) → optional eject → allow app termination.
     private func finishQuit(rebuild: Bool) async {
         let shouldEject = ejectOnQuit && volume != nil
-        if rebuild {
-            busyMessage = "Rebuilding menu list…"
-        } else if shouldEject {
+        // Rebuild uses the edge progress bar (isRebuildingMenu), not the center overlay.
+        if !rebuild, shouldEject {
             busyMessage = "Ejecting…"
         }
         defer {

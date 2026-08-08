@@ -156,6 +156,12 @@ struct KatanaApp: App {
                     Button("Title Case") {
                         state.titleCaseSelection()
                     }
+                    Button("Uppercase") {
+                        state.uppercaseSelection()
+                    }
+                    Button("Lowercase") {
+                        state.lowercaseSelection()
+                    }
                 }
                 .disabled(state.selection.isEmpty || state.isBusy)
 

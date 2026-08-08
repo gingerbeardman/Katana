@@ -101,9 +101,9 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
             description: "Spot same-size, same-serial, and hash-matched copies. Hash missing games when you want exact matches."
         ),
         WelcomeFeature(
-            icon: "square.and.arrow.down",
+            icon: "oven",
             title: "Rebuild the Menu",
-            description: "Bake names and order into GDmenu or openMenu in slot 01 (⌘S) so the console list matches the card."
+            description: "Bake names and order into GDmenu or openMenu in slot 01 (⌘S) so the menu matches the card."
         ),
     ]
 

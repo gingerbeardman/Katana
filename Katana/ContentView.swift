@@ -14,11 +14,12 @@ struct ContentView: View {
                     InspectorView(state: state)
                         .inspectorColumnWidth(min: 260, ideal: 280, max: 360)
                 }
-                // Customizable toolbar. Default icons only:
-                // + − A–Z Rebuild Eject · search · Inspector
-                // Palette also has Open / Up / Down / Duplicates, plus native
-                // Space / Flexible Space (via installNativeToolbarSpacers).
+                // Toolbar order (layout-toolbar): leading = highest-frequency task flow;
+                // trailing = stable global/UI (search via .searchable, then inspector).
+                // Default: Open · Add · Delete · Rebuild · A–Z · Eject | search | Inspector
+                // Palette only: Up / Down / Duplicates (+ native Space / Flexible Space).
                 .toolbar(id: "katana.main") {
+                    // --- Leading: open / create ---
                     ToolbarItem(id: "open", placement: .primaryAction) {
                         Button {
                             state.openCard()
@@ -27,7 +28,6 @@ struct ContentView: View {
                         }
                         .help("Open GDEMU SD card")
                     }
-                    .defaultCustomization(.hidden)
 
                     ToolbarItem(id: "add", placement: .primaryAction) {
                         Button {
@@ -39,6 +39,7 @@ struct ContentView: View {
                         .help("Add disc images or game folders to the next free slots")
                     }
 
+                    // --- Edit selection ---
                     ToolbarItem(id: "delete", placement: .primaryAction) {
                         Button {
                             state.deleteSelected()
@@ -73,23 +74,14 @@ struct ContentView: View {
                     }
                     .defaultCustomization(.hidden)
 
-                    ToolbarItem(id: "sortAZ", placement: .primaryAction) {
-                        Button {
-                            state.sortAlphabetically()
-                        } label: {
-                            Label("Apply A–Z to Disc", systemImage: "arrow.up.arrow.down.square")
-                        }
-                        .disabled(state.volume == nil || state.games.count < 2 || state.isBusy)
-                        .help("Renumber folders A–Z on the SD card. Click table headers to sort the view only.")
-                    }
-
+                    // --- Commit / organize (after edit) ---
                     ToolbarItem(id: "rebuildMenu", placement: .primaryAction) {
                         Button {
                             state.rebuildMenuList()
                         } label: {
                             Label(
                                 state.menuNeedsRebuild ? "Rebuild Menu*" : "Rebuild Menu",
-                                systemImage: "sdcard"
+                                systemImage: "oven"
                             )
                         }
                         .disabled(!state.canRebuildMenu)
@@ -101,6 +93,16 @@ struct ContentView: View {
                                     : "Bake the current game list into the \(state.menuKind.displayName) image (slot 01)."
                         )
                         .symbolVariant(state.menuNeedsRebuild ? .fill : .none)
+                    }
+
+                    ToolbarItem(id: "sortAZ", placement: .primaryAction) {
+                        Button {
+                            state.sortAlphabetically()
+                        } label: {
+                            Label("Apply A–Z to Disc", systemImage: "arrow.up.arrow.down.square")
+                        }
+                        .disabled(state.volume == nil || state.games.count < 2 || state.isBusy)
+                        .help("Renumber folders A–Z on the SD card. Click table headers to sort the view only.")
                     }
 
                     ToolbarItem(id: "duplicates", placement: .primaryAction) {
@@ -128,6 +130,7 @@ struct ContentView: View {
                     }
                     .defaultCustomization(.hidden)
 
+                    // --- Session end (later in flow) ---
                     ToolbarItem(id: "eject", placement: .primaryAction) {
                         Button {
                             Task { await state.eject() }
@@ -138,7 +141,7 @@ struct ContentView: View {
                         .help("Eject SD card")
                     }
 
-                    // Trailing-most by default (after searchable).
+                    // Trailing-most global UI control (after searchable).
                     ToolbarItem(id: "inspector", placement: .confirmationAction) {
                         Button {
                             state.isInspectorPresented.toggle()

@@ -146,6 +146,12 @@ struct InspectorView: View {
                             Button("Title Case") {
                                 state.titleCaseSelection()
                             }
+                            Button("Uppercase") {
+                                state.uppercaseSelection()
+                            }
+                            Button("Lowercase") {
+                                state.lowercaseSelection()
+                            }
                         }
                         .disabled(state.isBusy)
 
@@ -472,6 +478,12 @@ struct InspectorView: View {
                 Button("Title Case") {
                     applyManualCase(to: game, style: .title)
                 }
+                Button("Uppercase") {
+                    applyManualCase(to: game, style: .upper)
+                }
+                Button("Lowercase") {
+                    applyManualCase(to: game, style: .lower)
+                }
             }
             .disabled(state.isBusy)
 
@@ -639,6 +651,8 @@ struct InspectorView: View {
     private enum ManualCaseStyle {
         case sentence
         case title
+        case upper
+        case lower
     }
 
     private func applyManualCase(to game: GameEntry, style: ManualCaseStyle) {
@@ -646,11 +660,18 @@ struct InspectorView: View {
         switch style {
         case .sentence: state.sentenceCaseSelection()
         case .title: state.titleCaseSelection()
+        case .upper: state.uppercaseSelection()
+        case .lower: state.lowercaseSelection()
         }
         if let updated = state.games.first(where: { $0.id == game.id }) {
             draftName = updated.name
         } else {
-            draftName = style == .sentence ? game.name.sentenceCasedTitle : game.name.titleCasedName
+            switch style {
+            case .sentence: draftName = game.name.sentenceCasedTitle
+            case .title: draftName = game.name.titleCasedName
+            case .upper: draftName = game.name.uppercasedName
+            case .lower: draftName = game.name.lowercasedName
+            }
         }
     }
 

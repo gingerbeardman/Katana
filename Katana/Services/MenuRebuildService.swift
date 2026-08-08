@@ -30,26 +30,30 @@ enum MenuRebuildService: Sendable {
     }
 
     /// Full rebuild: generate list → bake GDI → replace slot-01 image files.
+    /// - Parameter progress: `(message, fraction 0…1)` for UI edge progress.
     nonisolated static func rebuild(
         games: [GameEntry],
         rootURL: URL,
         menuKind: MenuKind? = nil,
-        progress: (@Sendable (String) -> Void)? = nil
+        progress: (@Sendable (String, Double) -> Void)? = nil
     ) throws -> Result {
         guard !games.isEmpty else { throw RebuildError.noGames }
 
         let ordered = games.sorted { $0.number < $1.number }
         let kind = menuKind ?? detectMenuKind(games: ordered) ?? .gdMenu
 
-        progress?("Reading disc headers…")
+        // 0…0.55 reading headers · 0.55…0.85 bake · 0.85…1.0 install
+        progress?("Reading disc headers…", 0.02)
         let items = MenuListGenerator.items(for: ordered, menuKind: kind) { done, total in
+            let t = max(total, 1)
             if done == 0 || done == total || done % 25 == 0 {
-                progress?("Reading disc headers… \(done)/\(total)")
+                let frac = 0.02 + 0.53 * (Double(done) / Double(t))
+                progress?("Reading disc headers… \(done)/\(total)", frac)
             }
         }
 
         let listText = MenuListGenerator.makeList(kind: kind, items: items)
-        progress?("Building \(kind.displayName) image…")
+        progress?("Building \(kind.displayName) image…", 0.58)
 
         let assets = try assetsURL(for: kind)
 
@@ -76,13 +80,14 @@ enum MenuRebuildService: Sendable {
             throw RebuildError.bakeFailed(error.localizedDescription)
         }
 
-        progress?("Installing menu into slot 01…")
+        progress?("Installing menu into slot 01…", 0.88)
         let menuFolder = try installMenu(
             builtGDI: outDir,
             games: ordered,
             rootURL: rootURL,
             kind: kind
         )
+        progress?("Installed \(kind.displayName)", 1.0)
 
         // Refresh name/serial on the menu folder.
         let nameURL = menuFolder.appendingPathComponent("name.txt")

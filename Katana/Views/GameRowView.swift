@@ -46,7 +46,7 @@ struct GameRowView: View {
 
             FormatBadge(format: game.format)
 
-            Text(ByteCount.string(for: game.byteSize, integerMegabytes: true))
+            Text(ByteCount.gameSizeString(for: game.byteSize, integerMegabytes: true))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 72, alignment: .trailing)
@@ -96,13 +96,9 @@ struct MenuChip: View {
     }
 }
 
-/// List badge for duplicate markers (ready grade, or “—” while pending / no group).
+/// List badge for a flagged duplicate (grade + index only — no blank placeholders).
 enum DuplicateListBadge: Equatable {
-    /// Analysis still running.
-    case pending
     case ready(DuplicateInfo)
-    /// Analysed and not in a group — keep a visible “—” so the chip slot never vanishes.
-    case empty
 }
 
 struct DuplicateBadge: View {
@@ -119,16 +115,6 @@ struct DuplicateBadge: View {
 
     var body: some View {
         switch badge {
-        case .pending:
-            chipLabel("—")
-                .background(Color.secondary.opacity(0.12), in: Capsule())
-                .foregroundStyle(.tertiary)
-                .help("Detecting duplicates…")
-        case .empty:
-            chipLabel("—")
-                .background(Color.secondary.opacity(0.08), in: Capsule())
-                .foregroundStyle(.quaternary)
-                .help("No duplicates detected for this game (may change after hashing).")
         case .ready(let info):
             chipLabel("\(info.grade.shortLabel) \(info.indexInGroup)/\(info.groupSize)")
                 .background(color(for: info).opacity(0.18), in: Capsule())

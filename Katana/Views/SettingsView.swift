@@ -73,7 +73,7 @@ private struct GeneralSettingsPanel: View {
                     isOn: $state.sizesAsIntegerMB
                 )
                 SettingsDescription(
-                    "Whole MB under 1 GB (e.g. 1,188 MB); whole GB at larger sizes.\nDecimal units like Disk Utility (1 GB = 1,000 MB). Off adds decimals (e.g. 39.1 GB)."
+                    "Size column and inspector use whole MB (e.g. 1,188 MB).\nOff uses adaptive KB/MB. Title bar and sidebar free/capacity use GB when large."
                 )
             }
         }
@@ -109,14 +109,14 @@ private struct CardSettingsPanel: View {
                     .padding(.top, 4)
 
                 SettingsDescription(
-                    "After renames or reordering, use Card → Rebuild (⌘S) so the console list matches the SD card. On quit you will be prompted if the menu image is out of date."
+                    "After renames or reordering, use Card → Rebuild (⌘S) so the menu matches the SD card. On quit you will be prompted if the menu image is out of date."
                 )
                 .padding(.top, 2)
             }
 
             SettingsSeparator()
 
-            SettingsSection(title: "Quantity:") {
+            SettingsSection(title: "Multipass:") {
                 SettingsToggle(
                     "Manage multiple cards",
                     isOn: $state.manageMultipleCards
