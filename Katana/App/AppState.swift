@@ -16,11 +16,25 @@ final class AppState {
             }
         }
     }
-    var games: [GameEntry] = []
+    var games: [GameEntry] = [] {
+        didSet {
+            maxGameNumber = games.map(\.number).max() ?? 1
+        }
+    }
+    /// Highest slot number on the open card (avoids `games.map` in every table/inspector body).
+    private(set) var maxGameNumber: Int = 1
+    /// Inspector-only snapshot — updated when selection or *selected* row data changes,
+    /// not on every background size-enrichment write to unrelated rows.
+    private(set) var inspectorSnapshot: InspectorSnapshot = .empty
     /// Leading sidebar column visibility (`NavigationSplitView`). Forced `.all` when no card is open.
     var splitColumnVisibility: NavigationSplitViewVisibility = .all
     /// Multi-select (⌘/⇧ click). Empty when nothing selected.
-    var selection: Set<GameEntry.ID> = []
+    var selection: Set<GameEntry.ID> = [] {
+        didSet {
+            guard oldValue != selection else { return }
+            rebuildInspectorSnapshot()
+        }
+    }
     /// Bumped while the table is filling so the list can scroll to the newest row.
     var scrollTargetGameID: GameEntry.ID?
     var searchText: String = ""
@@ -144,6 +158,10 @@ final class AppState {
     /// Background fill of folder sizes / stored hashes after a fast scan.
     private var detailEnrichmentTask: Task<Void, Never>?
     private var detailEnrichmentGeneration: UInt64 = 0
+    /// Coalesce size writes so SwiftUI is not notified every 8-folder FAT batch.
+    private var enrichmentPendingDetails: [(UUID, CardScanner.FolderDetails)] = []
+    private var enrichmentFlushTask: Task<Void, Never>?
+    private var enrichmentLastFlushAt: CFAbsoluteTime = 0
     /// NSWorkspace volume rename / app-activate observers (Finder label changes).
     private var workspaceObserverTokens: [NSObjectProtocol] = []
     private var didInstallWorkspaceObservers = false
@@ -399,17 +417,59 @@ final class AppState {
 
     /// Selected games in list order (by slot number).
     var selectedGames: [GameEntry] {
-        games.filter { selection.contains($0.id) }
+        guard !selection.isEmpty else { return [] }
+        return games.filter { selection.contains($0.id) }
     }
 
     /// Single-selection convenience (nil if 0 or 2+ selected).
     var selectedGame: GameEntry? {
-        let selected = selectedGames
-        return selected.count == 1 ? selected[0] : nil
+        guard selection.count == 1, let id = selection.first else { return nil }
+        return games.first { $0.id == id }
     }
 
     var selectedIndices: [Int] {
-        games.indices.filter { selection.contains(games[$0].id) }
+        guard !selection.isEmpty else { return [] }
+        return games.indices.filter { selection.contains(games[$0].id) }
+    }
+
+    /// Lookup without re-filtering the whole list for common single-id paths.
+    func game(id: GameEntry.ID) -> GameEntry? {
+        games.first { $0.id == id }
+    }
+
+    /// Replace the game list and optionally refresh the inspector snapshot.
+    func replaceGames(_ newGames: [GameEntry], refreshInspector: Bool = true) {
+        games = newGames
+        if refreshInspector {
+            rebuildInspectorSnapshot()
+        }
+    }
+
+    /// Rebuild inspector inputs without requiring `InspectorView` to observe `games`.
+    func rebuildInspectorSnapshot() {
+        let maxN = maxGameNumber
+        var snap = InspectorSnapshot(
+            content: .empty,
+            maxNumber: maxN,
+            menuDisplayName: menuKind.displayName,
+            duplicatesEnabled: duplicatesEnabled,
+            isBusy: isBusy,
+            focusNameFieldToken: focusNameFieldToken
+        )
+        if selection.isEmpty {
+            snap.content = .empty
+        } else if selection.count == 1, let id = selection.first, let game = games.first(where: { $0.id == id }) {
+            let dup = duplicatesEnabled ? duplicateInfoByID[id] : nil
+            let marked = duplicatesEnabled && isMarkedNotDuplicate(game)
+            snap.content = .single(game: game, duplicate: dup, markedNotDuplicate: marked)
+        } else {
+            let selected = games.filter { selection.contains($0.id) }
+            let bytes = selected.reduce(Int64(0)) { $0 + $1.byteSize }
+            let anyDup = duplicatesEnabled && selected.contains { duplicateInfoByID[$0.id] != nil }
+            let anyMarked = duplicatesEnabled && selected.contains { isMarkedNotDuplicate($0) }
+            snap.content = .multi(games: selected, totalBytes: bytes, anyDup: anyDup, anyMarked: anyMarked)
+        }
+        inspectorSnapshot = snap
     }
 
     var totalBytes: Int64 {
@@ -566,6 +626,7 @@ final class AppState {
         if !duplicateInfoByID.isEmpty {
             duplicateInfoByID = Self.duplicateMapRemoving(removedIDs, from: duplicateInfoByID)
         }
+        rebuildInspectorSnapshot()
         scheduleDuplicateRecompute(showPendingMarkers: false)
         let n = targets.count
         flash(n == 1 ? "Marked not a duplicate" : "Marked \(n) games not duplicates")
@@ -593,6 +654,7 @@ final class AppState {
             try? await VolumeStore.shared.setNotDuplicateKeys(keys, for: uuid)
         }
         // Full re-analyze without pending “—” flash (restore can reintroduce groups).
+        rebuildInspectorSnapshot()
         scheduleDuplicateRecompute(showPendingMarkers: false)
         flash(removed == 1 ? "Duplicate detection restored" : "Restored \(removed) games")
     }
@@ -1062,12 +1124,13 @@ final class AppState {
             volume = result.volume
             // Final authoritative order (progress may have arrived out of slot order).
             let applyStart = CFAbsoluteTimeGetCurrent()
-            games = result.entries
+            replaceGames(result.entries, refreshInspector: false)
             if let first = result.entries.first {
-                selection = [first.id]
+                selection = [first.id] // didSet rebuilds inspector
             } else {
                 selection = []
             }
+            rebuildInspectorSnapshot()
             LaunchTrace.mark(
                 "assign games+selection (\(result.entries.count)) (\(Int((CFAbsoluteTimeGetCurrent() - applyStart) * 1000))ms)"
             )
@@ -1146,6 +1209,8 @@ final class AppState {
     }
 
     /// After a fast scan, fill folder/payload sizes and stored hash sidecars off the main actor.
+    /// UI publishes are **coalesced** (~200 ms): per-batch `games[i]=…` was thrashing SwiftUI
+    /// (Inspector + Table) for seconds on a 276-game card (Instruments ~30s mark).
     private func startLazyDetailEnrichment(volumeUUID: String) {
         cancelLazyDetailEnrichment()
         let pending = games.filter(\.needsDetailEnrichment)
@@ -1153,16 +1218,18 @@ final class AppState {
 
         detailEnrichmentGeneration &+= 1
         let generation = detailEnrichmentGeneration
-        let snapshot = pending.map { (id: $0.id, path: $0.folderPath) }
+        let work = pending.map { (id: $0.id, path: $0.folderPath) }
+        // Larger FAT batches — fewer MainActor hops; flush still time-coalesced.
+        let batchSize = 24
 
         detailEnrichmentTask = Task.detached(priority: .utility) {
-            // Concurrent batches so the table fills sizes progressively without thrashing FAT USB.
             var i = 0
-            while i < snapshot.count {
+            while i < work.count {
                 if Task.isCancelled { return }
-                let end = min(i + 8, snapshot.count)
-                let batch = Array(snapshot[i..<end])
+                let end = min(i + batchSize, work.count)
+                let batch = Array(work[i..<end])
                 var batchResults: [(UUID, CardScanner.FolderDetails)] = []
+                batchResults.reserveCapacity(batch.count)
                 await withTaskGroup(of: (UUID, CardScanner.FolderDetails)?.self) { group in
                     for item in batch {
                         group.addTask {
@@ -1176,26 +1243,10 @@ final class AppState {
                         if let result { batchResults.append(result) }
                     }
                 }
-                await MainActor.run {
-                    guard generation == self.detailEnrichmentGeneration else { return }
-                    var any = false
-                    for (id, details) in batchResults {
-                        guard let idx = self.games.firstIndex(where: { $0.id == id }) else { continue }
-                        self.games[idx].byteSize = details.byteSize
-                        self.games[idx].payloadByteSize = details.payloadByteSize
-                        if let sha = details.contentSHA256 {
-                            self.games[idx].contentSHA256 = sha
-                        }
-                        self.games[idx].detailsLoaded = true
-                        any = true
-                    }
-                    if any {
-                        self.refreshStatus()
-                        // Debounce while sizes stream in — don't flash “—” on every batch.
-                        self.scheduleDuplicateRecompute(
-                            showPendingMarkers: false,
-                            debounce: .milliseconds(350)
-                        )
+                if !batchResults.isEmpty {
+                    await MainActor.run {
+                        guard generation == self.detailEnrichmentGeneration else { return }
+                        self.enqueueEnrichmentDetails(batchResults)
                     }
                 }
                 i = end
@@ -1203,6 +1254,8 @@ final class AppState {
 
             await MainActor.run {
                 guard generation == self.detailEnrichmentGeneration else { return }
+                self.flushEnrichmentDetails(force: true)
+                self.refreshStatus()
                 // Final accurate grades once all sizes/hashes are known.
                 self.scheduleDuplicateRecompute(showPendingMarkers: false)
                 self.persistEnrichedCache(volumeUUID: volumeUUID)
@@ -1210,10 +1263,71 @@ final class AppState {
         }
     }
 
+    private func enqueueEnrichmentDetails(_ batch: [(UUID, CardScanner.FolderDetails)]) {
+        enrichmentPendingDetails.append(contentsOf: batch)
+        let minInterval: CFAbsoluteTime = 0.22
+        let elapsed = CFAbsoluteTimeGetCurrent() - enrichmentLastFlushAt
+        if elapsed >= minInterval, enrichmentPendingDetails.count >= 24 {
+            flushEnrichmentDetails(force: true)
+            return
+        }
+        enrichmentFlushTask?.cancel()
+        let wait = max(0, minInterval - elapsed)
+        let generation = detailEnrichmentGeneration
+        enrichmentFlushTask = Task { @MainActor in
+            if wait > 0 {
+                try? await Task.sleep(for: .seconds(wait))
+            }
+            guard !Task.isCancelled, generation == self.detailEnrichmentGeneration else { return }
+            self.flushEnrichmentDetails(force: true)
+        }
+    }
+
+    /// Apply pending size/hash fields in one `games` write (single Observation pulse).
+    private func flushEnrichmentDetails(force: Bool) {
+        guard force, !enrichmentPendingDetails.isEmpty else { return }
+        let pending = enrichmentPendingDetails
+        enrichmentPendingDetails = []
+        enrichmentLastFlushAt = CFAbsoluteTimeGetCurrent()
+        enrichmentFlushTask = nil
+
+        var indexByID: [GameEntry.ID: Int] = [:]
+        indexByID.reserveCapacity(games.count)
+        for (i, g) in games.enumerated() {
+            indexByID[g.id] = i
+        }
+
+        var next = games
+        var selectedTouched = false
+        var any = false
+        for (id, details) in pending {
+            guard let idx = indexByID[id] else { continue }
+            next[idx].byteSize = details.byteSize
+            next[idx].payloadByteSize = details.payloadByteSize
+            if let sha = details.contentSHA256 {
+                next[idx].contentSHA256 = sha
+            }
+            next[idx].detailsLoaded = true
+            any = true
+            if selection.contains(id) {
+                selectedTouched = true
+            }
+        }
+        guard any else { return }
+        games = next
+        // Only rebuild inspector when the *selected* row’s sizes/hashes changed.
+        if selectedTouched {
+            rebuildInspectorSnapshot()
+        }
+    }
+
     private func cancelLazyDetailEnrichment() {
         detailEnrichmentGeneration &+= 1
         detailEnrichmentTask?.cancel()
         detailEnrichmentTask = nil
+        enrichmentFlushTask?.cancel()
+        enrichmentFlushTask = nil
+        enrichmentPendingDetails = []
     }
 
     /// Write current entries back into the volume cache so the next open is fully warm.
@@ -1374,6 +1488,9 @@ final class AppState {
                     self.duplicateInfoByID = mapped
                     self.isDuplicateInfoComputing = false
                     self.hasDuplicateAnalysis = true
+                    if !self.selection.isEmpty {
+                        self.rebuildInspectorSnapshot()
+                    }
                 }
                 return
             }
@@ -1399,6 +1516,9 @@ final class AppState {
                 self.duplicateInfoByID = info
                 self.isDuplicateInfoComputing = false
                 self.hasDuplicateAnalysis = true
+                if !self.selection.isEmpty {
+                    self.rebuildInspectorSnapshot()
+                }
                 LaunchTrace.mark(
                     "DuplicateDetector apply map size=\(info.count) (\(Int((CFAbsoluteTimeGetCurrent() - applyStart) * 1000))ms main)"
                 )
@@ -1891,6 +2011,9 @@ final class AppState {
             }
             // Name-only change: patch cache in place so the next launch can still snapshot.
             persistNameCacheUpdates(for: [games[index]])
+            if selection.contains(id) {
+                rebuildInspectorSnapshot()
+            }
 
             undoManager.registerUndo(withTarget: self) { target in
                 target.rename(id: id, to: previous)
@@ -1981,6 +2104,9 @@ final class AppState {
         }
         let renamed = undos.compactMap { id, _ in games.first(where: { $0.id == id }) }
         persistNameCacheUpdates(for: renamed)
+        if !selection.isEmpty {
+            rebuildInspectorSnapshot()
+        }
         flash(undos.count == 1 ? "Renamed" : "Renamed \(undos.count) games")
 
         undoManager.registerUndo(withTarget: self) { target in

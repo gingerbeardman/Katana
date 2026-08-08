@@ -3,6 +3,9 @@ import SwiftUI
 
 /// Trailing inspector (~280pt) following macOS iWork inspector layout patterns.
 /// Single-game: Title → IP.BIN → Cover → On Card → Actions (no repeated fields).
+///
+/// Reads `AppState.inspectorSnapshot` only — not the full `games` array — so lazy
+/// size enrichment of other rows does not rebuild this entire tree (Instruments thrash).
 struct InspectorView: View {
     @Bindable var state: AppState
 
@@ -13,44 +16,53 @@ struct InspectorView: View {
     @State private var detailLoadToken: UUID = UUID()
     @FocusState private var nameFieldFocused: Bool
 
-    private var maxNumber: Int {
-        state.games.map(\.number).max() ?? 1
-    }
+    private var snap: InspectorSnapshot { state.inspectorSnapshot }
 
-    private var selected: [GameEntry] { state.selectedGames }
-    private var game: GameEntry? { state.selectedGame }
+    private var maxNumber: Int { snap.maxNumber }
 
     /// Fixed label column width — same idea as iWork slider/field labels (72pt).
     private let labelWidth: CGFloat = 72
 
     var body: some View {
         Group {
-            if selected.isEmpty {
+            switch snap.content {
+            case .empty:
                 emptyState
-            } else if let game, selected.count == 1 {
-                singleInspector(game)
-            } else {
-                multiInspector(selected)
+            case .single(let game, let dup, let marked):
+                singleInspector(game, duplicate: dup, markedNotDuplicate: marked)
+            case .multi(let games, let totalBytes, let anyDup, let anyMarked):
+                multiInspector(
+                    games,
+                    totalBytes: totalBytes,
+                    anyDup: anyDup,
+                    anyMarked: anyMarked
+                )
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Track busy separately (does not depend on `games`).
+        .disabled(state.isBusy)
     }
 
     // MARK: - Single
 
-    private func singleInspector(_ game: GameEntry) -> some View {
+    private func singleInspector(
+        _ game: GameEntry,
+        duplicate: DuplicateInfo?,
+        markedNotDuplicate: Bool
+    ) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 collapsible(.title) {
                     titleSectionBody(game)
                 }
-                if state.duplicatesEnabled {
-                    if let dup = state.duplicateInfo(for: game.id) {
+                if snap.duplicatesEnabled {
+                    if let dup = duplicate {
                         sectionDivider
                         collapsible(.duplicate) {
                             duplicateSectionBody(game, info: dup)
                         }
-                    } else if state.isMarkedNotDuplicate(game) {
+                    } else if markedNotDuplicate {
                         sectionDivider
                         collapsible(.duplicate) {
                             notDuplicateMarkedBody(game)
@@ -76,7 +88,6 @@ struct InspectorView: View {
             }
         }
         .background(Color(nsColor: .controlBackgroundColor))
-        .disabled(state.isBusy)
         .onAppear {
             syncDraft(from: game)
             loadDiscDetails(for: game)
@@ -97,7 +108,12 @@ struct InspectorView: View {
 
     // MARK: - Multi
 
-    private func multiInspector(_ games: [GameEntry]) -> some View {
+    private func multiInspector(
+        _ games: [GameEntry],
+        totalBytes: Int64,
+        anyDup: Bool,
+        anyMarked: Bool
+    ) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 collapsible(.selection) {
@@ -105,7 +121,7 @@ struct InspectorView: View {
                         Text("\(games.count) games")
                             .font(.title3.weight(.semibold).monospacedDigit())
 
-                        Text(state.formatSize(state.selectedBytes))
+                        Text(state.formatSize(totalBytes))
                             .font(.callout.monospacedDigit())
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity)
@@ -173,9 +189,7 @@ struct InspectorView: View {
                                 .frame(maxWidth: .infinity)
                         }
 
-                        if state.duplicatesEnabled {
-                            let anyDup = games.contains { state.duplicateInfo(for: $0.id) != nil }
-                            let anyMarked = games.contains { state.isMarkedNotDuplicate($0) }
+                        if snap.duplicatesEnabled {
                             if anyDup {
                                 Button {
                                     state.markNotDuplicate(ids: Set(games.map(\.id)))
@@ -236,7 +250,7 @@ struct InspectorView: View {
         let slot = FolderNumbering.format(game.number, maxNumber: maxNumber)
         let size = state.formatGameSize(game)
         if game.isMenu {
-            return "Slot \(slot) · \(state.menuKind.displayName) · \(size)"
+            return "Slot \(slot) · \(snap.menuDisplayName) · \(size)"
         }
         return "Slot \(slot) · \(game.format.displayName) · \(size)"
     }

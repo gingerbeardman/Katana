@@ -15,7 +15,7 @@ struct GameListView: View {
     @State private var tableRemountToken: UInt64 = 0
 
     private var maxNumber: Int {
-        state.games.map(\.number).max() ?? 1
+        state.maxGameNumber
     }
 
     /// Filtered list sorted for display. Does not mutate disc order.
