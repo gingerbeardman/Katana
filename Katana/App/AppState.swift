@@ -970,9 +970,16 @@ final class AppState {
         scanProgress = nil
         statusText = "Scanning \(url.lastPathComponent)…"
 
-        // Lock identity for this open: disk UUID, else remembered/preferred, else mint once.
-        // Reuse that same id for chrome resolve, cache load, and scan (no path: keys).
+        // Lock identity for this open: remembered/preferred first (stable across Finder renames
+        // and flaky FAT volume UUIDs), else disk UUID, else mint once.
+        // Open Card (no preferred) still reuses a recent with the same path / volume name.
         var lockedVolumeUUID = preferredVolumeUUID
+        if lockedVolumeUUID == nil {
+            lockedVolumeUUID = try? await VolumeStore.shared.matchingRecentUUID(for: url)
+            if let lockedVolumeUUID {
+                LaunchTrace.mark("open matched recent UUID \(lockedVolumeUUID)")
+            }
+        }
         let preferredForEarly = lockedVolumeUUID
 
         // Show volume chrome immediately; table fills as folders are identified.

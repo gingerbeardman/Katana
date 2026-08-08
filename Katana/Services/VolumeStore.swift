@@ -251,25 +251,82 @@ actor VolumeStore {
         try save()
     }
 
-    /// Resolve a remembered volume to a file URL and whether security-scope was started by the caller.
-    /// Caller must call `startAccessingSecurityScopedResource()` on the returned URL when `needsSecurityScope` is true.
-    nonisolated static func resolveURL(from remembered: RememberedVolume) throws -> (url: URL, isSecurityScoped: Bool) {
+    /// Resolve a remembered volume to a file URL.
+    ///
+    /// Order: security-scoped bookmark (if present and reachable) → saved `lastPath` →
+    /// `/Volumes/<volumeName>` (Finder rename of the volume label). Maps Cocoa
+    /// “file doesn’t exist” bookmark failures to a friendly not-mounted error.
+    ///
+    /// Caller must call `startAccessingSecurityScopedResource()` when `isSecurityScoped` is true.
+    nonisolated static func resolveURL(
+        from remembered: RememberedVolume
+    ) throws -> (url: URL, isSecurityScoped: Bool) {
+        let fm = FileManager.default
+
         if let data = remembered.bookmarkData {
-            var isStale = false
-            let url = try URL(
-                resolvingBookmarkData: data,
-                options: [.withSecurityScope, .withoutUI],
-                relativeTo: nil,
-                bookmarkDataIsStale: &isStale
-            )
-            return (url, true)
+            do {
+                var isStale = false
+                let url = try URL(
+                    resolvingBookmarkData: data,
+                    options: [.withSecurityScope, .withoutUI],
+                    relativeTo: nil,
+                    bookmarkDataIsStale: &isStale
+                )
+                if fm.fileExists(atPath: url.path) {
+                    return (url, true)
+                }
+                // Bookmark resolved to a path that is gone (rename/eject) — try fallbacks.
+                LaunchTrace.mark(
+                    "resolveURL bookmark path missing isStale=\(isStale) path=\(url.path)"
+                )
+            } catch {
+                // Common after volume renames / unplug: NSCocoaErrorDomain “The file doesn’t exist.”
+                LaunchTrace.mark(
+                    "resolveURL bookmark failed: \(error.localizedDescription)"
+                )
+            }
         }
 
-        let url = URL(fileURLWithPath: remembered.lastPath, isDirectory: true)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            throw VolumeStoreError.notMounted(remembered.volumeName)
+        var candidates: [URL] = [
+            URL(fileURLWithPath: remembered.lastPath, isDirectory: true),
+        ]
+        let name = remembered.volumeName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty {
+            let byName = URL(fileURLWithPath: "/Volumes/\(name)", isDirectory: true)
+            if !candidates.contains(where: { $0.standardizedFileURL == byName.standardizedFileURL }) {
+                candidates.append(byName)
+            }
         }
-        return (url, false)
+
+        for url in candidates {
+            if fm.fileExists(atPath: url.path) {
+                LaunchTrace.mark("resolveURL fallback hit \(url.path)")
+                // No security scope from bookmark — open may still work under absolute-path
+                // exceptions; next successful open refreshes the bookmark.
+                return (url, false)
+            }
+        }
+
+        throw VolumeStoreError.notMounted(remembered.volumeName)
+    }
+
+    /// Find a remembered card that matches this root so Open Card reuses the same cache key.
+    func matchingRecentUUID(for rootURL: URL) throws -> String? {
+        try ensureLoaded()
+        let path = rootURL.standardizedFileURL.path
+        if let hit = prefs.recents.first(where: { $0.lastPath == path }) {
+            return hit.volumeUUID
+        }
+        // Same volume label under /Volumes after a remount (path may match after rename too).
+        let name = rootURL.standardizedFileURL.lastPathComponent
+        if path.hasPrefix("/Volumes/"),
+           let hit = prefs.recents.first(where: {
+               $0.volumeName == name || URL(fileURLWithPath: $0.lastPath).lastPathComponent == name
+           })
+        {
+            return hit.volumeUUID
+        }
+        return nil
     }
 
     nonisolated static func makeBookmark(for url: URL) -> Data? {

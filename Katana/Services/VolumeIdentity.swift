@@ -11,12 +11,12 @@ enum VolumeIdentity: Sendable {
     /// Resolve volume metadata for a user-selected card root.
     ///
     /// Identity priority (bookmark = access; this = cache/recents key):
-    /// 1. Disk volume UUID when the OS provides one (survives Finder renames)
-    /// 2. `preferredUUID` from a prior open / remembered card (survives path renames
-    ///    when the disk has no UUID — e.g. some FAT fixtures)
+    /// 1. `preferredUUID` from a prior open / remembered card — **wins** so Finder renames
+    ///    and flaky FAT volume UUIDs do not orphan the scan cache (cold 5s+ rescan).
+    /// 2. Disk volume UUID when the OS provides one and nothing is preferred
     /// 3. Mint `stable:<uuid>` once — caller must persist via `VolumeStore.remember`
     ///
-    /// Never keys on volume *name*. Path is not used as a new identity.
+    /// Never keys on volume *name* alone. Path is not used as a new identity.
     /// - Parameter preferredUUID: Known identity from recents / an earlier resolve in the
     ///   same open so path-only roots keep one key across renames and double resolves.
     nonisolated static func resolve(
@@ -63,18 +63,20 @@ enum VolumeIdentity: Sendable {
         )
     }
 
-    /// Choose a durable cache/recents key. Disk UUID wins; otherwise keep preferred; else mint.
+    /// Choose a durable cache/recents key.
+    /// Preferred (remembered) wins — some SD / FAT stacks report a new `volumeUUIDString`
+    /// after remount or Finder rename, which previously fragmented the scan cache.
     nonisolated static func stableVolumeUUID(
         diskUUID: String?,
         preferredUUID: String?
     ) -> String {
-        if let disk = diskUUID?.trimmingCharacters(in: .whitespacesAndNewlines), !disk.isEmpty {
-            return disk
-        }
         if let preferred = preferredUUID?.trimmingCharacters(in: .whitespacesAndNewlines),
            !preferred.isEmpty
         {
             return preferred
+        }
+        if let disk = diskUUID?.trimmingCharacters(in: .whitespacesAndNewlines), !disk.isEmpty {
+            return disk
         }
         return stableIDPrefix + UUID().uuidString
     }

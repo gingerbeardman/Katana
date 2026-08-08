@@ -3,18 +3,25 @@ import Testing
 @testable import Katana
 
 struct VolumeIdentityTests {
-    @Test func stableVolumeUUIDPrefersDiskOverPreferred() {
+    @Test func stableVolumeUUIDPrefersPreferredOverDisk() {
+        // Remembered id must win — FAT/SD volume UUIDs can change across remount/rename.
+        let preferred = VolumeIdentity.stableIDPrefix + "old"
         let id = VolumeIdentity.stableVolumeUUID(
             diskUUID: "DISK-123",
-            preferredUUID: VolumeIdentity.stableIDPrefix + "old"
+            preferredUUID: preferred
         )
-        #expect(id == "DISK-123")
+        #expect(id == preferred)
     }
 
     @Test func stableVolumeUUIDKeepsPreferredWhenNoDisk() {
         let preferred = VolumeIdentity.stableIDPrefix + "remembered"
         let id = VolumeIdentity.stableVolumeUUID(diskUUID: nil, preferredUUID: preferred)
         #expect(id == preferred)
+    }
+
+    @Test func stableVolumeUUIDUsesDiskWhenNoPreferred() {
+        let id = VolumeIdentity.stableVolumeUUID(diskUUID: "DISK-123", preferredUUID: nil)
+        #expect(id == "DISK-123")
     }
 
     @Test func stableVolumeUUIDMintsWhenNothingKnown() {
@@ -58,14 +65,8 @@ struct VolumeIdentityTests {
         let first = try VolumeIdentity.resolve(rootURL: root, preferredUUID: preferred)
         let second = try VolumeIdentity.resolve(rootURL: root, preferredUUID: preferred)
         #expect(first.volumeUUID == second.volumeUUID)
+        #expect(first.volumeUUID == preferred)
         #expect(!VolumeIdentity.isPathDerivedID(first.volumeUUID))
-
-        // When the OS exposes a disk UUID, it wins over preferred (correct).
-        // When it doesn't, preferred is kept so renames don't orphan the cache.
-        if first.volumeUUID != preferred {
-            let bare = try VolumeIdentity.resolve(rootURL: root)
-            #expect(first.volumeUUID == bare.volumeUUID)
-        }
     }
 
     @Test func scanCacheKeyStableWithPreferredUUID() async throws {
