@@ -7,8 +7,18 @@ import UniformTypeIdentifiers
 @Observable
 @MainActor
 final class AppState {
-    var volume: CardVolume?
+    var volume: CardVolume? {
+        didSet {
+            // Empty / no-remount state lives in the sidebar (Open / Reopen). Always show it
+            // when nothing is open — macOS may have left the column collapsed from last session.
+            if volume == nil {
+                splitColumnVisibility = .all
+            }
+        }
+    }
     var games: [GameEntry] = []
+    /// Leading sidebar column visibility (`NavigationSplitView`). Forced `.all` when no card is open.
+    var splitColumnVisibility: NavigationSplitViewVisibility = .all
     /// Multi-select (⌘/⇧ click). Empty when nothing selected.
     var selection: Set<GameEntry.ID> = []
     /// Bumped while the table is filling so the list can scroll to the newest row.
@@ -99,6 +109,9 @@ final class AppState {
     var recentVolumes: [RememberedVolume] = []
     /// View-only table sort for the open card (persisted per volume UUID).
     var displaySort: DisplaySortPreference = .mostRecentFirst
+    /// Volume UUID that `displaySort` was loaded for — avoids writing the previous card’s
+    /// sort onto a newly opened UUID during the open race.
+    private var displaySortLoadedForUUID: String?
     /// Which console menu image to bake (GDmenu or openMenu). Persisted per volume.
     var menuKind: MenuKind = .gdMenu
     /// Kind currently installed in slot 01 (last successful bake, or detected on open).
@@ -796,6 +809,8 @@ final class AppState {
         }
         guard let remembered = try? await VolumeStore.shared.lastRemembered() else {
             statusText = "Open a GDEMU SD card to begin"
+            // No card remounted — keep Open / Reopen reachable.
+            splitColumnVisibility = .all
             LaunchTrace.mark("restoreSessionIfNeeded: no remembered volume")
             return
         }
@@ -803,6 +818,10 @@ final class AppState {
         statusText = "Restoring \(remembered.volumeName)…"
         LaunchTrace.mark("restoreSessionIfNeeded → openRemembered(\(remembered.volumeName))")
         await openRemembered(remembered, showErrorIfMissing: false)
+        if volume == nil {
+            // Remount failed (card not present) — empty state needs the sidebar.
+            splitColumnVisibility = .all
+        }
         LaunchTrace.mark("restoreSessionIfNeeded end")
     }
 
@@ -943,6 +962,10 @@ final class AppState {
         notDuplicateKeys = []
         games = []
         menuContentDirty = false
+        // Drop previous card’s sort immediately so the Table does not keep stale header
+        // chevrons / order while the new volume resolves (cold open was the worst case).
+        displaySort = .mostRecentFirst
+        displaySortLoadedForUUID = nil
         isScanning = true
         scanProgress = nil
         statusText = "Scanning \(url.lastPathComponent)…"
@@ -961,13 +984,15 @@ final class AppState {
         }
         if let resolved = earlyVolume {
             lockedVolumeUUID = resolved.volumeUUID
-            volume = resolved
+            // Load sort *before* publishing `volume` so GameListView’s onChange(volumeUUID)
+            // applies the correct comparators (and remounts the Table) on first paint.
             await LaunchTrace.measureAsync("loadDisplaySort") {
                 await loadDisplaySort(for: resolved.volumeUUID)
             }
             await LaunchTrace.measureAsync("loadNotDuplicateKeys") {
                 await loadNotDuplicateKeys(for: resolved.volumeUUID)
             }
+            volume = resolved
         }
 
         // Let SwiftUI paint the empty/disabled table before heavy work begins.
@@ -1084,12 +1109,14 @@ final class AppState {
             // Content hashing is never automatic — user starts it from Duplicates / Card menu.
         } catch {
             cancelLazyDetailEnrichment()
-            volume = nil
+            volume = nil // also forces sidebar open via didSet
             games = []
             selection = []
             trashSummary = .empty
             resetDuplicateAnalysisState()
             notDuplicateKeys = []
+            displaySort = .mostRecentFirst
+            displaySortLoadedForUUID = nil
             menuKind = .gdMenu
             lastError = error.localizedDescription
             statusText = "Failed to open card"
@@ -1390,8 +1417,10 @@ final class AppState {
 
     /// Load persisted visual sort for this card (default: newest slots first).
     func loadDisplaySort(for volumeUUID: String) async {
-        displaySort = (try? await VolumeStore.shared.displaySort(for: volumeUUID))
+        let loaded = (try? await VolumeStore.shared.displaySort(for: volumeUUID))
             ?? .mostRecentFirst
+        displaySort = loaded
+        displaySortLoadedForUUID = volumeUUID
     }
 
     /// Load last hashing throughput for instant ETA on “Compute Missing Hashes”.
@@ -1408,7 +1437,9 @@ final class AppState {
     /// Persist table column sort for the open card.
     func saveDisplaySort(_ sort: DisplaySortPreference) {
         displaySort = sort
-        guard let uuid = volume?.volumeUUID else { return }
+        // Only write once sort has been loaded for *this* open volume (prevents the
+        // previous card’s header state from being saved onto a newly opened UUID).
+        guard let uuid = volume?.volumeUUID, uuid == displaySortLoadedForUUID else { return }
         Task {
             try? await VolumeStore.shared.setDisplaySort(sort, for: uuid)
         }
@@ -1586,7 +1617,7 @@ final class AppState {
         do {
             // Keep last volume + recents so remount/relaunch can restore access.
             stopAccess()
-            self.volume = nil
+            self.volume = nil // also forces sidebar open via didSet
             games = []
             selection = []
             trashSummary = .empty
@@ -1594,6 +1625,8 @@ final class AppState {
             menuContentDirty = false
             bakedMenuKind = .gdMenu
             menuKind = .gdMenu
+            displaySort = .mostRecentFirst
+            displaySortLoadedForUUID = nil
             undoManager.removeAllActions()
             resetDuplicateAnalysisState()
             try await VolumeEject.eject(rootURL: root)
@@ -2240,6 +2273,8 @@ final class AppState {
             menuContentDirty = false
             bakedMenuKind = .gdMenu
             menuKind = .gdMenu
+            displaySort = .mostRecentFirst
+            displaySortLoadedForUUID = nil
             undoManager.removeAllActions()
             try await VolumeEject.eject(rootURL: root)
         } catch {

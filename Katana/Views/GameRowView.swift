@@ -156,13 +156,19 @@ struct FormatBadge: View {
     let format: DiscFormat
 
     var body: some View {
-        Text(format.displayName)
-            .font(.caption2.weight(.semibold))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(color.opacity(0.15), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
-            .foregroundStyle(color)
-            .frame(width: 36)
+        // Stubs / not-yet-scanned rows use `.unknown` — leave the cell empty (no "?").
+        if format == .unknown {
+            Color.clear
+                .frame(width: 36, height: 1)
+        } else {
+            Text(format.displayName)
+                .font(.caption2.weight(.semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(color.opacity(0.15), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+                .foregroundStyle(color)
+                .frame(width: 36)
+        }
     }
 
     private var color: Color {

@@ -9,6 +9,10 @@ struct GameListView: View {
 
     /// SwiftUI Table sort state — view only, not disc order.
     @State private var sortOrder: [KeyPathComparator<GameEntry>] = DisplaySortPreference.mostRecentFirst.comparators
+    /// Bumped when we must remount the Table so column header chevrons match `sortOrder`.
+    /// SwiftUI Table often keeps stale NSTableView sort indicators when `sortOrder` is
+    /// set programmatically (cold open of a new/renamed volume was the worst case).
+    @State private var tableRemountToken: UInt64 = 0
 
     private var maxNumber: Int {
         state.games.map(\.number).max() ?? 1
@@ -80,6 +84,8 @@ struct GameListView: View {
                     ? 0.55
                     : (state.isScanning || state.isRebuildingMenu) ? 0.72 : 1
             )
+            // Remount when volume or programmed sort changes so header chevrons match data order.
+            .id(tableIdentity)
             .background {
                 if state.scrollToNewRows {
                     TableSelectionScroller(trigger: state.scrollTargetGameID)
@@ -151,31 +157,57 @@ struct GameListView: View {
             if scanning { state.cancelInlineRename() }
         }
         // Restore saved sort when a card opens / changes; drop any in-flight rename.
-        .onChange(of: state.volume?.volumeUUID) { _, _ in
+        .onChange(of: state.volume?.volumeUUID) { _, newUUID in
             state.cancelInlineRename()
-            sortOrder = state.displaySort.comparators
+            applySortFromState(remount: true)
+            if newUUID == nil {
+                // Clean empty-state headers (default newest-first).
+                sortOrder = DisplaySortPreference.mostRecentFirst.comparators
+            }
         }
         .onChange(of: state.displaySort) { _, new in
-            // External load after open — sync Table chevrons.
+            // External load after open — sync Table chevrons (remount if needed).
             let next = new.comparators
             if !sortOrdersMatch(sortOrder, next) {
                 sortOrder = next
+                tableRemountToken &+= 1
             }
         }
         // Persist when the user clicks a column header.
         .onChange(of: sortOrder) { _, new in
+            guard state.volume != nil else { return }
             guard let pref = DisplaySortPreference.from(sortOrder: new) else { return }
             if pref != state.displaySort {
                 state.saveDisplaySort(pref)
             }
         }
         .onAppear {
-            sortOrder = state.displaySort.comparators
+            applySortFromState(remount: false)
+        }
+    }
+
+    /// Identity that forces a fresh `NSTableView` when volume opens or sort is applied
+    /// programmatically. Do **not** key on `displaySort` alone — user header clicks already
+    /// update chevrons natively, and remounting would throw away scroll position.
+    private var tableIdentity: String {
+        let vol = state.volume?.volumeUUID ?? "none"
+        return "\(vol)|\(tableRemountToken)"
+    }
+
+    private func applySortFromState(remount: Bool) {
+        let next = state.displaySort.comparators
+        if !sortOrdersMatch(sortOrder, next) {
+            sortOrder = next
+            if remount { tableRemountToken &+= 1 }
+        } else if remount {
+            // Same comparators, but headers may still be stale from the previous card.
+            tableRemountToken &+= 1
         }
     }
 
     private func applyAndSave(_ pref: DisplaySortPreference) {
         sortOrder = pref.comparators
+        tableRemountToken &+= 1
         state.saveDisplaySort(pref)
     }
 

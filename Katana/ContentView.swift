@@ -4,7 +4,7 @@ struct ContentView: View {
     @Bindable var state: AppState
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $state.splitColumnVisibility) {
             SidebarView(state: state)
         } detail: {
             GameListView(state: state)
