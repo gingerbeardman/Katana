@@ -2,8 +2,8 @@ import Foundation
 
 /// Immediate, on-disk mutations. No deferred "save" — the SD card is the source of truth.
 enum CardOperations: Sendable {
-    nonisolated static let trashFolderName = ".dcgdsd-trash"
-    nonisolated static let tmpFolderName = ".dcgdsd-tmp"
+    nonisolated static let trashFolderName = ".katana-trash"
+    nonisolated static let tmpFolderName = ".katana-tmp"
     nonisolated static let nameFile = "name.txt"
     nonisolated static let serialFile = "serial.txt"
 
@@ -24,7 +24,7 @@ enum CardOperations: Sendable {
 
     // MARK: - Delete (soft → same-volume trash, pack gaps)
 
-    /// Soft-delete one or more games into `.dcgdsd-trash/`, then pack remaining numbers.
+    /// Soft-delete one or more games into `.katana-trash/`, then pack remaining numbers.
     /// Uses single-pass renames when packing down (half the I/O of two-phase renumber).
     /// Returns updated remaining games — callers should **not** full-rescan.
     nonisolated static func delete(
@@ -172,6 +172,116 @@ enum CardOperations: Sendable {
         }
     }
 
+    // MARK: - Trash
+
+    /// Soft-deleted packages under `.katana-trash/` (top-level items + total bytes).
+    struct TrashSummary: Sendable, Equatable {
+        var itemCount: Int
+        var totalBytes: Int64
+
+        var isEmpty: Bool { itemCount == 0 }
+
+        static let empty = TrashSummary(itemCount: 0, totalBytes: 0)
+    }
+
+    struct EmptyTrashResult: Sendable {
+        /// Top-level items removed from trash.
+        var itemCount: Int
+        /// Approximate bytes reclaimed (folder contents).
+        var bytesFreed: Int64
+    }
+
+    /// Inspect `.katana-trash/` without deleting. Safe if missing.
+    nonisolated static func trashSummary(on rootURL: URL) -> TrashSummary {
+        LaunchTrace.measure("CardOperations.trashSummary") {
+            let trashRoot = rootURL.appendingPathComponent(trashFolderName, isDirectory: true)
+            let fm = FileManager.default
+            guard fm.fileExists(atPath: trashRoot.path) else { return .empty }
+
+            guard let contents = try? fm.contentsOfDirectory(
+                at: trashRoot,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ), !contents.isEmpty else {
+                return .empty
+            }
+
+            var bytes: Int64 = 0
+            for url in contents {
+                bytes += directoryByteSize(at: url) ?? 0
+            }
+            return TrashSummary(itemCount: contents.count, totalBytes: bytes)
+        }
+    }
+
+    /// Permanently delete everything under `.katana-trash/`.
+    /// Safe if missing (returns zeros). Does not affect numbered game slots.
+    nonisolated static func emptyTrash(
+        rootURL: URL,
+        progress: (@Sendable (String) -> Void)? = nil
+    ) throws -> EmptyTrashResult {
+        try emptyTrashFolder(
+            rootURL.appendingPathComponent(trashFolderName, isDirectory: true),
+            progress: progress
+        )
+    }
+
+    nonisolated private static func emptyTrashFolder(
+        _ trashRoot: URL,
+        progress: (@Sendable (String) -> Void)?
+    ) throws -> EmptyTrashResult {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: trashRoot.path) else {
+            return EmptyTrashResult(itemCount: 0, bytesFreed: 0)
+        }
+
+        let contents = try fm.contentsOfDirectory(
+            at: trashRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )
+        guard !contents.isEmpty else {
+            try? fm.removeItem(at: trashRoot)
+            return EmptyTrashResult(itemCount: 0, bytesFreed: 0)
+        }
+
+        progress?("Emptying trash…")
+        var bytes: Int64 = 0
+        for (index, url) in contents.enumerated() {
+            bytes += directoryByteSize(at: url) ?? 0
+            try fm.removeItem(at: url)
+            if index % 5 == 0 || index == contents.count - 1 {
+                progress?("Emptying trash… \(index + 1)/\(contents.count)")
+            }
+        }
+        if let left = try? fm.contentsOfDirectory(atPath: trashRoot.path), left.isEmpty {
+            try? fm.removeItem(at: trashRoot)
+        }
+        return EmptyTrashResult(itemCount: contents.count, bytesFreed: bytes)
+    }
+
+    /// Whether `.katana-trash` exists and has content.
+    nonisolated static func trashIsEmpty(on rootURL: URL) -> Bool {
+        trashSummary(on: rootURL).isEmpty
+    }
+
+    nonisolated private static func directoryByteSize(at url: URL) -> Int64? {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(
+            at: url,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        var total: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                  values.isRegularFile == true
+            else { continue }
+            total += Int64(values.fileSize ?? 0)
+        }
+        return total
+    }
+
     // MARK: - Import (add discs)
 
     /// A resolved disc package ready to copy onto the card.
@@ -294,6 +404,24 @@ enum CardOperations: Sendable {
             nextNumber += 1
             let widthMax = max(newTotal, number, occupied.max() ?? 0)
             let folderName = FolderNumbering.format(number, maxNumber: widthMax)
+            // Final image name on the card (single-file imports become disc.*).
+            var imageName = source.imageFileName
+            let preferred = preferredImageName(for: source.imageFileName)
+            let willRenameSingle = source.fileNames?.count == 1 && preferred != source.imageFileName
+            if willRenameSingle {
+                imageName = preferred
+            }
+
+            // Hash payload on the **source** volume (usually much faster than re-reading the SD).
+            // Digest uses canonical on-card names so it matches a post-copy hash of dest.
+            var precomputedHash: ContentHashSidecar.ComputeResult?
+            if let sources = try? payloadSourcesForImport(source: source, destImageName: imageName),
+               !sources.isEmpty
+            {
+                progress?("Hashing \(offset + 1)/\(resolved.count)… \(source.hintName)")
+                precomputedHash = try? ContentHashSidecar.compute(sources: sources)
+            }
+
             progress?("Copying \(offset + 1)/\(resolved.count)… \(source.hintName)")
 
             let dest = rootURL.appendingPathComponent(folderName, isDirectory: true)
@@ -312,17 +440,26 @@ enum CardOperations: Sendable {
             }
 
             // Prefer disc.* names when we copied a single image file.
-            // Resolve display name from the *source* filename first (GCM-style), before rename.
-            var imageName = source.imageFileName
-            let preferred = preferredImageName(for: source.imageFileName)
-            if source.fileNames?.count == 1,
-               preferred != source.imageFileName
-            {
+            if willRenameSingle {
                 let from = dest.appendingPathComponent(source.imageFileName)
                 let to = dest.appendingPathComponent(preferred)
                 if fm.fileExists(atPath: from.path), !fm.fileExists(atPath: to.path) {
                     try? fm.moveItem(at: from, to: to)
                     imageName = preferred
+                }
+            }
+
+            // Write sidecars from the precomputed digest (tiny write; no SD re-read of the disc).
+            var contentHash: String?
+            var payloadSize: Int64 = 0
+            if let computed = precomputedHash {
+                do {
+                    try ContentHashSidecar.write(computed, to: dest)
+                    contentHash = computed.sha256
+                    payloadSize = computed.payloadSize
+                } catch {
+                    // Fall back to post-import hashing in the UI if sidecar write fails.
+                    contentHash = nil
                 }
             }
 
@@ -358,11 +495,11 @@ enum CardOperations: Sendable {
                 format: format,
                 imageFileName: imageName,
                 folderPath: dest.path,
-                byteSize: details?.byteSize ?? 0,
-                payloadByteSize: details?.payloadByteSize ?? 0,
-                contentSHA256: details?.contentSHA256,
+                byteSize: details?.byteSize ?? payloadSize,
+                payloadByteSize: payloadSize > 0 ? payloadSize : (details?.payloadByteSize ?? 0),
+                contentSHA256: contentHash ?? details?.contentSHA256,
                 isMenu: false,
-                detailsLoaded: details != nil
+                detailsLoaded: details != nil || contentHash != nil
             )
             added.append(entry)
         }
@@ -438,6 +575,34 @@ enum CardOperations: Sendable {
         }
     }
 
+    /// Payload files to hash for import, using **destination** names and **source** content paths.
+    nonisolated private static func payloadSourcesForImport(
+        source: DiscImportSource,
+        destImageName: String
+    ) throws -> [ContentHashSidecar.PayloadSource] {
+        let fm = FileManager.default
+        let names: [String]
+        if let fileNames = source.fileNames {
+            names = fileNames
+        } else {
+            names = try fm.contentsOfDirectory(atPath: source.packageURL.path)
+                .filter { !$0.hasPrefix(".") }
+                .filter { $0 != trashFolderName && $0 != tmpFolderName }
+        }
+
+        var sources: [ContentHashSidecar.PayloadSource] = []
+        for name in names {
+            let ext = (name as NSString).pathExtension.lowercased()
+            guard ContentHashSidecar.payloadExtensions.contains(ext) else { continue }
+            let content = source.packageURL.appendingPathComponent(name)
+            guard fm.fileExists(atPath: content.path) else { continue }
+            // Single-image imports may land as disc.gdi / disc.cdi / disc.ccd.
+            let canonical = (name == source.imageFileName) ? destImageName : name
+            sources.append(.init(name: canonical, contentURL: content))
+        }
+        return sources
+    }
+
     nonisolated private static func copyPackage(source: DiscImportSource, to dest: URL) throws {
         let fm = FileManager.default
         if let fileNames = source.fileNames {
@@ -457,7 +622,9 @@ enum CardOperations: Sendable {
         for name in names {
             // Skip nested manager trash/tmp if someone selected a card root by mistake
             // (already blocked) or odd packages.
-            if name == trashFolderName || name == tmpFolderName { continue }
+            if name == trashFolderName || name == tmpFolderName {
+                continue
+            }
             let from = source.packageURL.appendingPathComponent(name)
             let to = dest.appendingPathComponent(name)
             try fm.copyItem(at: from, to: to)

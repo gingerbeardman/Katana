@@ -2,20 +2,16 @@ import XCTest
 @testable import Katana
 
 final class MenuGDIBakeTests: XCTestCase {
-    /// Stock assets from Tools/MenuGDIBuilder (repo path relative to test host is fragile;
-    /// resolve from the source tree next to the project).
+    /// Stock trees under `Tools/MenuAssets/` (next to the Xcode project).
     private var gdMenuAssets: URL? {
-        let candidates = [
-            // Running under xcodebuild: SRCROOT / project-adjacent
-            URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent() // KatanaTests
-                .deletingLastPathComponent() // project root
-                .appendingPathComponent("Tools/MenuGDIBuilder/assets/gdMenu"),
-        ]
-        for url in candidates where FileManager.default.fileExists(atPath: url.appendingPathComponent("IP.BIN").path) {
-            return url
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // KatanaTests
+            .deletingLastPathComponent() // project root
+            .appendingPathComponent("Tools/MenuAssets/gdMenu")
+        guard FileManager.default.fileExists(atPath: url.appendingPathComponent("IP.BIN").path) else {
+            return nil
         }
-        return nil
+        return url
     }
 
     func testNativeBakeGdMenuProducesTracks() throws {
@@ -62,7 +58,7 @@ final class MenuGDIBakeTests: XCTestCase {
         XCTAssertTrue(lines.contains(where: { $0.hasPrefix("3 ") && $0.contains("track03.iso") }))
         XCTAssertTrue(lines.contains(where: { $0.hasPrefix("5 ") && $0.contains("track05.iso") }))
 
-        // Ballpark sizes vs known-good MenuGDIBuilder output (not byte-identical).
+        // Ballpark sizes (not byte-identical to historical helper output).
         let t1 = try out.appendingPathComponent("track01.iso").resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         let t3 = try out.appendingPathComponent("track03.iso").resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         let t5 = try out.appendingPathComponent("track05.iso").resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
@@ -83,7 +79,7 @@ final class MenuGDIBakeTests: XCTestCase {
         let assets = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-            .appendingPathComponent("Tools/MenuGDIBuilder/assets/openMenu")
+            .appendingPathComponent("Tools/MenuAssets/openMenu")
         guard FileManager.default.fileExists(atPath: assets.appendingPathComponent("IP.BIN").path) else {
             throw XCTSkip("openMenu assets not found")
         }

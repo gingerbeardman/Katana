@@ -43,7 +43,7 @@ struct CardScannerIntegrationTests {
 
     @Test func scanFixtureCard() async throws {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("dcgdsd-fixture-\(UUID().uuidString)", isDirectory: true)
+        let root = fm.temporaryDirectory.appendingPathComponent("katana-fixture-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: root) }
 

@@ -152,7 +152,8 @@ enum GameDatabase: Sendable {
 
     /// Lazy, process-wide table (immutable after load).
     private nonisolated(unsafe) static let sharedTitles: [String: Entry] = {
-        loadFromBundle()
+        LaunchTrace.mark("GameDatabase.sharedTitles lazy init")
+        return loadFromBundle()
     }()
 
     nonisolated private static func loadFromBundle() -> [String: Entry] {
@@ -163,8 +164,14 @@ enum GameDatabase: Sendable {
             Bundle.main.resourceURL?.appendingPathComponent("dreamcast-titles.json"),
         ]
         for case let url? in candidates {
-            if let map = loadTitles(from: url) { return map }
+            if let map = LaunchTrace.measure("GameDatabase.loadTitles \(url.lastPathComponent)", {
+                loadTitles(from: url)
+            }) {
+                LaunchTrace.mark("GameDatabase loaded \(map.count) titles from \(url.path)")
+                return map
+            }
         }
+        LaunchTrace.mark("GameDatabase.loadFromBundle: empty")
         return [:]
     }
 

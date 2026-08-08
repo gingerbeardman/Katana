@@ -1,9 +1,10 @@
+import CryptoKit
 import Foundation
 
 // MARK: - Model
 
 /// Strength of evidence that two (or more) games are the same content.
-nonisolated enum DuplicateGrade: String, Hashable, Sendable, Comparable {
+nonisolated enum DuplicateGrade: String, Hashable, Sendable, Comparable, Codable {
     /// SHA-256 of disc payload matches (or size+hash when both present).
     case exact
     /// Same payload size plus serial and/or strong name match.
@@ -46,8 +47,8 @@ nonisolated enum DuplicateGrade: String, Hashable, Sendable, Comparable {
     }
 }
 
-nonisolated struct DuplicateSignal: Hashable, Sendable {
-    nonisolated enum Kind: String, Hashable, Sendable {
+nonisolated struct DuplicateSignal: Hashable, Sendable, Codable {
+    nonisolated enum Kind: String, Hashable, Sendable, Codable {
         case hash
         case size
         case serial
@@ -95,6 +96,30 @@ enum DuplicateIdentity: Sendable {
     }
 }
 
+// MARK: - Disk cache (per volume)
+
+/// Persisted duplicate analysis for a card. Invalidated when game names/sizes/hashes change.
+nonisolated struct DuplicateCacheRecord: Codable, Sendable {
+    var version: Int
+    var volumeUUID: String
+    /// SHA-256 hex of the analysis input (folders, names, sizes, hashes, ignored keys).
+    var signature: String
+    var rows: [DuplicateCacheRow]
+
+    static let currentVersion = 1
+}
+
+nonisolated struct DuplicateCacheRow: Codable, Sendable {
+    var folderName: String
+    var number: Int
+    var grade: DuplicateGrade
+    var signals: [DuplicateSignal]
+    var indexInGroup: Int
+    var groupSize: Int
+    /// Stable group id (sorted folder names), not UUID-based.
+    var groupKey: String
+}
+
 // MARK: - Detector
 
 enum DuplicateDetector {
@@ -109,9 +134,95 @@ enum DuplicateDetector {
     /// cannot form a group on serial alone.
     nonisolated static let weakSerialFrequency: Int = 4
 
+    // MARK: Input signature (cache key)
+
+    /// Fingerprint of everything that affects analysis for `games`.
+    nonisolated static func analysisSignature(
+        games: [GameEntry],
+        ignoredIdentityKeys: Set<String> = []
+    ) -> String {
+        var lines: [String] = []
+        lines.reserveCapacity(games.count + 1)
+        for g in games.sorted(by: { $0.number < $1.number }) {
+            if g.isMenu { continue }
+            let folder = URL(fileURLWithPath: g.folderPath).lastPathComponent
+            let size = g.payloadByteSize > 0 ? g.payloadByteSize : g.byteSize
+            lines.append(
+                "\(folder)|\(g.number)|\(g.name)|\(g.serial)|\(size)|\(g.contentSHA256 ?? "")"
+            )
+        }
+        lines.append("ignored:" + ignoredIdentityKeys.sorted().joined(separator: ","))
+        let data = Data(lines.joined(separator: "\n").utf8)
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Rebuild a live `DuplicateInfo` map from a disk cache (caller must check signature).
+    nonisolated static func mapFromCache(
+        _ record: DuplicateCacheRecord,
+        onto games: [GameEntry]
+    ) -> [GameEntry.ID: DuplicateInfo]? {
+        guard record.version == DuplicateCacheRecord.currentVersion else { return nil }
+
+        let liveByFolder: [String: GameEntry] = Dictionary(
+            games.filter { !$0.isMenu }.map {
+                (URL(fileURLWithPath: $0.folderPath).lastPathComponent, $0)
+            },
+            uniquingKeysWith: { _, last in last }
+        )
+
+        var result: [GameEntry.ID: DuplicateInfo] = [:]
+        result.reserveCapacity(record.rows.count)
+        for row in record.rows {
+            guard let game = liveByFolder[row.folderName], game.number == row.number else {
+                // Folder gone or renumbered — force recompute.
+                return nil
+            }
+            result[game.id] = DuplicateInfo(
+                groupKey: row.groupKey,
+                grade: row.grade,
+                signals: row.signals,
+                indexInGroup: row.indexInGroup,
+                groupSize: row.groupSize
+            )
+        }
+        return result
+    }
+
+    /// Snapshot analysis results for disk (folder-keyed, UUID-stable).
+    nonisolated static func cacheRecord(
+        volumeUUID: String,
+        signature: String,
+        games: [GameEntry],
+        info: [GameEntry.ID: DuplicateInfo]
+    ) -> DuplicateCacheRecord {
+        let rows: [DuplicateCacheRow] = games.compactMap { game in
+            guard !game.isMenu, let dup = info[game.id] else { return nil }
+            let folder = URL(fileURLWithPath: game.folderPath).lastPathComponent
+            return DuplicateCacheRow(
+                folderName: folder,
+                number: game.number,
+                grade: dup.grade,
+                signals: dup.signals,
+                indexInGroup: dup.indexInGroup,
+                groupSize: dup.groupSize,
+                groupKey: dup.groupKey
+            )
+        }
+        .sorted { $0.number < $1.number }
+
+        return DuplicateCacheRecord(
+            version: DuplicateCacheRecord.currentVersion,
+            volumeUUID: volumeUUID,
+            signature: signature,
+            rows: rows
+        )
+    }
+
+    // MARK: Analyze
+
     /// Build per-game duplicate info. Menu entries are never flagged.
     /// - Parameter ignoredIdentityKeys: Per-card “not a duplicate” marks (see `DuplicateIdentity`).
-    /// Safe to call off the main actor (O(n²) pair checks).
+    /// Safe to call off the main actor (O(n²) pair checks with precomputed features).
     nonisolated static func analyze(
         _ games: [GameEntry],
         ignoredIdentityKeys: Set<String> = []
@@ -123,9 +234,12 @@ enum DuplicateDetector {
         }
         guard candidates.count >= 2 else { return [:] }
 
-        let serialFreq = serialFrequency(candidates)
-        var parent = Dictionary(uniqueKeysWithValues: candidates.map { ($0.id, $0.id) })
-        var rank = Dictionary(uniqueKeysWithValues: candidates.map { ($0.id, 0) })
+        // Precompute once — pair loop used to re-normalize names / rebuild bigrams / recompile regexes.
+        let features = candidates.map(Features.init(game:))
+        let serialFreq = serialFrequency(features)
+
+        var parent = Dictionary(uniqueKeysWithValues: features.map { ($0.id, $0.id) })
+        var rank = Dictionary(uniqueKeysWithValues: features.map { ($0.id, 0) })
 
         func find(_ id: GameEntry.ID) -> GameEntry.ID {
             var x = id
@@ -145,37 +259,40 @@ enum DuplicateDetector {
         }
 
         // Best edge grade between each pair that matches (for per-member grade).
-        var bestEdge: [Set<GameEntry.ID>: (DuplicateGrade, [DuplicateSignal])] = [:]
+        // Ordered UUID pair keys avoid allocating a Set per edge.
+        var bestEdge: [EdgeKey: (DuplicateGrade, [DuplicateSignal])] = [:]
+        bestEdge.reserveCapacity(min(features.count * 2, 4096))
 
-        let list = candidates
-        for i in 0..<list.count {
-            for j in (i + 1)..<list.count {
+        let list = features
+        let n = list.count
+        for i in 0..<n {
+            for j in (i + 1)..<n {
                 let a = list[i], b = list[j]
                 guard let match = match(a, b, serialFreq: serialFreq) else { continue }
                 union(a.id, b.id)
-                bestEdge[Set([a.id, b.id])] = match
+                bestEdge[EdgeKey(a.id, b.id)] = match
             }
         }
 
         // Components
-        var components: [GameEntry.ID: [GameEntry]] = [:]
-        for game in candidates {
-            let root = find(game.id)
-            components[root, default: []].append(game)
+        var components: [GameEntry.ID: [Features]] = [:]
+        for f in features {
+            let root = find(f.id)
+            components[root, default: []].append(f)
         }
 
         var result: [GameEntry.ID: DuplicateInfo] = [:]
         for (_, members) in components {
             guard members.count > 1 else { continue }
             let sorted = members.sorted { $0.number < $1.number }
-            let groupKey = sorted.map(\.id.uuidString).sorted().joined(separator: "|")
+            // Stable group key (folder names) so disk cache remaps cleanly across UUID churn.
+            let groupKey = sorted.map(\.folderName).sorted().joined(separator: "|")
 
             for (offset, game) in sorted.enumerated() {
-                // Best grade among edges from this game to any other member.
                 var grade: DuplicateGrade = .weak
                 var signals: [DuplicateSignal] = []
                 for other in sorted where other.id != game.id {
-                    if let edge = bestEdge[Set([game.id, other.id])] {
+                    if let edge = bestEdge[EdgeKey(game.id, other.id)] {
                         if edge.0 > grade {
                             grade = edge.0
                             signals = edge.1
@@ -199,6 +316,7 @@ enum DuplicateDetector {
                 )
             }
         }
+
         return result
     }
 
@@ -239,6 +357,53 @@ enum DuplicateDetector {
         Set(analyze(games, ignoredIdentityKeys: ignoredIdentityKeys).values.map(\.groupKey)).count
     }
 
+    // MARK: - Precomputed features
+
+    /// Per-game fields used in the pair loop (computed once).
+    nonisolated struct Features: Sendable {
+        var id: GameEntry.ID
+        var number: Int
+        var folderName: String
+        var name: String
+        var serialNorm: String
+        var size: Int64
+        var hash: String?
+        var normalizedName: String
+        var bigrams: Set<String>
+        var discNumber: Int?
+        var stemNormalized: String
+        var stemBigrams: Set<String>
+
+        nonisolated init(game: GameEntry) {
+            id = game.id
+            number = game.number
+            folderName = URL(fileURLWithPath: game.folderPath).lastPathComponent
+            name = game.name
+            serialNorm = normalizeSerial(game.serial)
+            size = game.payloadByteSize > 0 ? game.payloadByteSize : game.byteSize
+            hash = game.contentSHA256
+            normalizedName = normalizeName(game.name)
+            bigrams = bigramsOf(normalizedName)
+            discNumber = DuplicateDetector.discNumber(in: game.name)
+            let stem = stripDiscMarkers(game.name)
+            stemNormalized = stem
+            stemBigrams = bigramsOf(stem)
+        }
+    }
+
+    private nonisolated struct EdgeKey: Hashable, Sendable {
+        var lo: GameEntry.ID
+        var hi: GameEntry.ID
+
+        init(_ a: GameEntry.ID, _ b: GameEntry.ID) {
+            if a.uuidString < b.uuidString {
+                lo = a; hi = b
+            } else {
+                lo = b; hi = a
+            }
+        }
+    }
+
     // MARK: - Pair match
 
     /// Returns grade + signals if the pair should be linked, else nil.
@@ -247,41 +412,48 @@ enum DuplicateDetector {
         _ b: GameEntry,
         serialFreq: [String: Int]
     ) -> (DuplicateGrade, [DuplicateSignal])? {
+        match(Features(game: a), Features(game: b), serialFreq: serialFreq)
+    }
+
+    nonisolated static func match(
+        _ a: Features,
+        _ b: Features,
+        serialFreq: [String: Int]
+    ) -> (DuplicateGrade, [DuplicateSignal])? {
         var signals: [DuplicateSignal] = []
 
-        let hashA = a.contentSHA256
-        let hashB = b.contentSHA256
-        let sameHash = hashA != nil && hashA == hashB
+        let sameHash = a.hash != nil && a.hash == b.hash
 
-        let sizeA = a.payloadByteSize > 0 ? a.payloadByteSize : a.byteSize
-        let sizeB = b.payloadByteSize > 0 ? b.payloadByteSize : b.byteSize
-        let sameSize = sizeA >= minSizeForMatch && sizeA == sizeB
-        let sizesDifferMaterially = sizesLookLikeDifferentDiscs(sizeA, sizeB)
+        let sameSize = a.size >= minSizeForMatch && a.size == b.size
+        let sizesDifferMaterially = sizesLookLikeDifferentDiscs(a.size, b.size)
 
-        let serialA = normalizeSerial(a.serial)
-        let serialB = normalizeSerial(b.serial)
-        let serialShared = !serialA.isEmpty && serialA == serialB
-        let serialIsWeak = serialShared && (serialFreq[serialA] ?? 0) >= weakSerialFrequency
+        let serialShared = !a.serialNorm.isEmpty && a.serialNorm == b.serialNorm
+        let serialIsWeak = serialShared && (serialFreq[a.serialNorm] ?? 0) >= weakSerialFrequency
 
-        let nameScore = nameSimilarity(a.name, b.name)
+        let nameScore = nameSimilarity(
+            normalizedA: a.normalizedName,
+            bigramsA: a.bigrams,
+            normalizedB: b.normalizedName,
+            bigramsB: b.bigrams
+        )
         let namesSimilar = nameScore >= nameSimilarityThreshold
         let namesExact = nameScore >= 0.999
 
         // Multi-disc: same product serial, different disc # in the title (or very different sizes).
-        let multiDiscSet = looksLikeMultiDiscPair(a.name, b.name)
+        let multiDiscSet = looksLikeMultiDiscPair(a, b)
             || (serialShared && sizesDifferMaterially && !sameHash)
 
         if sameHash {
-            signals.append(DuplicateSignal(kind: .hash, detail: String(hashA!.prefix(12))))
+            signals.append(DuplicateSignal(kind: .hash, detail: String(a.hash!.prefix(12))))
         }
         if sameSize {
-            signals.append(DuplicateSignal(kind: .size, detail: byteLabel(sizeA)))
+            signals.append(DuplicateSignal(kind: .size, detail: byteLabel(a.size)))
         }
         if serialShared {
             signals.append(
                 DuplicateSignal(
                     kind: .serial,
-                    detail: serialIsWeak ? "\(serialA) (common)" : serialA
+                    detail: serialIsWeak ? "\(a.serialNorm) (common)" : a.serialNorm
                 )
             )
         }
@@ -301,7 +473,6 @@ enum DuplicateDetector {
 
         // Multi-disc of the same game: do **not** flag on serial (or soft name) alone.
         if multiDiscSet {
-            // Still flag if payload size matches (unusual for real multi-disc, common for bad dups).
             if sameSize && namesSimilar {
                 return (.strong, signals)
             }
@@ -336,13 +507,18 @@ enum DuplicateDetector {
 
     /// "Game (Disc 1)" vs "Game (Disc 2)", "CD1"/"CD2", "Disk 1 of 3", etc.
     nonisolated static func looksLikeMultiDiscPair(_ nameA: String, _ nameB: String) -> Bool {
-        let da = discNumber(in: nameA)
-        let db = discNumber(in: nameB)
-        if let da, let db, da != db {
-            // Same franchise title stem → multi-disc set.
-            let stemA = stripDiscMarkers(nameA)
-            let stemB = stripDiscMarkers(nameB)
-            return nameSimilarity(stemA, stemB) >= 0.75
+        looksLikeMultiDiscPair(Features(game: stubEntry(name: nameA)), Features(game: stubEntry(name: nameB)))
+    }
+
+    nonisolated private static func looksLikeMultiDiscPair(_ a: Features, _ b: Features) -> Bool {
+        if let da = a.discNumber, let db = b.discNumber, da != db {
+            let stemScore = nameSimilarity(
+                normalizedA: a.stemNormalized,
+                bigramsA: a.stemBigrams,
+                normalizedB: b.stemNormalized,
+                bigramsB: b.stemBigrams
+            )
+            return stemScore >= 0.75
         }
         return false
     }
@@ -350,6 +526,20 @@ enum DuplicateDetector {
     /// Extract a disc index from common naming patterns, if any.
     nonisolated static func discNumber(in name: String) -> Int? {
         let s = name.lowercased()
+        let range = NSRange(s.startIndex..., in: s)
+        for regex in discNumberRegexes {
+            guard let match = regex.firstMatch(in: s, range: range),
+                  match.numberOfRanges > 1,
+                  let r = Range(match.range(at: 1), in: s),
+                  let n = Int(s[r]), n > 0, n < 20
+            else { continue }
+            return n
+        }
+        return nil
+    }
+
+    /// Compiled once — was the largest avoidable cost inside the O(n²) loop.
+    private nonisolated static let discNumberRegexes: [NSRegularExpression] = {
         let patterns = [
             #"disc\s*(\d+)"#,
             #"disk\s*(\d+)"#,
@@ -358,20 +548,10 @@ enum DuplicateDetector {
             #"\b(\d+)\s*of\s*\d+\b"#,
             #"\[(\d+)\]"#,
         ]
-        for pattern in patterns {
-            if let regex = try? NSRegularExpression(pattern: pattern, options: []),
-               let match = regex.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
-               match.numberOfRanges > 1,
-               let range = Range(match.range(at: 1), in: s),
-               let n = Int(s[range]), n > 0, n < 20 {
-                return n
-            }
-        }
-        return nil
-    }
+        return patterns.compactMap { try? NSRegularExpression(pattern: $0, options: []) }
+    }()
 
-    nonisolated static func stripDiscMarkers(_ name: String) -> String {
-        var s = name
+    private nonisolated static let discStripRegexes: [NSRegularExpression] = {
         let patterns = [
             #"\(?\s*disc\s*\d+\s*(of\s*\d+)?\)?"#,
             #"\(?\s*disk\s*\d+\s*(of\s*\d+)?\)?"#,
@@ -379,11 +559,14 @@ enum DuplicateDetector {
             #"\[\s*\d+\s*\]"#,
             #"\d+\s*of\s*\d+"#,
         ]
-        for pattern in patterns {
-            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
-                let range = NSRange(s.startIndex..., in: s)
-                s = regex.stringByReplacingMatches(in: s, range: range, withTemplate: " ")
-            }
+        return patterns.compactMap { try? NSRegularExpression(pattern: $0, options: .caseInsensitive) }
+    }()
+
+    nonisolated static func stripDiscMarkers(_ name: String) -> String {
+        var s = name
+        for regex in discStripRegexes {
+            let range = NSRange(s.startIndex..., in: s)
+            s = regex.stringByReplacingMatches(in: s, range: range, withTemplate: " ")
         }
         return normalizeName(s)
     }
@@ -402,13 +585,23 @@ enum DuplicateDetector {
     nonisolated static func nameSimilarity(_ a: String, _ b: String) -> Double {
         let na = normalizeName(a)
         let nb = normalizeName(b)
+        return nameSimilarity(
+            normalizedA: na,
+            bigramsA: bigramsOf(na),
+            normalizedB: nb,
+            bigramsB: bigramsOf(nb)
+        )
+    }
+
+    nonisolated private static func nameSimilarity(
+        normalizedA na: String,
+        bigramsA ba: Set<String>,
+        normalizedB nb: String,
+        bigramsB bb: Set<String>
+    ) -> Double {
         guard !na.isEmpty, !nb.isEmpty else { return 0 }
         if na == nb { return 1 }
-
-        let ba = bigrams(na)
-        let bb = bigrams(nb)
         guard !ba.isEmpty, !bb.isEmpty else {
-            // Single-character / very short: fall back to containment.
             if na.contains(nb) || nb.contains(na) { return 0.9 }
             return 0
         }
@@ -416,10 +609,11 @@ enum DuplicateDetector {
         return Double(2 * inter) / Double(ba.count + bb.count)
     }
 
-    private nonisolated static func bigrams(_ s: String) -> Set<String> {
+    nonisolated private static func bigramsOf(_ s: String) -> Set<String> {
         let chars = Array(s)
         guard chars.count >= 2 else { return [] }
         var set = Set<String>()
+        set.reserveCapacity(chars.count)
         for i in 0..<(chars.count - 1) {
             set.insert(String(chars[i...i + 1]))
         }
@@ -453,17 +647,33 @@ enum DuplicateDetector {
         return joined.split { $0.isWhitespace }.joined(separator: " ")
     }
 
-    private nonisolated static func serialFrequency(_ games: [GameEntry]) -> [String: Int] {
+    private nonisolated static func serialFrequency(_ features: [Features]) -> [String: Int] {
         var freq: [String: Int] = [:]
-        for g in games {
-            let s = normalizeSerial(g.serial)
-            guard !s.isEmpty else { continue }
-            freq[s, default: 0] += 1
+        for f in features {
+            guard !f.serialNorm.isEmpty else { continue }
+            freq[f.serialNorm, default: 0] += 1
         }
         return freq
     }
 
     private nonisolated static func byteLabel(_ n: Int64) -> String {
         ByteCount.string(for: n)
+    }
+
+    /// Minimal entry for public multi-disc helper that still takes raw names.
+    private nonisolated static func stubEntry(name: String) -> GameEntry {
+        GameEntry(
+            id: UUID(),
+            number: 2,
+            name: name,
+            serial: "",
+            format: .unknown,
+            imageFileName: "disc.cdi",
+            folderPath: "/tmp/x",
+            byteSize: 0,
+            payloadByteSize: 0,
+            contentSHA256: nil,
+            isMenu: false
+        )
     }
 }

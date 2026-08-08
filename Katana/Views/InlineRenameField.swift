@@ -177,7 +177,7 @@ struct RenameAwareTitleCell: View {
     }
 
     var body: some View {
-        HStack(spacing: 6) {
+        Group {
             if state.renamingGameID == game.id {
                 InlineRenameField(
                     text: $draft,
@@ -191,30 +191,14 @@ struct RenameAwareTitleCell: View {
                         state.cancelInlineRename()
                     }
                 )
-                .frame(maxWidth: .infinity, alignment: .leading)
             } else {
                 Text(game.name)
                     .fontWeight(game.isMenu ? .semibold : .regular)
                     .lineLimit(1)
                     .truncationMode(.tail)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            // Chips stay trailing so long titles truncate cleanly before badges.
-            if game.isMenu {
-                Text("MENU")
-                    .font(.caption2.weight(.bold))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(Color.secondary.opacity(0.14), in: Capsule())
-                    .foregroundStyle(.secondary)
-                    .layoutPriority(1)
-            }
-            if let badge = state.listDuplicateBadge(for: game.id) {
-                DuplicateBadge(badge)
-                    .layoutPriority(1)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// Full name when there is no extension; otherwise stem only (Finder-style).

@@ -15,19 +15,17 @@ struct SidebarView: View {
             VStack(alignment: .leading, spacing: 0) {
                 cardSection
                 sectionDivider
-                if !state.recentVolumes.isEmpty {
+                if state.showsRecentCardsSection {
                     recentSection
                     sectionDivider
                 }
-                if state.volume != nil {
+                if state.volume != nil, state.duplicatesEnabled {
                     duplicatesSection
                     sectionDivider
                 }
                 if let stats = state.lastScanStats {
                     scanSection(stats)
-                    sectionDivider
                 }
-                notesSection
             }
             .padding(.bottom, 12)
         }
@@ -49,7 +47,7 @@ struct SidebarView: View {
                     Text(volume.volumeName)
                         .font(.body.weight(.medium))
                         .lineLimit(1)
-                    Spacer(minLength: 0)
+                    Spacer(minLength: 4)
                     if volume.isReadOnly {
                         Text("Read-only")
                             .font(.caption.weight(.semibold))
@@ -58,6 +56,17 @@ struct SidebarView: View {
                             .padding(.vertical, 2)
                             .background(Color.orange.opacity(0.15), in: Capsule())
                     }
+                    Button {
+                        Task { await state.eject() }
+                    } label: {
+                        Image(systemName: "eject.fill")
+                            .imageScale(.medium)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!state.canEject)
+                    .help("Eject \(volume.volumeName)")
+                    .accessibilityLabel("Eject")
                 }
 
                 if volume.isReadOnly {
@@ -84,44 +93,41 @@ struct SidebarView: View {
                         if freeFraction <= 0.25 { return .orange }
                         return .green
                     }()
+                    let freeLine: String = {
+                        var s = "\(state.formatSize(free, capacityHint: total)) free of \(state.formatSize(total, capacityHint: total))"
+                        if !state.trashSummary.isEmpty {
+                            let trashSize = state.formatSize(
+                                state.trashSummary.totalBytes,
+                                capacityHint: total
+                            )
+                            s += " (\(trashSize) in Trash)"
+                        }
+                        return s
+                    }()
                     VStack(alignment: .leading, spacing: 4) {
                         ProgressView(value: Double(used), total: Double(total))
                             .tint(capacityColor)
-                        Text("\(ByteCount.string(for: free)) free of \(ByteCount.string(for: total))")
+                        Text(freeLine)
                             .font(.callout.monospacedDigit())
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity)
                             .multilineTextAlignment(.center)
+                            .help(
+                                state.trashSummary.isEmpty
+                                    ? "Free space on the card"
+                                    : "\(state.trashSummary.itemCount) soft-deleted item\(state.trashSummary.itemCount == 1 ? "" : "s") in \(CardOperations.trashFolderName)"
+                            )
                     }
                 }
-
-                Text(volume.rootPath)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
-
-                Picker("Menu", selection: Binding(
-                    get: { state.menuKind },
-                    set: { state.setMenuKind($0) }
-                )) {
-                    ForEach(MenuKind.allCases) { kind in
-                        Text(kind.displayName).tag(kind)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .disabled(state.isBusy)
-                .help("Console menu baked into slot 01. Switch and rebuild (⌘S) to convert.")
 
                 Button {
-                    Task { await state.eject() }
+                    state.emptyCardTrash()
                 } label: {
-                    Text("Eject")
+                    Text("Empty Trash…")
                         .frame(maxWidth: .infinity)
                 }
-                .disabled(!state.canEject)
+                .disabled(!state.canEmptyCardTrash)
+                .help("Permanently delete soft-deleted games on this card")
             } else {
                 Text("No card open")
                     .font(.callout)
@@ -137,6 +143,18 @@ struct SidebarView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
+
+                // Single-card mode: one-shot reopen without a full Recent list.
+                if !state.manageMultipleCards, let last = state.lastRememberedVolume {
+                    Button {
+                        state.reopenLastCard()
+                    } label: {
+                        Text("Reopen “\(last.volumeName)”")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .disabled(!state.canReopenLastCard)
+                    .help(last.lastPath)
+                }
             }
         }
         .padding(.horizontal, 16)
@@ -210,21 +228,33 @@ struct SidebarView: View {
     // MARK: - Duplicates
 
     private var duplicatesSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        // Always show the metric lines. While analysis is pending (scan / first compute),
+        // use “—” placeholders — never a false “No duplicates flagged” empty state.
+        let pending = !state.hasDuplicateAnalysis || state.isDuplicateInfoComputing
+
+        return VStack(alignment: .leading, spacing: 10) {
             sectionHeader("Duplicates")
 
-            if state.duplicateGameCount > 0 {
-                metricRow("Groups", value: "\(state.duplicateGroupCount)")
-                metricRow("Flagged", value: "\(state.duplicateGameCount)")
-                metricRow("Exact", value: "\(state.exactDuplicateCount)", valueColor: .pink)
-                metricRow("Extras", value: "\(state.redundantDuplicateCount)", valueColor: .red)
-            } else {
-                Text("No duplicates flagged.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
-                    .multilineTextAlignment(.center)
-            }
+            metricRow(
+                "Groups",
+                value: pending ? "—" : "\(state.duplicateGroupCount)",
+                valueColor: pending ? .secondary : .primary
+            )
+            metricRow(
+                "Flagged",
+                value: pending ? "—" : "\(state.duplicateGameCount)",
+                valueColor: pending ? .secondary : .primary
+            )
+            metricRow(
+                "Exact",
+                value: pending ? "—" : "\(state.exactDuplicateCount)",
+                valueColor: pending ? .secondary : .pink
+            )
+            metricRow(
+                "Extras",
+                value: pending ? "—" : "\(state.redundantDuplicateCount)",
+                valueColor: pending ? .secondary : .red
+            )
 
             if state.notDuplicateMarkCount > 0 {
                 metricRow(
@@ -289,6 +319,7 @@ struct SidebarView: View {
                 .help("Grade badges on titles in the game list (Exact 1/2, …). Off by default.")
 
             Toggle("Show duplicates only", isOn: $state.showDuplicatesOnly)
+                .help("Highlight duplicates and dim the rest. All rows stay in place (no list reflow).")
 
             VStack(spacing: 8) {
                 Button {
@@ -347,7 +378,7 @@ struct SidebarView: View {
         .disabled(state.isScanning)
     }
 
-    // MARK: - Scan / notes
+    // MARK: - Scan
 
     private func scanSection(_ stats: String) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -355,31 +386,6 @@ struct SidebarView: View {
             Text(stats)
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity)
-                .multilineTextAlignment(.center)
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
-    }
-
-    private var notesSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(
-                state.volume?.isReadOnly == true
-                    ? "Card is read-only — unlock the SD write-protect switch to make changes."
-                    : "Writes go straight to the card.\nUndo with ⌘Z."
-            )
-                .font(.callout)
-                .foregroundStyle(state.volume?.isReadOnly == true ? Color.orange : Color.secondary)
-                .frame(maxWidth: .infinity)
-                .multilineTextAlignment(.center)
-            Text(
-                state.menuNeedsRebuild
-                    ? "\(state.menuKind.displayName) list is out of date — Rebuild Menu (⌘S), or you’ll be asked on quit."
-                    : "Rebuild Menu (⌘S) updates \(state.menuKind.displayName) in slot 01."
-            )
-                .font(.callout)
-                .foregroundStyle(state.menuNeedsRebuild ? Color.orange : Color.secondary.opacity(0.8))
                 .frame(maxWidth: .infinity)
                 .multilineTextAlignment(.center)
         }

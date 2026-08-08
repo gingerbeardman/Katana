@@ -26,75 +26,125 @@ struct GameListView: View {
     }
 
     var body: some View {
-        Table(displayedGames, selection: $state.selection, sortOrder: $sortOrder) {
-            TableColumn("#", value: \.number) { game in
-                HStack(spacing: 4) {
-                    Text(FolderNumbering.format(game.number, maxNumber: maxNumber))
+        // Rebuild strip is a *top* sibling of the Table (not bottom safeAreaInset).
+        // Bottom insets on NavigationSplitView detail + Table were clipped unless
+        // the window was extremely tall — users never saw the bar.
+        VStack(spacing: 0) {
+            if state.volume != nil, state.menuNeedsRebuild {
+                menuRebuildBar
+            }
+
+            Table(displayedGames, selection: $state.selection, sortOrder: $sortOrder) {
+                TableColumn("#", value: \.number) { game in
+                    // Slot + trailing chips (MENU / duplicate). Observes AppState for pending badges.
+                    NumberColumnCell(game: game, maxNumber: maxNumber, state: state)
+                }
+                .width(min: 110, ideal: 110, max: 110)
+
+                TableColumn("Title", value: \.name) { game in
+                    // Observe rename state inside the cell (Table caches closures).
+                    RenameAwareTitleCell(game: game, state: state)
+                        .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
+                }
+                .width(min: 160, ideal: 280)
+
+                TableColumn("Serial", value: \.serial) { game in
+                    Text(game.serial.isEmpty ? "—" : game.serial)
+                        .font(.body.monospaced())
+                        .foregroundStyle(game.serial.isEmpty ? .tertiary : .primary)
+                        .lineLimit(1)
+                        .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
+                }
+                .width(min: 72, ideal: 100, max: 140)
+
+                TableColumn("Format", value: \.formatSortKey) { game in
+                    FormatBadge(format: game.format)
+                        .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
+                }
+                .width(min: 52, ideal: 64, max: 80)
+
+                TableColumn("Size", value: \.byteSize) { game in
+                    Text(state.formatSize(game.byteSize))
                         .font(.body.monospacedDigit())
                         .foregroundStyle(.secondary)
-                        .frame(minWidth: 28, alignment: .trailing)
-                    if state.isHashingGame(game) {
-                        ProgressView()
-                            .controlSize(.small)
-                            .help("Computing content hash…")
-                    }
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
+                }
+                .width(min: 72, ideal: 88, max: 110)
+            }
+            // Keep rows visible while scanning; block interaction only.
+            .disabled(state.isScanning || state.isBusy)
+            .opacity(state.isScanning ? 0.72 : 1)
+            .background {
+                if state.scrollToNewRows {
+                    TableSelectionScroller(trigger: state.scrollTargetGameID)
                 }
             }
-            .width(min: 52, ideal: 64, max: 80)
-
-            TableColumn("Title", value: \.name) { game in
-                // Observe rename state inside the cell (Table caches closures).
-                RenameAwareTitleCell(game: game, state: state)
+            .contextMenu(forSelectionType: GameEntry.ID.self) { selectedIDs in
+                selectionContextMenu(selectedIDs)
+            } primaryAction: { selectedIDs in
+                // Double-click: Finder-style inline rename (not inspector).
+                if selectedIDs.count == 1, let id = selectedIDs.first {
+                    state.beginInlineRename(id)
+                }
             }
-            .width(min: 160, ideal: 280)
-
-            TableColumn("Serial", value: \.serial) { game in
-                Text(game.serial.isEmpty ? "—" : game.serial)
-                    .font(.body.monospaced())
-                    .foregroundStyle(game.serial.isEmpty ? .tertiary : .primary)
-                    .lineLimit(1)
-            }
-            .width(min: 72, ideal: 100, max: 140)
-
-            TableColumn("Format", value: \.formatSortKey) { game in
-                FormatBadge(format: game.format)
-            }
-            .width(min: 52, ideal: 64, max: 80)
-
-            TableColumn("Size", value: \.byteSize) { game in
-                Text(ByteCount.string(for: game.byteSize))
-                    .font(.body.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-            .width(min: 72, ideal: 88, max: 110)
-        }
-        // Keep rows visible while scanning; block interaction only.
-        .disabled(state.isScanning || state.isBusy)
-        .opacity(state.isScanning ? 0.72 : 1)
-        .background {
-            if state.scrollToNewRows {
-                TableSelectionScroller(trigger: state.scrollTargetGameID)
-            }
-        }
-        .contextMenu(forSelectionType: GameEntry.ID.self) { selectedIDs in
-            selectionContextMenu(selectedIDs)
-        } primaryAction: { selectedIDs in
-            // Double-click: Finder-style inline rename (not inspector).
-            if selectedIDs.count == 1, let id = selectedIDs.first {
+            .onKeyPress(.return) {
+                guard state.renamingGameID == nil,
+                      !state.isBusy,
+                      !state.isScanning,
+                      state.selection.count == 1,
+                      let id = state.selection.first
+                else { return .ignored }
                 state.beginInlineRename(id)
+                return .handled
+            }
+            .overlay(alignment: .top) {
+                // Subtle edge progress only — count lives in the window subtitle.
+                if state.isScanning, let progress = state.scanProgress, progress.total > 0 {
+                    GeometryReader { geo in
+                        let fraction = progress.total > 0
+                            ? min(1, max(0, Double(progress.completed) / Double(progress.total)))
+                            : 0
+                        ZStack(alignment: .leading) {
+                            Rectangle()
+                                .fill(Color.primary.opacity(0.08))
+                            Rectangle()
+                                .fill(Color.accentColor)
+                                .frame(width: geo.size.width * fraction)
+                        }
+                    }
+                    .frame(height: 2)
+                    .allowsHitTesting(false)
+                }
+            }
+            .overlay {
+                // Do not cover the table while scanning — rows fill in as progress.
+                if let busy = state.busyMessage, !state.isScanning {
+                    busyOverlay(busy)
+                } else if state.volume == nil, !state.isScanning {
+                    ContentUnavailableView {
+                        Label("No Card Open", systemImage: "sdcard")
+                    } description: {
+                        Text("Open a GDEMU SD card root (the folder that contains 01, 02, …).")
+                    } actions: {
+                        Button("Open Card…") { state.openCard() }
+                            .buttonStyle(.borderedProminent)
+                    }
+                } else if state.filteredGames.isEmpty, !state.isScanning, state.volume != nil {
+                    ContentUnavailableView.search(text: state.searchText)
+                }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if state.volume != nil, isNonSlotSort {
+                    displaySortBar
+                }
             }
         }
-        .onKeyPress(.return) {
-            guard state.renamingGameID == nil,
-                  !state.isBusy,
-                  !state.isScanning,
-                  state.selection.count == 1,
-                  let id = state.selection.first
-            else { return .ignored }
-            state.beginInlineRename(id)
-            return .handled
-        }
+        .searchable(
+            text: $state.searchText,
+            placement: .toolbar,
+            prompt: "Name, serial, number…"
+        )
         .onChange(of: state.selection) { _, newValue in
             // Leave rename mode if the renamed row is no longer selected.
             if let id = state.renamingGameID, !newValue.contains(id) {
@@ -106,72 +156,6 @@ struct GameListView: View {
         }
         .onChange(of: state.isScanning) { _, scanning in
             if scanning { state.cancelInlineRename() }
-        }
-        .searchable(
-            text: $state.searchText,
-            placement: .toolbar,
-            prompt: "Name, serial, number…"
-        )
-        .overlay(alignment: .top) {
-            // Subtle edge progress only — count lives in the window subtitle.
-            if state.isScanning, let progress = state.scanProgress, progress.total > 0 {
-                GeometryReader { geo in
-                    let fraction = progress.total > 0
-                        ? min(1, max(0, Double(progress.completed) / Double(progress.total)))
-                        : 0
-                    ZStack(alignment: .leading) {
-                        Rectangle()
-                            .fill(Color.primary.opacity(0.08))
-                        Rectangle()
-                            .fill(Color.accentColor)
-                            .frame(width: geo.size.width * fraction)
-                    }
-                }
-                .frame(height: 2)
-                .allowsHitTesting(false)
-            }
-        }
-        .overlay {
-            // Do not cover the table while scanning — rows fill in as progress.
-            if let busy = state.busyMessage, !state.isScanning {
-                busyOverlay(busy)
-            } else if state.volume == nil, !state.isScanning {
-                ContentUnavailableView {
-                    Label("No Card Open", systemImage: "sdcard")
-                } description: {
-                    Text("Open a GDEMU SD card root (the folder that contains 01, 02, …). Changes write immediately.")
-                } actions: {
-                    Button("Open Card…") { state.openCard() }
-                        .buttonStyle(.borderedProminent)
-                }
-            } else if state.filteredGames.isEmpty, !state.isScanning, state.volume != nil {
-                ContentUnavailableView.search(text: state.searchText)
-            }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if state.volume != nil, isNonSlotSort {
-                HStack(spacing: 8) {
-                    Image(systemName: "arrow.up.arrow.down.circle")
-                        .foregroundStyle(.secondary)
-                    Text("Sorted by \(state.displaySort.summary) — disc slot numbers unchanged.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 8)
-                    Button("Newest First") {
-                        applyAndSave(.mostRecentFirst)
-                    }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
-                    Button("Slot Order") {
-                        applyAndSave(.discOrder)
-                    }
-                    .buttonStyle(.borderless)
-                    .font(.caption)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(.bar)
-            }
         }
         // Restore saved sort when a card opens / changes; drop any in-flight rename.
         .onChange(of: state.volume?.volumeUUID) { _, _ in
@@ -202,6 +186,66 @@ struct GameListView: View {
         state.saveDisplaySort(pref)
     }
 
+    /// Compact strip under the toolbar — warning chrome (not inverted white-on-orange).
+    private var menuRebuildBar: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .imageScale(.medium)
+            Text("\(state.menuKind.displayName) list is out of date")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            Text("— rebuild so the console matches the card")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+            Spacer(minLength: 8)
+            Button("Rebuild…") {
+                state.rebuildMenuList()
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
+            .controlSize(.small)
+            .disabled(!state.canRebuildMenu || state.isTextInputFocused)
+            .help("Bake names and order into \(state.menuKind.displayName) in slot 01 (⌘S)")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background {
+            Rectangle().fill(.bar)
+            Rectangle().fill(Color.orange.opacity(0.14))
+        }
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    private var displaySortBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.up.arrow.down.circle")
+                .foregroundStyle(.secondary)
+            Text("Sorted by \(state.displaySort.summary) — disc slot numbers unchanged.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Button("Newest First") {
+                applyAndSave(.mostRecentFirst)
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+            Button("Slot Order") {
+                applyAndSave(.discOrder)
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(.bar)
+        .overlay(alignment: .top) { Divider() }
+    }
+
     private func sortOrdersMatch(
         _ a: [KeyPathComparator<GameEntry>],
         _ b: [KeyPathComparator<GameEntry>]
@@ -222,23 +266,37 @@ struct GameListView: View {
             .disabled(state.isBusy || state.isScanning)
         }
 
-        let selectedGames = state.games.filter { selectedIDs.contains($0.id) }
-        let anyDup = selectedGames.contains { state.duplicateInfo(for: $0.id) != nil }
-        let anyMarked = selectedGames.contains { state.isMarkedNotDuplicate($0) }
-        if anyDup {
-            Button(multi ? "Mark Not Duplicates" : "Not a Duplicate") {
-                state.markNotDuplicate(ids: selectedIDs)
-            }
+        Button("Show Details") {
+            state.selection = selectedIDs
+            state.isInspectorPresented = true
         }
-        if anyMarked {
-            Button("Restore Duplicate Detection") {
-                state.clearNotDuplicateMark(ids: selectedIDs)
+        .disabled(count == 0)
+
+        let selectedGames = state.games.filter { selectedIDs.contains($0.id) }
+        if state.duplicatesEnabled {
+            let anyDup = selectedGames.contains { state.duplicateInfo(for: $0.id) != nil }
+            let anyMarked = selectedGames.contains { state.isMarkedNotDuplicate($0) }
+            if anyDup {
+                Button(multi ? "Mark Not Duplicates" : "Not a Duplicate") {
+                    state.markNotDuplicate(ids: selectedIDs)
+                }
+            }
+            if anyMarked {
+                Button("Restore Duplicate Detection") {
+                    state.clearNotDuplicateMark(ids: selectedIDs)
+                }
             }
         }
 
-        Button(multi ? "Sentence Case (\(count))" : "Sentence Case") {
-            state.selection = selectedIDs
-            state.sentenceCaseSelection()
+        Menu(multi ? "Manually Rename (\(count))" : "Manually Rename") {
+            Button("Sentence Case") {
+                state.selection = selectedIDs
+                state.sentenceCaseSelection()
+            }
+            Button("Title Case") {
+                state.selection = selectedIDs
+                state.titleCaseSelection()
+            }
         }
         .disabled(count == 0 || state.isBusy)
 

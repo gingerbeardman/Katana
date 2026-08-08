@@ -54,7 +54,7 @@ enum MenuRebuildService: Sendable {
         let assets = try assetsURL(for: kind)
 
         let tempRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("dcgdsd-menu-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("katana-menu-\(UUID().uuidString)", isDirectory: true)
         let outDir = tempRoot.appendingPathComponent("menu_gdi", isDirectory: true)
 
         defer { try? FileManager.default.removeItem(at: tempRoot) }
@@ -109,16 +109,30 @@ enum MenuRebuildService: Sendable {
         let menu = games.first(where: { $0.number == 1 || $0.isMenu }) ?? games.first
         guard let menu else { return nil }
 
-        if let k = MenuKind.detect(fromName: menu.name) { return k }
+        if let k = MenuKind.detect(fromName: menu.name) {
+            LaunchTrace.mark("detectMenuKind: from name \"\(menu.name)\" → \(k.rawValue)")
+            return k
+        }
+        let serialStart = CFAbsoluteTimeGetCurrent()
         if let serial = try? String(
             contentsOf: menu.folderURL.appendingPathComponent("serial.txt"),
             encoding: .utf8
         ), let k = MenuKind.detect(fromName: serial) {
+            LaunchTrace.mark(
+                "detectMenuKind: from serial.txt (\(Int((CFAbsoluteTimeGetCurrent() - serialStart) * 1000))ms) → \(k.rawValue)"
+            )
             return k
         }
+        let ipStart = CFAbsoluteTimeGetCurrent()
         if let ip = IpBinReader.read(from: menu), let k = MenuKind.detect(fromIP: ip) {
+            LaunchTrace.mark(
+                "detectMenuKind: from IP.BIN (\(Int((CFAbsoluteTimeGetCurrent() - ipStart) * 1000))ms) → \(k.rawValue)"
+            )
             return k
         }
+        LaunchTrace.mark(
+            "detectMenuKind: no match (IP.BIN attempt \(Int((CFAbsoluteTimeGetCurrent() - ipStart) * 1000))ms)"
+        )
         return nil
     }
 
@@ -164,7 +178,7 @@ enum MenuRebuildService: Sendable {
     nonisolated private static func extractAssetsZip(_ zipURL: URL, kind: MenuKind) throws -> URL {
         let fm = FileManager.default
         let root = fm.temporaryDirectory
-            .appendingPathComponent("dcgdsd-menu-assets-\(kind.rawValue)", isDirectory: true)
+            .appendingPathComponent("katana-menu-assets-\(kind.rawValue)", isDirectory: true)
         if fm.fileExists(atPath: root.path) {
             try? fm.removeItem(at: root)
         }
@@ -216,7 +230,7 @@ enum MenuRebuildService: Sendable {
         }
 
         let root = fm.temporaryDirectory
-            .appendingPathComponent("dcgdsd-menu-assets-\(kind.rawValue)", isDirectory: true)
+            .appendingPathComponent("katana-menu-assets-\(kind.rawValue)", isDirectory: true)
         if fm.fileExists(atPath: root.path) {
             try? fm.removeItem(at: root)
         }
@@ -286,7 +300,7 @@ enum MenuRebuildService: Sendable {
 
         // Stage onto the same volume first — never wipe slot 01 until the new set is complete.
         let stageRoot = rootURL
-            .appendingPathComponent(".dcgdsd-tmp", isDirectory: true)
+            .appendingPathComponent(CardOperations.tmpFolderName, isDirectory: true)
             .appendingPathComponent("menu-stage-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: stageRoot, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: stageRoot.deletingLastPathComponent()) }
@@ -296,7 +310,7 @@ enum MenuRebuildService: Sendable {
         }
 
         let keepNames: Set<String> = [
-            "name.txt", "serial.txt", "hash.dcgdsd",
+            "name.txt", "serial.txt", "katana.sha",
             "info.txt", "0gdtex.pvr", "0GDTEX.PVR",
         ]
         let imageExts: Set<String> = ["gdi", "iso", "raw", "bin", "cdi", "img", "ccd", "sub", "mds", "mdf"]

@@ -6,7 +6,7 @@ struct VolumeStoreTests {
     @Test func rememberAndLoadLast() async throws {
         let fm = FileManager.default
         let root = fm.temporaryDirectory
-            .appendingPathComponent("dcgdsd-vol-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("katana-vol-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: root) }
 

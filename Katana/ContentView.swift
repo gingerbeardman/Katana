@@ -114,11 +114,15 @@ struct ContentView: View {
                                     : "square.stack.3d.up.badge.a"
                             )
                         }
-                        .disabled(state.games.isEmpty)
+                        .disabled(state.games.isEmpty || !state.duplicatesEnabled)
                         .help(
-                            state.duplicateGameCount == 0
-                                ? "No duplicates detected"
-                                : "\(state.duplicateGroupCount) groups · \(state.redundantDuplicateCount) extras"
+                            !state.duplicatesEnabled
+                                ? "Duplicate tools are off (Settings → General)"
+                                : (!state.hasDuplicateAnalysis || state.isDuplicateInfoComputing)
+                                    ? "Detecting duplicates…"
+                                    : state.duplicateGameCount == 0
+                                        ? "No duplicates detected"
+                                        : "\(state.duplicateGroupCount) groups · \(state.redundantDuplicateCount) extras"
                         )
                         .symbolVariant(state.showDuplicatesOnly ? .fill : .none)
                     }
@@ -148,36 +152,42 @@ struct ContentView: View {
                 .installNativeToolbarSpacers()
         }
         .overlay(alignment: .bottom) {
-            if let flash = state.flashMessage {
-                Text(flash)
-                    .font(.callout.weight(.medium).monospacedDigit())
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(.regularMaterial, in: Capsule())
-                    .padding(.bottom, 16)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-        }
-        .animation(.snappy, value: state.flashMessage)
-        .overlay(alignment: .top) {
-            if let err = state.lastError {
-                HStack {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                    Text(err)
-                        .lineLimit(2)
-                        .numericText()
-                    Spacer()
-                    Button("Dismiss") { state.lastError = nil }
-                        .buttonStyle(.borderless)
+            ZStack {
+                if let flash = state.flashMessage {
+                    Text(flash)
+                        .font(.callout.weight(.medium).monospacedDigit())
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(.regularMaterial, in: Capsule())
+                        .padding(.bottom, 16)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
-                .font(.callout)
-                .padding(10)
-                .background(.yellow.opacity(0.9), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .padding()
-                .transition(.move(edge: .top).combined(with: .opacity))
             }
+            // Scoped to this overlay only — must not sit on NavigationSplitView
+            // (that reflowed the whole window content up under the titlebar).
+            .animation(.snappy, value: state.flashMessage)
         }
-        .animation(.snappy, value: state.lastError)
+        .overlay(alignment: .top) {
+            ZStack {
+                if let err = state.lastError {
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text(err)
+                            .lineLimit(2)
+                            .numericText()
+                        Spacer()
+                        Button("Dismiss") { state.lastError = nil }
+                            .buttonStyle(.borderless)
+                    }
+                    .font(.callout)
+                    .padding(10)
+                    .background(.yellow.opacity(0.9), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .padding()
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .animation(.snappy, value: state.lastError)
+        }
     }
 
 }

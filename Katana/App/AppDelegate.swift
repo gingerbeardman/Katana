@@ -5,15 +5,33 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var appState: AppState?
 
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        LaunchTrace.mark("applicationWillFinishLaunching")
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        LaunchTrace.mark("applicationDidFinishLaunching")
         // Keep `isTextInputFocused` in sync so menu key equivalents (⌘A, ⌫, ⌘Z…)
         // don't steal keystrokes from TextField / search / field editors.
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(windowDidUpdateForTextFocus(_:)),
-            name: NSWindow.didUpdateNotification,
-            object: nil
-        )
+        // Prefer editing begin/end (+ key-window changes) — *not* didUpdate, which
+        // fires every layout pass and caused a brief main-thread hitch at launch.
+        let nc = NotificationCenter.default
+        for name in [
+            NSText.didBeginEditingNotification,
+            NSText.didEndEditingNotification,
+            NSControl.textDidBeginEditingNotification,
+            NSControl.textDidEndEditingNotification,
+            NSWindow.didBecomeKeyNotification,
+            NSWindow.didResignKeyNotification,
+        ] {
+            nc.addObserver(
+                self,
+                selector: #selector(syncTextInputFocus(_:)),
+                name: name,
+                object: nil
+            )
+        }
+        LaunchTrace.mark("applicationDidFinishLaunching (observers installed)")
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -26,10 +44,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
-    @objc private func windowDidUpdateForTextFocus(_ notification: Notification) {
-        let editing = Self.isEditingText(in: NSApp.keyWindow)
-        guard let appState, appState.isTextInputFocused != editing else { return }
-        appState.isTextInputFocused = editing
+    @objc private func syncTextInputFocus(_ notification: Notification) {
+        // Defer one turn so the field editor is installed before we sample firstResponder.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let appState = self.appState else { return }
+            let editing = Self.isEditingText(in: NSApp.keyWindow)
+            if appState.isTextInputFocused != editing {
+                appState.isTextInputFocused = editing
+            }
+        }
     }
 
     /// Field editor (`NSTextView`) or an editable `NSTextField` owns typing shortcuts.

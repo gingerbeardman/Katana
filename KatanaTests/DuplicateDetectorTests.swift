@@ -91,6 +91,35 @@ struct DuplicateDetectorTests {
         #expect(DuplicateDetector.nameSimilarity("Crazy Taxi", "Sonic") < 0.5)
     }
 
+    @Test func analysisSignatureStableForSameList() {
+        let a = entry(number: 2, name: "Foo", serial: "T1", size: 10)
+        let b = entry(number: 3, name: "Bar", serial: "T2", size: 20)
+        let s1 = DuplicateDetector.analysisSignature(games: [a, b])
+        let s2 = DuplicateDetector.analysisSignature(games: [b, a]) // order by number
+        #expect(s1 == s2)
+        #expect(s1.count == 64)
+    }
+
+    @Test func cacheRoundTripRemapsIDs() {
+        let a = entry(number: 2, name: "Sonic Adventure", serial: "T-9708N", size: 500_000_000)
+        let b = entry(number: 5, name: "Sonic Adventure", serial: "T9708N", size: 500_000_000)
+        let info = DuplicateDetector.analyze([a, b])
+        let sig = DuplicateDetector.analysisSignature(games: [a, b])
+        let record = DuplicateDetector.cacheRecord(
+            volumeUUID: "vol",
+            signature: sig,
+            games: [a, b],
+            info: info
+        )
+        // New UUIDs, same folders/content (folder path uses number).
+        let a2 = entry(number: 2, name: "Sonic Adventure", serial: "T-9708N", size: 500_000_000)
+        let b2 = entry(number: 5, name: "Sonic Adventure", serial: "T9708N", size: 500_000_000)
+        let mapped = DuplicateDetector.mapFromCache(record, onto: [a2, b2])
+        #expect(mapped?[a2.id]?.isPrimary == true)
+        #expect(mapped?[b2.id]?.isRedundant == true)
+        #expect(mapped?[a2.id]?.grade == info[a.id]?.grade)
+    }
+
     private func entry(
         number: Int,
         name: String,

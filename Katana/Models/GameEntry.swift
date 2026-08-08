@@ -15,7 +15,7 @@ nonisolated struct GameEntry: Identifiable, Codable, Hashable, Sendable {
     var byteSize: Int64
     /// Disc payload only (tracks/images) — used for size-based duplicate matching.
     var payloadByteSize: Int64
-    /// SHA-256 of payload when known (from `hash.dcgdsd` sidecar).
+    /// SHA-256 of payload when known (from `katana.sha` or per-file sidecars).
     var contentSHA256: String?
     var isMenu: Bool
     /// False after a fast scan until sizes / stored hashes are filled in the background.

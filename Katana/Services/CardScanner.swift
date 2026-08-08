@@ -106,16 +106,37 @@ enum CardScanner: Sendable {
         onProgress: (@Sendable (ProgressEvent) async -> Void)?
     ) async throws -> ScanResult {
         let started = Date()
-        let volume = try VolumeIdentity.resolve(rootURL: rootURL)
+        LaunchTrace.mark("CardScanner.performScan begin preferSnapshot=\(preferSnapshotCache)")
+        let volume = try LaunchTrace.measure("CardScanner VolumeIdentity.resolve") {
+            try VolumeIdentity.resolve(rootURL: rootURL)
+        }
         let fm = FileManager.default
 
-        if preferSnapshotCache,
-           let snapshot = try await loadSnapshotIfValid(rootURL: rootURL)
-        {
-            return snapshot
+        if preferSnapshotCache {
+            let snapshot = try await LaunchTrace.measureAsync("CardScanner.loadSnapshotIfValid") {
+                try await loadSnapshotIfValid(rootURL: rootURL)
+            }
+            if let snapshot {
+                LaunchTrace.mark("CardScanner snapshot HIT \(snapshot.entries.count) entries")
+                // Paint every row at once so “Show duplicates only” / markers never sit on an empty table.
+                if let onProgress, !snapshot.entries.isEmpty {
+                    await onProgress(
+                        ProgressEvent(
+                            entries: snapshot.entries,
+                            completed: snapshot.entries.count,
+                            total: snapshot.entries.count
+                        )
+                    )
+                }
+                return snapshot
+            }
+            LaunchTrace.mark("CardScanner snapshot MISS")
         }
 
-        let cached = try? await CardCacheStore.shared.load(volumeUUID: volume.volumeUUID)
+        let cached = try await LaunchTrace.measureAsync("CardCacheStore.load") {
+            try? await CardCacheStore.shared.load(volumeUUID: volume.volumeUUID)
+        }
+        LaunchTrace.mark("CardCacheStore.load entries=\(cached?.entries.count ?? 0)")
         // uniquingKeysWith: corrupt caches may repeat folder names after partial renumbers.
         let cacheByFolder: [String: CachedEntry] = {
             guard let cached else { return [:] }
@@ -125,9 +146,12 @@ enum CardScanner: Sendable {
             )
         }()
 
-        let numbered = try numberedFolderURLs(at: rootURL)
+        let numbered = try LaunchTrace.measure("CardScanner.numberedFolderURLs") {
+            try numberedFolderURLs(at: rootURL)
+        }
 
         let total = numbered.count
+        LaunchTrace.mark("CardScanner numbered folders=\(total)")
         var hits = 0
         var misses = 0
         var collected: [GameEntry] = []
@@ -149,6 +173,41 @@ enum CardScanner: Sendable {
             await onProgress(
                 ProgressEvent(entries: batch, completed: collected.count, total: total)
             )
+        }
+
+        // First paint: one row per slot (cache hit → real data, else stub) so the list
+        // height is final immediately — no row insertion jump while workers run.
+        if let onProgress, total > 0 {
+            let firstPaint: [GameEntry] = LaunchTrace.measure("CardScanner build firstPaint") {
+                numbered.map { number, url in
+                    let folderName = url.lastPathComponent
+                    if var entry = cacheByFolder[folderName]?.entry {
+                        entry.number = number
+                        entry.folderPath = url.path
+                        if entry.byteSize > 0 { entry.detailsLoaded = true }
+                        return entry
+                    }
+                    return GameEntry(
+                        id: UUID(),
+                        number: number,
+                        name: "…",
+                        serial: "",
+                        format: .unknown,
+                        imageFileName: "",
+                        folderPath: url.path,
+                        byteSize: 0,
+                        payloadByteSize: 0,
+                        contentSHA256: nil,
+                        isMenu: number == 1,
+                        detailsLoaded: false
+                    )
+                }
+            }
+            await LaunchTrace.measureAsync("CardScanner firstPaint onProgress") {
+                await onProgress(
+                    ProgressEvent(entries: firstPaint, completed: 0, total: total)
+                )
+            }
         }
 
         try await withThrowingTaskGroup(of: (Int, GameEntry, FolderFingerprint, Bool).self) { group in

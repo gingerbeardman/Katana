@@ -44,15 +44,17 @@ struct InspectorView: View {
                 collapsible(.title) {
                     titleSectionBody(game)
                 }
-                if let dup = state.duplicateInfo(for: game.id) {
-                    sectionDivider
-                    collapsible(.duplicate) {
-                        duplicateSectionBody(game, info: dup)
-                    }
-                } else if state.isMarkedNotDuplicate(game) {
-                    sectionDivider
-                    collapsible(.duplicate) {
-                        notDuplicateMarkedBody(game)
+                if state.duplicatesEnabled {
+                    if let dup = state.duplicateInfo(for: game.id) {
+                        sectionDivider
+                        collapsible(.duplicate) {
+                            duplicateSectionBody(game, info: dup)
+                        }
+                    } else if state.isMarkedNotDuplicate(game) {
+                        sectionDivider
+                        collapsible(.duplicate) {
+                            notDuplicateMarkedBody(game)
+                        }
                     }
                 }
                 sectionDivider
@@ -103,7 +105,7 @@ struct InspectorView: View {
                         Text("\(games.count) games")
                             .font(.title3.weight(.semibold).monospacedDigit())
 
-                        Text(ByteCount.string(for: state.selectedBytes))
+                        Text(state.formatSize(state.selectedBytes))
                             .font(.callout.monospacedDigit())
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity)
@@ -137,22 +139,15 @@ struct InspectorView: View {
 
                 collapsible(.actions) {
                     VStack(alignment: .leading, spacing: 10) {
-                        HStack(spacing: 8) {
-                            Button {
+                        Menu("Manually Rename") {
+                            Button("Sentence Case") {
                                 state.sentenceCaseSelection()
-                            } label: {
-                                Text("Sentence Case")
-                                    .frame(maxWidth: .infinity)
                             }
-
-                            Button {
-                                let urls = games.map(\.folderURL)
-                                NSWorkspace.shared.activateFileViewerSelecting(urls)
-                            } label: {
-                                Text("Reveal")
-                                    .frame(maxWidth: .infinity)
+                            Button("Title Case") {
+                                state.titleCaseSelection()
                             }
                         }
+                        .disabled(state.isBusy)
 
                         Menu("Automatically Rename") {
                             ForEach(AutoRenameSource.allCases) { source in
@@ -164,23 +159,33 @@ struct InspectorView: View {
                         }
                         .disabled(state.isBusy)
 
-                        let anyDup = games.contains { state.duplicateInfo(for: $0.id) != nil }
-                        let anyMarked = games.contains { state.isMarkedNotDuplicate($0) }
-                        if anyDup {
-                            Button {
-                                state.markNotDuplicate(ids: Set(games.map(\.id)))
-                            } label: {
-                                Text("Mark Not Duplicates")
-                                    .frame(maxWidth: .infinity)
-                            }
-                            .help("Stop flagging these games as duplicates on this card")
+                        Button {
+                            let urls = games.map(\.folderURL)
+                            NSWorkspace.shared.activateFileViewerSelecting(urls)
+                        } label: {
+                            Text("Reveal in Finder")
+                                .frame(maxWidth: .infinity)
                         }
-                        if anyMarked {
-                            Button {
-                                state.clearNotDuplicateMark(ids: Set(games.map(\.id)))
-                            } label: {
-                                Text("Restore Duplicate Detection")
-                                    .frame(maxWidth: .infinity)
+
+                        if state.duplicatesEnabled {
+                            let anyDup = games.contains { state.duplicateInfo(for: $0.id) != nil }
+                            let anyMarked = games.contains { state.isMarkedNotDuplicate($0) }
+                            if anyDup {
+                                Button {
+                                    state.markNotDuplicate(ids: Set(games.map(\.id)))
+                                } label: {
+                                    Text("Mark Not Duplicates")
+                                        .frame(maxWidth: .infinity)
+                                }
+                                .help("Stop flagging these games as duplicates on this card")
+                            }
+                            if anyMarked {
+                                Button {
+                                    state.clearNotDuplicateMark(ids: Set(games.map(\.id)))
+                                } label: {
+                                    Text("Restore Duplicate Detection")
+                                        .frame(maxWidth: .infinity)
+                                }
                             }
                         }
 
@@ -223,7 +228,7 @@ struct InspectorView: View {
 
     private func titleStatusLine(for game: GameEntry) -> String {
         let slot = FolderNumbering.format(game.number, maxNumber: maxNumber)
-        let size = ByteCount.string(for: game.byteSize)
+        let size = state.formatSize(game.byteSize)
         if game.isMenu {
             return "Slot \(slot) · \(state.menuKind.displayName) · \(size)"
         }
@@ -460,21 +465,15 @@ struct InspectorView: View {
 
     private func actionsSectionBody(_ game: GameEntry) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Button {
-                    applySentenceCase(to: game)
-                } label: {
-                    Text("Sentence Case")
-                        .frame(maxWidth: .infinity)
+            Menu("Manually Rename") {
+                Button("Sentence Case") {
+                    applyManualCase(to: game, style: .sentence)
                 }
-
-                Button {
-                    revealInFinder(game)
-                } label: {
-                    Text("Reveal")
-                        .frame(maxWidth: .infinity)
+                Button("Title Case") {
+                    applyManualCase(to: game, style: .title)
                 }
             }
+            .disabled(state.isBusy)
 
             Menu("Automatically Rename") {
                 ForEach(AutoRenameSource.allCases) { source in
@@ -489,6 +488,13 @@ struct InspectorView: View {
                 }
             }
             .disabled(state.isBusy)
+
+            Button {
+                revealInFinder(game)
+            } label: {
+                Text("Reveal in Finder")
+                    .frame(maxWidth: .infinity)
+            }
 
             Button(role: .destructive) {
                 state.delete(id: game.id)
@@ -630,13 +636,21 @@ struct InspectorView: View {
         state.rename(id: game.id, to: trimmed)
     }
 
-    private func applySentenceCase(to game: GameEntry) {
+    private enum ManualCaseStyle {
+        case sentence
+        case title
+    }
+
+    private func applyManualCase(to game: GameEntry, style: ManualCaseStyle) {
         state.selectOnly(game.id)
-        state.sentenceCaseSelection()
+        switch style {
+        case .sentence: state.sentenceCaseSelection()
+        case .title: state.titleCaseSelection()
+        }
         if let updated = state.games.first(where: { $0.id == game.id }) {
             draftName = updated.name
         } else {
-            draftName = game.name.sentenceCasedTitle
+            draftName = style == .sentence ? game.name.sentenceCasedTitle : game.name.titleCasedName
         }
     }
 

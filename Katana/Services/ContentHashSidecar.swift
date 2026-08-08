@@ -5,14 +5,15 @@ import Foundation
 ///
 /// Supported sidecar layouts (read any that are present):
 /// - `disc.cdi.sha` / `track04.iso.sha256` / `foo.md5` — common “filename.<algo>” files
-/// - `hash.dcgdsd` — our multi-file aggregate JSON (written when we compute a full folder hash)
+/// - `katana.sha` — Katana multi-file aggregate (JSON: digest + fingerprints)
 ///
 /// Extension → algorithm (when writing we prefer `.sha256`):
 /// - `.md5` → MD5 (read-only recognition; we still store hex for comparison)
 /// - `.sha1` / `.sha` (40 hex chars) → SHA-1
 /// - `.sha256` / `.sha` (64 hex chars) → SHA-256
 enum ContentHashSidecar: Sendable {
-    nonisolated static let aggregateFileName = "hash.dcgdsd"
+    /// Aggregate written by Katana (JSON `Record`, not a bare hex dump).
+    nonisolated static let aggregateFileName = "katana.sha"
     nonisolated static let version = 1
 
     /// Files that count as disc payload (not manager metadata / hash sidecars).
@@ -26,7 +27,8 @@ enum ContentHashSidecar: Sendable {
     ]
 
     nonisolated static let metadataNames: Set<String> = [
-        "name.txt", "serial.txt", "info.txt", aggregateFileName.lowercased()
+        "name.txt", "serial.txt", "info.txt",
+        aggregateFileName.lowercased(),
     ]
 
     nonisolated struct Record: Codable, Hashable, Sendable {
@@ -75,23 +77,35 @@ enum ContentHashSidecar: Sendable {
         )
     }
 
-    /// Compute SHA-256 over payload and write:
-    /// 1) per primary image `name.sha256` (widely recognized)
-    /// 2) aggregate `hash.dcgdsd` for multi-track folders
-    nonisolated static func computeAndWrite(for folderURL: URL) throws -> Record {
-        let manifest = try payloadManifest(in: folderURL)
-        guard !manifest.isEmpty else { throw HashError.noPayload }
+    /// Canonical payload file name (as stored on the card) + URL to read content from.
+    /// Content may live on a faster volume during import (hash source before SD write).
+    nonisolated struct PayloadSource: Sendable {
+        var name: String
+        var contentURL: URL
+    }
+
+    nonisolated struct ComputeResult: Sendable {
+        var sha256: String
+        var payloadSize: Int64
+        var perFileSHA256: [(name: String, hex: String)]
+    }
+
+    /// Hash payload bytes from arbitrary paths using **canonical names** in the digest.
+    /// Does not write sidecars — use `write(_:to:)` after files exist at the destination.
+    nonisolated static func compute(sources: [PayloadSource]) throws -> ComputeResult {
+        let ordered = sources.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        guard !ordered.isEmpty else { throw HashError.noPayload }
 
         var hasher = SHA256()
         var perFileSHA256: [(name: String, hex: String)] = []
+        var totalSize: Int64 = 0
 
-        for item in manifest {
-            let url = folderURL.appendingPathComponent(item.name)
+        for item in ordered {
             hasher.update(data: Data(item.name.utf8))
             hasher.update(data: Data([0]))
 
             var fileHasher = SHA256()
-            guard let handle = try? FileHandle(forReadingFrom: url) else {
+            guard let handle = try? FileHandle(forReadingFrom: item.contentURL) else {
                 throw HashError.unreadable(item.name)
             }
             defer { try? handle.close() }
@@ -103,28 +117,53 @@ enum ContentHashSidecar: Sendable {
             }
             let fileHex = fileHasher.finalize().map { String(format: "%02x", $0) }.joined()
             perFileSHA256.append((item.name, fileHex))
-
-            // Write adjacent sidecar: `track01.iso.sha256` (and `.sha` alias for single-file discs).
-            try writeAdjacentHash(hex: fileHex, algorithm: .sha256, forFileNamed: item.name, in: folderURL)
+            let size = (try? item.contentURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+            totalSize += size
         }
 
-        let digest = hasher.finalize()
-        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        let hex = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return ComputeResult(sha256: hex, payloadSize: totalSize, perFileSHA256: perFileSHA256)
+    }
+
+    /// Write aggregate + adjacent sidecars into a folder that already has the payload files.
+    /// Fingerprints use **destination** size/mtime so `validHash` stays fresh after a copy.
+    nonisolated static func write(_ computed: ComputeResult, to folderURL: URL) throws {
+        let manifest = try payloadManifest(in: folderURL)
+        guard !manifest.isEmpty else { throw HashError.noPayload }
+
+        for item in computed.perFileSHA256 {
+            try writeAdjacentHash(hex: item.hex, algorithm: .sha256, forFileNamed: item.name, in: folderURL)
+        }
+        if computed.perFileSHA256.count == 1, let only = computed.perFileSHA256.first {
+            try writeAdjacentHash(hex: only.hex, algorithm: .sha, forFileNamed: only.name, in: folderURL)
+        }
+
         let record = Record(
             version: version,
-            payloadSize: payloadSize(from: manifest),
-            sha256: hex,
+            payloadSize: computed.payloadSize > 0 ? computed.payloadSize : payloadSize(from: manifest),
+            sha256: computed.sha256,
             fileFingerprints: fingerprintLines(from: manifest),
             computedAt: Date()
         )
         try writeAggregate(record, to: folderURL)
+    }
 
-        // Single-file discs also get the short `.sha` form many tools use.
-        if perFileSHA256.count == 1, let only = perFileSHA256.first {
-            try writeAdjacentHash(hex: only.hex, algorithm: .sha, forFileNamed: only.name, in: folderURL)
+    /// Compute SHA-256 over payload and write sidecars into the same folder.
+    nonisolated static func computeAndWrite(for folderURL: URL) throws -> Record {
+        let manifest = try payloadManifest(in: folderURL)
+        guard !manifest.isEmpty else { throw HashError.noPayload }
+        let sources = manifest.map {
+            PayloadSource(name: $0.name, contentURL: folderURL.appendingPathComponent($0.name))
         }
-
-        return record
+        let computed = try compute(sources: sources)
+        try write(computed, to: folderURL)
+        return Record(
+            version: version,
+            payloadSize: computed.payloadSize,
+            sha256: computed.sha256,
+            fileFingerprints: fingerprintLines(from: try payloadManifest(in: folderURL)),
+            computedAt: Date()
+        )
     }
 
     // MARK: - Adjacent hash files (filename.sha / .sha256 / .md5)
@@ -208,11 +247,13 @@ enum ContentHashSidecar: Sendable {
     // MARK: - Aggregate JSON
 
     nonisolated static func readAggregate(in folderURL: URL) -> Record? {
-        let url = folderURL.appendingPathComponent(aggregateFileName)
-        guard let data = try? Data(contentsOf: url) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return try? decoder.decode(Record.self, from: data)
+        let url = folderURL.appendingPathComponent(aggregateFileName)
+        guard let data = try? Data(contentsOf: url),
+              let record = try? decoder.decode(Record.self, from: data)
+        else { return nil }
+        return record
     }
 
     nonisolated static func writeAggregate(_ record: Record, to folderURL: URL) throws {

@@ -12,36 +12,27 @@ struct GameRowView: View {
                 Text(FolderNumbering.format(game.number, maxNumber: maxNumber))
                     .font(.body.monospacedDigit())
                     .foregroundStyle(.secondary)
-                    .frame(minWidth: 28, alignment: .trailing)
                 if isHashing {
                     ProgressView()
                         .controlSize(.small)
                 }
+                Spacer(minLength: 2)
+                if game.isMenu {
+                    MenuChip()
+                        .layoutPriority(1)
+                }
+                if let duplicate {
+                    DuplicateBadge(info: duplicate)
+                        .layoutPriority(1)
+                }
             }
-            .frame(width: 56, alignment: .leading)
+            .frame(minWidth: 72, alignment: .leading)
 
             VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(game.name)
-                        .fontWeight(game.isMenu ? .semibold : .regular)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    if game.isMenu {
-                        Text("MENU")
-                            .font(.caption2.weight(.bold))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(Color.secondary.opacity(0.14), in: Capsule())
-                            .foregroundStyle(.secondary)
-                            .layoutPriority(1)
-                    }
-                    // Caller passes `duplicate` only when markers are enabled.
-                    if let duplicate {
-                        DuplicateBadge(info: duplicate)
-                            .layoutPriority(1)
-                    }
-                }
+                Text(game.name)
+                    .fontWeight(game.isMenu ? .semibold : .regular)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                 if !game.serial.isEmpty {
                     Text(game.serial)
                         .font(.caption.monospaced())
@@ -49,12 +40,13 @@ struct GameRowView: View {
                         .lineLimit(1)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             Spacer(minLength: 8)
 
             FormatBadge(format: game.format)
 
-            Text(ByteCount.string(for: game.byteSize))
+            Text(ByteCount.string(for: game.byteSize, integerMegabytes: true))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 72, alignment: .trailing)
@@ -63,10 +55,54 @@ struct GameRowView: View {
     }
 }
 
-/// List badge for duplicate markers (ready grade, or pending “—” while analysing).
+/// Slot column: number (and optional hash spinner) leading; MENU / duplicate chips trailing.
+struct NumberColumnCell: View {
+    let game: GameEntry
+    let maxNumber: Int
+    @Bindable var state: AppState
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(FolderNumbering.format(game.number, maxNumber: maxNumber))
+                .font(.body.monospacedDigit())
+                .foregroundStyle(.secondary)
+            if state.isHashingGame(game) {
+                ProgressView()
+                    .controlSize(.small)
+                    .help("Computing content hash…")
+            }
+            Spacer(minLength: 2)
+            if game.isMenu {
+                MenuChip()
+                    .layoutPriority(1)
+            }
+            if let badge = state.listDuplicateBadge(for: game.id) {
+                DuplicateBadge(badge)
+                    .layoutPriority(1)
+            }
+        }
+        .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
+    }
+}
+
+struct MenuChip: View {
+    var body: some View {
+        Text("MENU")
+            .font(.caption2.weight(.bold))
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Color.secondary.opacity(0.14), in: Capsule())
+            .foregroundStyle(.secondary)
+    }
+}
+
+/// List badge for duplicate markers (ready grade, or “—” while pending / no group).
 enum DuplicateListBadge: Equatable {
+    /// Analysis still running.
     case pending
     case ready(DuplicateInfo)
+    /// Analysed and not in a group — keep a visible “—” so the chip slot never vanishes.
+    case empty
 }
 
 struct DuplicateBadge: View {
@@ -84,22 +120,28 @@ struct DuplicateBadge: View {
     var body: some View {
         switch badge {
         case .pending:
-            Text("—")
-                .font(.caption2.weight(.bold).monospacedDigit())
-                .padding(.horizontal, 5)
-                .padding(.vertical, 1)
+            chipLabel("—")
                 .background(Color.secondary.opacity(0.12), in: Capsule())
                 .foregroundStyle(.tertiary)
                 .help("Detecting duplicates…")
+        case .empty:
+            chipLabel("—")
+                .background(Color.secondary.opacity(0.08), in: Capsule())
+                .foregroundStyle(.quaternary)
+                .help("No duplicates detected for this game (may change after hashing).")
         case .ready(let info):
-            Text("\(info.grade.shortLabel) \(info.indexInGroup)/\(info.groupSize)")
-                .font(.caption2.weight(.bold).monospacedDigit())
-                .padding(.horizontal, 5)
-                .padding(.vertical, 1)
+            chipLabel("\(info.grade.shortLabel) \(info.indexInGroup)/\(info.groupSize)")
                 .background(color(for: info).opacity(0.18), in: Capsule())
                 .foregroundStyle(color(for: info))
                 .help(helpText(for: info))
         }
+    }
+
+    private func chipLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2.weight(.bold).monospacedDigit())
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
     }
 
     private func helpText(for info: DuplicateInfo) -> String {

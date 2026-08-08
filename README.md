@@ -64,9 +64,10 @@ Pipeline: archive → Developer ID export → notarize/staple app → HFS-compre
 ## Architecture notes
 
 - **Menu bake** lives under `Katana/Services/MenuBake/` (`MenuGDIBake`, ISO 9660 Level 1 + multi-track GDI, LBA 45000, truncate/CDDA). Invoked only from `MenuRebuildService`.
-- **No runtime helper:** rebuild does not launch an external process. The old .NET `MenuGDIBuilder` path is gone from the shipping app.
-- **`Tools/MenuGDIBuilder/`** remains in the repo as a **reference only** (DiscUtils / GDromBuilder lineage, stock `assets/` used by tests). You do not need .NET to build or run Katana.
-- **`BundledHelpers/`** (if present locally) is obsolete staging from the helper era and is not used by the Xcode target.
+- **No runtime helper:** rebuild is native Swift — no .NET process, no nested helper binary.
+- **`Tools/MenuAssets/`** — unpacked stock gdMenu / openMenu trees for unit tests (the app ships zipped copies under `Katana/Resources/MenuAssets/`).
+- **`Tools/scripts/build-gamedb.py`** — regenerate the bundled serial→title map.
+- **`Tools/licenses/`** — third-party license texts (e.g. DiscUtils MIT).
 
 ### Title resolution (scan / auto-rename)
 
@@ -102,7 +103,7 @@ For Windows/Linux, archive import, GDI shrinking, or the original Avalonia UI, u
 
 Menu GDI construction is a **Swift port** of the multi-track path used by GDMENUCardManager (itself built on community GDI tools), notably:
 
-- **[DiscUtils](https://github.com/DiscUtils/DiscUtils)** (Kenneth Bell) — MIT; reference sources under `Tools/MenuGDIBuilder/DiscUtils/`
+- **[DiscUtils](https://github.com/DiscUtils/DiscUtils)** (Kenneth Bell) — MIT (see `Tools/licenses/DiscUtils-LICENSE.txt`)
 - [GdiBuilder](https://github.com/Sappharad/GDIbuilder/) (Sappharad) and related GDI / ISO tooling
 
 ### Console menus & scene
@@ -128,7 +129,7 @@ As also credited by GDMENUCardManager:
 ## License notes
 
 - Menu GDI bake is a **Swift port** of the DiscUtils / GDromBuilder multi-track path (no Joliet, LBA 45000, truncated high-density tracks with CDDA).
-- **DiscUtils** reference sources under `Tools/MenuGDIBuilder/DiscUtils/` remain **MIT** (Kenneth Bell).
+- **DiscUtils** lineage is **MIT** (Kenneth Bell); license text in `Tools/licenses/DiscUtils-LICENSE.txt`.
 - **GDMENUCardManager** is **GPL-3.0**; Katana’s menu rebuild design and list formats are adapted from that project’s public behaviour and documented layouts.
 - Bundled **GameDB-Dreamcast** title data is **GPL-3.0**.
 - Bundled **GDmenu** / **openMenu** binary assets are third-party menu images for rebuild; they are not original Katana content. Respect their original authors’ terms when redistributing.

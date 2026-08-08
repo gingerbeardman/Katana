@@ -116,7 +116,7 @@ struct CardOperationsTests {
 
         let fm = FileManager.default
         let sourceDir = fm.temporaryDirectory
-            .appendingPathComponent("dcgdsd-import-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("katana-import-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: sourceDir, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: sourceDir) }
 
@@ -183,7 +183,7 @@ struct CardOperationsTests {
 
         let fm = FileManager.default
         let package = fm.temporaryDirectory
-            .appendingPathComponent("dcgdsd-pkg-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("katana-pkg-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: package, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: package) }
 
@@ -210,7 +210,7 @@ struct CardOperationsTests {
 
         let fm = FileManager.default
         let package = fm.temporaryDirectory
-            .appendingPathComponent("dcgdsd-pkg-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("katana-pkg-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: package, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: package) }
         try Data("cdi".utf8).write(to: package.appendingPathComponent("disc.cdi"))
@@ -233,7 +233,7 @@ struct CardOperationsTests {
 
     private func makeFixture(names: [String]) throws -> URL {
         let fm = FileManager.default
-        let root = fm.temporaryDirectory.appendingPathComponent("dcgdsd-ops-\(UUID().uuidString)", isDirectory: true)
+        let root = fm.temporaryDirectory.appendingPathComponent("katana-ops-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         let max = names.count
         for (i, name) in names.enumerated() {

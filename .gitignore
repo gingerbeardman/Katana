@@ -6,11 +6,5 @@ dist/
 *.xcuserstate
 DerivedData/
 
-# MenuGDIBuilder build outputs (staged universal helper lives in BundledHelpers/)
-Tools/MenuGDIBuilder/bin/
-Tools/MenuGDIBuilder/obj/
-Tools/MenuGDIBuilder/publish/
-Tools/MenuGDIBuilder/publish-multi/
-
 # IDE
 .nova/

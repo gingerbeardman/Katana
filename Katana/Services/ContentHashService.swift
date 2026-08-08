@@ -30,7 +30,7 @@ struct HashingProgress: Equatable, Sendable {
     }
 }
 
-/// Gradually fills in `hash.dcgdsd` sidecars so exact duplicates light up over time.
+/// Gradually fills in `katana.sha` sidecars so exact duplicates light up over time.
 @MainActor
 final class ContentHashService {
     static let shared = ContentHashService()

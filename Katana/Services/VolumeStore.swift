@@ -285,12 +285,17 @@ actor VolumeStore {
     private func ensureLoaded() throws {
         guard !loaded else { return }
         loaded = true
+        LaunchTrace.mark("VolumeStore.ensureLoaded \(storeURL.path)")
         guard fileManager.fileExists(atPath: storeURL.path) else {
             prefs = VolumePreferences(lastVolumeUUID: nil, recents: [], displaySortByVolume: [:])
+            LaunchTrace.mark("VolumeStore.ensureLoaded: no file")
             return
         }
-        let data = try Data(contentsOf: storeURL)
-        prefs = try decoder.decode(VolumePreferences.self, from: data)
+        try LaunchTrace.measure("VolumeStore read+decode volumes.json") {
+            let data = try Data(contentsOf: storeURL)
+            prefs = try decoder.decode(VolumePreferences.self, from: data)
+        }
+        LaunchTrace.mark("VolumeStore.ensureLoaded: \(prefs.recents.count) recents")
     }
 
     private func save() throws {
