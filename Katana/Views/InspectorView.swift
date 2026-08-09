@@ -18,8 +18,6 @@ struct InspectorView: View {
 
     private var snap: InspectorSnapshot { state.inspectorSnapshot }
 
-    private var maxNumber: Int { snap.maxNumber }
-
     /// Fixed label column width — same idea as iWork slider/field labels (72pt).
     private let labelWidth: CGFloat = 72
 
@@ -130,7 +128,7 @@ struct InspectorView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             ForEach(games.prefix(12)) { g in
                                 HStack(spacing: 8) {
-                                    Text(FolderNumbering.format(g.number, maxNumber: maxNumber))
+                                    Text(FolderNumbering.format(g.number))
                                         .font(.caption.monospacedDigit())
                                         .foregroundStyle(.secondary)
                                         .frame(width: 36, alignment: .trailing)
@@ -257,7 +255,7 @@ struct InspectorView: View {
     }
 
     private func titleStatusLine(for game: GameEntry) -> String {
-        let slot = FolderNumbering.format(game.number, maxNumber: maxNumber)
+        let slot = FolderNumbering.format(game.number)
         let size = state.formatGameSize(game)
         if game.isMenu {
             return "Slot \(slot) · \(snap.menuDisplayName) · \(size)"
@@ -299,7 +297,7 @@ struct InspectorView: View {
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(peers) { peer in
                     HStack(spacing: 8) {
-                        Text(FolderNumbering.format(peer.number, maxNumber: maxNumber))
+                        Text(FolderNumbering.format(peer.number))
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.secondary)
                             .frame(width: 36, alignment: .trailing)

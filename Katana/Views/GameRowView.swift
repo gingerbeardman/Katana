@@ -2,14 +2,13 @@ import SwiftUI
 
 struct GameRowView: View {
     let game: GameEntry
-    let maxNumber: Int
     var duplicate: DuplicateInfo?
     var isHashing: Bool = false
 
     var body: some View {
         HStack(spacing: 12) {
             HStack(spacing: 4) {
-                Text(FolderNumbering.format(game.number, maxNumber: maxNumber))
+                Text(FolderNumbering.format(game.number))
                     .font(.body.monospacedDigit())
                     .foregroundStyle(.secondary)
                 if isHashing {
@@ -60,12 +59,11 @@ struct GameRowView: View {
 /// Slot column: number (and optional hash spinner) leading; MENU / duplicate chips trailing.
 struct NumberColumnCell: View {
     let game: GameEntry
-    let maxNumber: Int
     @Bindable var state: AppState
 
     var body: some View {
         HStack(spacing: 4) {
-            Text(FolderNumbering.format(game.number, maxNumber: maxNumber))
+            Text(FolderNumbering.format(game.number))
                 .font(.body.monospacedDigit())
                 .foregroundStyle(.secondary)
             if state.isImportingGame(game) {

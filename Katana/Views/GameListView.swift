@@ -16,10 +16,6 @@ struct GameListView: View {
     /// Finder drag highlight (AppKit drop destination, same idea as 2UP pane drops).
     @State private var isDropTargeted = false
 
-    private var maxNumber: Int {
-        state.maxGameNumber
-    }
-
     /// Filtered list sorted for display. Does not mutate card slot order.
     private var displayedGames: [GameEntry] {
         state.filteredGames.sorted(using: sortOrder)
@@ -51,7 +47,7 @@ struct GameListView: View {
             ) {
                 TableColumn("#", value: \.number) { game in
                     // Slot + trailing chips (MENU / duplicate). Observes AppState for pending badges.
-                    NumberColumnCell(game: game, maxNumber: maxNumber, state: state)
+                    NumberColumnCell(game: game, state: state)
                 }
                 .width(min: 110, ideal: 110, max: 110)
                 .customizationID("number")

@@ -21,7 +21,7 @@ struct CardMenuRebuildIntegrationTests {
         let ordered = scan.entries.sorted { $0.number < $1.number }
         let maxNumber = ordered.map(\.number).max() ?? ordered.count
         let items = MenuListGenerator.items(for: ordered, menuKind: .gdMenu)
-        let listText = MenuListGenerator.makeList(kind: .gdMenu, items: items, maxNumber: maxNumber)
+        let listText = MenuListGenerator.makeList(kind: .gdMenu, items: items)
 
         // Prefer Tools tree (always present in test host); fall back to bundle zip.
         let toolsAssets = URL(fileURLWithPath: #filePath)
@@ -51,16 +51,14 @@ struct CardMenuRebuildIntegrationTests {
             )
         )
 
-        // Sanity: menu key is always `01` (GCM); games use card-wide width when max ≥ 100.
+        // Sanity: keys are `01`…`99`, then natural width — never 3-digit zero-padded (GCM).
         let track05 = try Data(contentsOf: outDir.appendingPathComponent("track05.iso"))
         let text = String(decoding: track05, as: UTF8.self)
-        let sample = FolderNumbering.format(1, maxNumber: maxNumber) + ".name="
+        let sample = FolderNumbering.format(1) + ".name="
         #expect(sample == "01.name=")
         #expect(text.contains(sample), "expected \(sample) in LIST for max=\(maxNumber)")
-        if maxNumber >= 100 {
-            #expect(text.contains("002.name=") || text.contains("\n002."))
-            #expect(!text.contains("001.name="))
-        }
+        #expect(!text.contains("001.name="))
+        #expect(!text.contains("002.name="))
 
         // Marker + copy of bake for host shell install (outside the sandbox).
         let marker = """

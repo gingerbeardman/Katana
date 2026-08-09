@@ -65,9 +65,8 @@ enum MenuRebuildService: Sendable {
         }
         let items = built.items
 
-        // Keys must match on-disk folders: menu `01`, games `002`… when max ≥ 100 (GCM).
-        let maxNumber = ordered.map(\.number).max() ?? ordered.count
-        let listText = MenuListGenerator.makeList(kind: kind, items: items, maxNumber: maxNumber)
+        // Keys must match on-disk folders: `01`…`99`, then `100`… (GCM).
+        let listText = MenuListGenerator.makeList(kind: kind, items: items)
         progress?("Building \(kind.displayName) image…", headerEnd)
 
         let assets = try assetsURL(for: kind)

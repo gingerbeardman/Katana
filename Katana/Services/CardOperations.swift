@@ -129,7 +129,7 @@ enum CardOperations: Sendable {
             } else {
                 copy.folderPath = rootURL
                     .appendingPathComponent(
-                        FolderNumbering.format(number, maxNumber: remaining.count),
+                        FolderNumbering.format(number),
                         isDirectory: true
                     )
                     .path
@@ -228,7 +228,7 @@ enum CardOperations: Sendable {
             } else {
                 game.folderPath = rootURL
                     .appendingPathComponent(
-                        FolderNumbering.format(number, maxNumber: order.count),
+                        FolderNumbering.format(number),
                         isDirectory: true
                     )
                     .path
@@ -558,22 +558,18 @@ enum CardOperations: Sendable {
         let memoryMax = existing.map(\.number).max() ?? 0
         let diskMax = occupiedBefore.max() ?? 0
         let startNumber = max(memoryMax, diskMax, existing.count) + 1
-        let endNumber = startNumber + resolved.count - 1
-        let newTotal = max(endNumber, memoryMax, diskMax, existing.count + resolved.count)
 
         emit(.message("Preparing \(totalSlots) slot\(totalSlots == 1 ? "" : "s")…"))
         emit(.fraction(0))
 
-        // Widen folder names if we cross 99 / 999 boundaries.
+        // Compact existing folders into canonical names before appending.
         var pathByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0.folderPath) })
         let desiredExisting = existing.enumerated().map { ($0.element.id, $0.offset + 1) }
-        // Use final card size for digit width (e.g. 99 → 100 forces 01→001 renames).
         let locations = try renumber(
             pathByID: &pathByID,
             desiredNumbers: desiredExisting,
             rootURL: rootURL,
             preferCompactPack: false,
-            maxNumber: newTotal,
             progress: { progress?($0); onEvent?(.message($0)) }
         )
 
@@ -587,7 +583,7 @@ enum CardOperations: Sendable {
             } else {
                 copy.folderPath = rootURL
                     .appendingPathComponent(
-                        FolderNumbering.format(number, maxNumber: newTotal),
+                        FolderNumbering.format(number),
                         isDirectory: true
                     )
                     .path
@@ -626,8 +622,7 @@ enum CardOperations: Sendable {
             }
             let number = nextNumber
             nextNumber += 1
-            let widthMax = max(newTotal, number, occupied.max() ?? 0)
-            let folderName = FolderNumbering.format(number, maxNumber: widthMax)
+            let folderName = FolderNumbering.format(number)
             var imageName = source.imageFileName
             let preferred = preferredImageName(for: source.imageFileName)
             let willRenameSingle = source.fileNames?.count == 1 && preferred != source.imageFileName
@@ -1598,7 +1593,7 @@ enum CardOperations: Sendable {
             } else {
                 game.folderPath = rootURL
                     .appendingPathComponent(
-                        FolderNumbering.format(number, maxNumber: orderedIDs.count),
+                        FolderNumbering.format(number),
                         isDirectory: true
                     )
                     .path
@@ -1644,12 +1639,9 @@ enum CardOperations: Sendable {
         desiredNumbers: [(UUID, Int)],
         rootURL: URL,
         preferCompactPack: Bool,
-        maxNumber maxNumberOverride: Int? = nil,
         progress: (@Sendable (String) -> Void)? = nil,
         fractionProgress: (@Sendable (Double) -> Void)? = nil
     ) throws -> [UUID: FolderLocation] {
-        let maxNumber = maxNumberOverride ?? desiredNumbers.map(\.1).max() ?? 1
-
         struct Planned {
             var id: UUID
             var from: URL
@@ -1664,7 +1656,7 @@ enum CardOperations: Sendable {
             guard let path = pathByID[id] else { continue }
             // Stay under `rootURL` so sandbox security scope is preserved.
             let from = scopedFolderURL(path: path, under: rootURL)
-            let finalName = FolderNumbering.format(number, maxNumber: maxNumber)
+            let finalName = FolderNumbering.format(number)
             planned.append(Planned(id: id, from: from, number: number, finalName: finalName))
         }
 
@@ -1732,7 +1724,7 @@ enum CardOperations: Sendable {
             for item in planned {
                 guard let path = pathByID[item.id] else { continue }
                 let from = scopedFolderURL(path: path, under: rootURL)
-                let finalName = FolderNumbering.format(item.number, maxNumber: maxNumber)
+                let finalName = FolderNumbering.format(item.number)
                 if from.lastPathComponent == finalName,
                    from.deletingLastPathComponent().standardizedFileURL == rootURL.standardizedFileURL {
                     continue
@@ -1775,7 +1767,7 @@ enum CardOperations: Sendable {
         // Build final map for all desired ids.
         var result: [UUID: FolderLocation] = [:]
         for (id, number) in desiredNumbers {
-            let finalName = FolderNumbering.format(number, maxNumber: maxNumber)
+            let finalName = FolderNumbering.format(number)
             let path = pathByID[id]
                 ?? rootURL.appendingPathComponent(finalName, isDirectory: true).path
             // Prefer canonical path under root with final name.

@@ -16,13 +16,7 @@ final class AppState {
             }
         }
     }
-    var games: [GameEntry] = [] {
-        didSet {
-            maxGameNumber = games.map(\.number).max() ?? 1
-        }
-    }
-    /// Highest slot number on the open card (avoids `games.map` in every table/inspector body).
-    private(set) var maxGameNumber: Int = 1
+    var games: [GameEntry] = []
     /// Inspector-only snapshot — updated when selection or *selected* row data changes,
     /// not on every background size-enrichment write to unrelated rows.
     private(set) var inspectorSnapshot: InspectorSnapshot = .empty
@@ -475,11 +469,10 @@ final class AppState {
 
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return list }
-        let maxN = games.last?.number ?? 1
         return list.filter { game in
             game.name.localizedCaseInsensitiveContains(q)
                 || game.serial.localizedCaseInsensitiveContains(q)
-                || FolderNumbering.format(game.number, maxNumber: maxN).contains(q)
+                || FolderNumbering.format(game.number).contains(q)
                 || game.format.displayName.localizedCaseInsensitiveContains(q)
         }
     }
@@ -520,10 +513,8 @@ final class AppState {
 
     /// Rebuild inspector inputs without requiring `InspectorView` to observe `games`.
     func rebuildInspectorSnapshot() {
-        let maxN = maxGameNumber
         var snap = InspectorSnapshot(
             content: .empty,
-            maxNumber: maxN,
             menuDisplayName: menuKind.displayName,
             duplicatesEnabled: duplicatesEnabled,
             isBusy: isBusy,

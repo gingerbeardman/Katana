@@ -615,10 +615,9 @@ struct CardOperationsTests {
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent("katana-ops-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
-        let max = names.count
         for (i, name) in names.enumerated() {
             let n = i + 1
-            let folder = root.appendingPathComponent(FolderNumbering.format(n, maxNumber: max), isDirectory: true)
+            let folder = root.appendingPathComponent(FolderNumbering.format(n), isDirectory: true)
             try fm.createDirectory(at: folder, withIntermediateDirectories: true)
             try name.write(to: folder.appendingPathComponent("name.txt"), atomically: true, encoding: .utf8)
             try "S\(n)".write(to: folder.appendingPathComponent("serial.txt"), atomically: true, encoding: .utf8)

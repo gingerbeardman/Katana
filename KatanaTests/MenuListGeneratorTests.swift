@@ -11,7 +11,7 @@ struct MenuListGeneratorTests {
         #expect(MenuListGenerator.formatFolderNumber(1000) == "1000")
     }
 
-    /// On a 100+ game card: menu stays `01` (GCM); game slots use 3-digit keys (`002`…).
+    /// Keys stay 2-digit under 100 even on a 100+ game card; only 100+ grow (GCM).
     @Test func listKeysMatchGCMFolderLayout() {
         let items = [
             MenuListGenerator.Item(
@@ -33,14 +33,14 @@ struct MenuListGeneratorTests {
                 ip: .fallback(name: "Jet", serial: "MK-5102")
             ),
         ]
-        let text = MenuListGenerator.makeGDMenuList(items: items, maxNumber: 278)
+        let text = MenuListGenerator.makeGDMenuList(items: items)
         #expect(text.hasPrefix("[GDMENU]\n01.name=GDMENU") || text.contains("\n01.name=GDMENU"))
         #expect(text.contains("01.name=GDMENU"))
-        #expect(text.contains("002.name=Sonic"))
+        #expect(text.contains("\n02.name=Sonic"))
         #expect(text.contains("100.name=Jet Grind Radio"))
-        // Menu must not be written as 001; games must not use 2-digit keys.
+        // No 3-digit zero-padded keys, ever — GDMENU won't match `002` folders.
         #expect(!text.contains("001.name="))
-        #expect(!text.contains("\n02.name="))
+        #expect(!text.contains("002.name="))
     }
 
     @Test func gdMenuListShape() {
@@ -239,5 +239,40 @@ struct IpBinReaderTests {
     @Test func parseRejectsNonKatana() {
         let data = Data(repeating: 0, count: 256)
         #expect(IpBinReader.parse(ipData: data) == nil)
+    }
+
+    /// Homebrew CDIs put big CDDA sessions before the data track, so IP.BIN can sit
+    /// far into the image. The old 8 MB scan cap made those games fall back to
+    /// placeholder headers (date 19990909) in LIST.INI.
+    @Test func readsHeaderDeepInsideCDI() throws {
+        var header = Data(count: 256)
+        header.replaceSubrange(0..<16, with: Array("SEGA SEGAKATANA ".utf8))
+        header.replaceSubrange(0x25..<0x2B, with: Array("GD-ROM".utf8))
+        header[0x2B] = 0x31
+        header[0x2D] = 0x31
+        header.replaceSubrange(0x30..<0x38, with: Array("JUE     ".utf8))
+        header.replaceSubrange(0x38..<0x3F, with: Array("0799A10".utf8))
+        header.replaceSubrange(0x40..<0x4A, with: Array("NGDT-0083 ".utf8))
+        header.replaceSubrange(0x4A..<0x50, with: Array("V1.000".utf8))
+        header.replaceSubrange(0x50..<0x58, with: Array("20061202".utf8))
+        header.replaceSubrange(0x80..<(0x80 + 12), with: Array("FAST STRIKER".utf8))
+
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("katana-ipbin-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        // 9 MB of "audio" before the header — beyond the old cap, spanning chunk edges.
+        let url = folder.appendingPathComponent("disc.cdi")
+        var image = Data(repeating: 0x55, count: 9 * 1024 * 1024 + 123)
+        image.append(header)
+        image.append(Data(repeating: 0, count: 2048))
+        try image.write(to: url)
+
+        let info = try #require(
+            IpBinReader.read(folderURL: folder, imageFileName: "disc.cdi", format: .cdi)
+        )
+        #expect(info.name == "FAST STRIKER")
+        #expect(info.releaseDate == "20061202")
     }
 }

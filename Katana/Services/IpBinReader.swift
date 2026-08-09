@@ -56,49 +56,46 @@ enum IpBinReader: Sendable {
     // MARK: - CDI / raw binary search
 
     nonisolated private static func readFromBinaryImage(_ url: URL) -> IpBinInfo? {
-        // Search up to 8 MB for the SEGAKATANA marker (covers most CDI layouts).
-        readHeader(from: url, maxSearch: 8 * 1024 * 1024)
+        // Scan the whole image. Homebrew CDIs (NG:DEV, Sturmwind, Ghost Blade…)
+        // put big CDDA sessions first, so IP.BIN can sit hundreds of MB in —
+        // an 8 MB cap silently fell back to placeholder headers for those games.
+        readHeader(from: url, maxSearch: .max)
     }
 
     nonisolated private static func readHeader(from url: URL, maxSearch: Int) -> IpBinInfo? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
 
-        let fileSize = (try? handle.seekToEnd()) ?? 0
+        // Fast path: header at offset 0 (2048-byte-sector data tracks).
+        guard let head = try? handle.read(upToCount: 512), head.count > 256 else { return nil }
+        if let info = parse(ipData: head) { return info }
+
+        // Stream in chunks scanning for the marker (never loads the image whole).
+        let marker = Data(katanaMarker)
+        let chunkSize = 4 * 1024 * 1024
         try? handle.seek(toOffset: 0)
-        let toRead = min(Int(fileSize), maxSearch)
-        guard toRead > 256 else { return nil }
-        guard let data = try? handle.read(upToCount: toRead), data.count > 256 else { return nil }
-
-        // Fast path: header at offset 0.
-        if let info = parse(ipData: data) { return info }
-
-        // Scan for marker.
-        guard let offset = findKatana(in: data) else { return nil }
-        let end = min(offset + 512, data.count)
-        return parse(ipData: data.subdata(in: offset..<end))
-    }
-
-    nonisolated private static func findKatana(in data: Data) -> Int? {
-        let marker = katanaMarker
-        guard data.count >= marker.count else { return nil }
-        return data.withUnsafeBytes { raw -> Int? in
-            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
-            let n = data.count - marker.count
-            var i = 0
-            while i <= n {
-                var matched = true
-                for j in 0..<marker.count {
-                    if base[i + j] != marker[j] {
-                        matched = false
-                        break
-                    }
+        var chunkStart = 0
+        var carry = Data() // tail of previous chunk so a marker spanning chunks still matches
+        while chunkStart < maxSearch {
+            guard let chunk = try? handle.read(upToCount: chunkSize), !chunk.isEmpty else { break }
+            let windowStart = chunkStart - carry.count
+            var window = carry
+            window.append(chunk)
+            var searchRange = window.startIndex..<window.endIndex
+            while let found = window.range(of: marker, in: searchRange) {
+                let absolute = windowStart + window.distance(from: window.startIndex, to: found.lowerBound)
+                try? handle.seek(toOffset: UInt64(absolute))
+                if let slice = try? handle.read(upToCount: 512),
+                   let info = parse(ipData: slice) {
+                    return info
                 }
-                if matched { return i }
-                i += 1
+                searchRange = window.index(after: found.lowerBound)..<window.endIndex
             }
-            return nil
+            try? handle.seek(toOffset: UInt64(chunkStart + chunk.count))
+            chunkStart += chunk.count
+            carry = Data(window.suffix(marker.count - 1))
         }
+        return nil
     }
 
     // MARK: - Field layout (Aaru / GDMENUCardManager compatible)
