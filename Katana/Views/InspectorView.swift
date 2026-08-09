@@ -652,6 +652,22 @@ struct InspectorView: View {
         let format = game.format
         let entry = game
 
+        // Prefer in-memory header cache (warm rebuilds / prior inspector visit).
+        if let cached = game.ipHeader {
+            ipInfo = cached
+            Task.detached(priority: .userInitiated) {
+                let tex = GdtexLoader.load(for: entry)
+                await MainActor.run {
+                    guard detailLoadToken == token else { return }
+                    gdtexImage = tex.image
+                    gdtexStatus = tex.image == nil
+                        ? (tex.status.isEmpty ? "File not found" : tex.status)
+                        : ""
+                }
+            }
+            return
+        }
+
         Task.detached(priority: .userInitiated) {
             let ip = IpBinReader.read(
                 folderURL: folder,
@@ -664,6 +680,8 @@ struct InspectorView: View {
             await MainActor.run {
                 guard detailLoadToken == token else { return }
                 ipInfo = ip
+                // Cache for menu rebuild so we don’t re-read every GDI on the card.
+                state.applyIpHeader(ip, forGameID: entry.id)
                 gdtexImage = tex.image
                 gdtexStatus = tex.image == nil
                     ? (tex.status.isEmpty ? "File not found" : tex.status)

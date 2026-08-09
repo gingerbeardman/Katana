@@ -112,6 +112,63 @@ struct MenuListGeneratorTests {
         #expect(text.contains("03.disc=\n"))
     }
 
+    @Test func itemsPreferCachedIpHeaderWithoutDiskRead() {
+        // When `ipHeader` is set, LIST fields come from cache (no missing folder / no read).
+        let cached = IpBinInfo(
+            name: "CACHED",
+            productNumber: "MK-9999",
+            disc: "2/2",
+            region: "J",
+            vga: false,
+            version: "V9.999",
+            releaseDate: "19990101",
+            isCodeBreaker: false
+        )
+        let game = GameEntry(
+            id: UUID(),
+            number: 2,
+            name: "Display Name",
+            serial: "MK-9999",
+            format: .gdi,
+            imageFileName: "disc.gdi",
+            folderPath: "/tmp/katana-no-such-game-folder",
+            byteSize: 1,
+            payloadByteSize: 1,
+            contentSHA256: nil,
+            isMenu: false,
+            detailsLoaded: true,
+            ipHeader: cached
+        )
+        let menu = GameEntry(
+            id: UUID(),
+            number: 1,
+            name: "GDMENU",
+            serial: "MK-0000",
+            format: .gdi,
+            imageFileName: "disc.gdi",
+            folderPath: "/tmp/katana-no-such-menu",
+            byteSize: 1,
+            payloadByteSize: 1,
+            contentSHA256: nil,
+            isMenu: true,
+            detailsLoaded: true,
+            ipHeader: .menuDefaults
+        )
+        let built = MenuListGenerator.itemsWithHeaderFills(
+            for: [menu, game],
+            menuKind: .gdMenu
+        )
+        #expect(built.filledHeaders.isEmpty) // both warm — no disk fills
+        #expect(built.items.count == 2)
+        #expect(built.items[1].ip.disc == "2/2")
+        #expect(built.items[1].ip.vga == false)
+        #expect(built.items[1].ip.version == "V9.999")
+        let text = MenuListGenerator.makeGDMenuList(items: built.items)
+        #expect(text.contains("02.disc=2/2\n"))
+        #expect(text.contains("02.vga=0\n"))
+        #expect(text.contains("02.date=19990101\n"))
+    }
+
     @Test func menuKindDetect() {
         #expect(MenuKind.detect(fromName: "GDMENU") == .gdMenu)
         #expect(MenuKind.detect(fromName: "gdmenu") == .gdMenu)

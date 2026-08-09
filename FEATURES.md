@@ -132,6 +132,7 @@ Collapsible sections, each remembering its expanded state:
 - **Out-of-date banner** — a warning strip appears above the list when names or order no longer match the baked menu; cleared again if you reverse the change (e.g. add a game then delete it, or undo a rename)
 - **Prompt on quit** — you're asked before leaving with a stale menu image
 - **Progress** — headers, bake stages (assets, tracks, disc.gdi), and install on the edge bar; bar reaches full width on completion
+- **Cached IP headers** — import, enrichment, and inspector store IP.BIN fields on each game so rebuilds skip re-reading every GDI; cleared when the disc content hash changes
 - **Bundled stock assets** — GDmenu and openMenu packs ship inside the app as zip resources
 
 ## Game Database

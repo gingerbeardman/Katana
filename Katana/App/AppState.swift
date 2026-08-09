@@ -847,6 +847,10 @@ final class AppState {
         ContentHashService.shared.onHashed = { [weak self] path, sha, payloadSize in
             guard let self else { return }
             guard let idx = self.games.firstIndex(where: { $0.folderPath == path }) else { return }
+            // Disc image changed (re-hash) — LIST fields from the old IP.BIN are untrustworthy.
+            if let old = self.games[idx].contentSHA256, old != sha {
+                self.games[idx].ipHeader = nil
+            }
             self.games[idx].contentSHA256 = sha
             self.games[idx].payloadByteSize = payloadSize
             // Debounce: hashing fires per-file; avoid blanking markers / thrashing the table.
@@ -1300,7 +1304,15 @@ final class AppState {
 
         detailEnrichmentGeneration &+= 1
         let generation = detailEnrichmentGeneration
-        let work = pending.map { (id: $0.id, path: $0.folderPath) }
+        let work = pending.map { game in
+            (
+                id: game.id,
+                path: game.folderPath,
+                imageFileName: game.imageFileName,
+                format: game.format,
+                needIP: game.ipHeader == nil && !game.isMenu && game.number != 1
+            )
+        }
         // Larger FAT batches — fewer MainActor hops; flush still time-coalesced.
         let batchSize = 24
 
@@ -1313,8 +1325,12 @@ final class AppState {
                 let batchResults = await withTaskGroup(of: (UUID, CardScanner.FolderDetails)?.self) { group in
                     for item in batch {
                         group.addTask {
+                            let loadIP: (String, DiscFormat)? = item.needIP
+                                ? (item.imageFileName, item.format)
+                                : nil
                             guard let details = try? CardScanner.loadFolderDetails(
-                                folderURL: URL(fileURLWithPath: item.path, isDirectory: true)
+                                folderURL: URL(fileURLWithPath: item.path, isDirectory: true),
+                                loadIP: loadIP
                             ) else { return nil }
                             return (item.id, details)
                         }
@@ -1388,7 +1404,14 @@ final class AppState {
             next[idx].byteSize = details.byteSize
             next[idx].payloadByteSize = details.payloadByteSize
             if let sha = details.contentSHA256 {
+                // Payload replaced → drop stale LIST fields (import keeps header until then).
+                if let old = next[idx].contentSHA256, old != sha {
+                    next[idx].ipHeader = nil
+                }
                 next[idx].contentSHA256 = sha
+            }
+            if let ip = details.ipHeader {
+                next[idx].ipHeader = ip
             }
             next[idx].detailsLoaded = true
             any = true
@@ -2650,6 +2673,31 @@ final class AppState {
         bakedMenuFingerprint = menuListFingerprint(for: games)
     }
 
+    /// Write IP.BIN snapshots onto rows (import / rebuild miss / inspector).
+    func applyIpHeader(_ ip: IpBinInfo, forGameID id: UUID) {
+        guard let idx = games.firstIndex(where: { $0.id == id }) else { return }
+        games[idx].ipHeader = ip
+    }
+
+    private func applyIpHeaderFills(_ fills: [MenuListGenerator.HeaderFill]) {
+        guard !fills.isEmpty else { return }
+        var indexByID: [GameEntry.ID: Int] = [:]
+        indexByID.reserveCapacity(games.count)
+        for (i, g) in games.enumerated() {
+            indexByID[g.id] = i
+        }
+        var next = games
+        var any = false
+        for fill in fills {
+            guard let idx = indexByID[fill.gameID] else { continue }
+            next[idx].ipHeader = fill.ip
+            any = true
+        }
+        if any {
+            games = next
+        }
+    }
+
     /// Rebuild the on-console GDmenu / openMenu image so the list matches current slots/names.
     func rebuildMenuList() {
         guard canRebuildMenu || (isHandlingQuit && !isHashing && volume != nil && !games.isEmpty) else {
@@ -2723,6 +2771,11 @@ final class AppState {
             // Hold full bar only for interactive rebuilds — quit path should not wait.
             if !quitting {
                 try? await Task.sleep(for: .milliseconds(200))
+            }
+
+            // Persist IP headers read on cache misses so the next rebuild stays warm.
+            if !result.filledHeaders.isEmpty {
+                applyIpHeaderFills(result.filledHeaders)
             }
 
             // Light refresh of the menu row. Never walk the menu tree on quit —

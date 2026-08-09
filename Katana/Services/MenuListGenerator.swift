@@ -85,26 +85,45 @@ enum MenuListGenerator: Sendable {
         sb += "\n"
     }
 
+    /// Headers filled from disk during this pass (misses) so callers can cache them on `GameEntry`.
+    struct HeaderFill: Sendable {
+        var gameID: UUID
+        var ip: IpBinInfo
+    }
+
     /// Build items for every game in card slot order (slot numbers as-is).
-    /// Reads IP.BIN off the main actor for fields GDmenu displays.
+    /// Prefers `GameEntry.ipHeader`; only hits the card when the cache is cold.
     nonisolated static func items(
         for games: [GameEntry],
         menuKind: MenuKind,
         progress: (@Sendable (Int, Int) -> Void)? = nil
     ) -> [Item] {
+        itemsWithHeaderFills(for: games, menuKind: menuKind, progress: progress).items
+    }
+
+    /// Same as `items`, plus any IP headers read from disk (for write-back into the list cache).
+    nonisolated static func itemsWithHeaderFills(
+        for games: [GameEntry],
+        menuKind: MenuKind,
+        progress: (@Sendable (Int, Int) -> Void)? = nil
+    ) -> (items: [Item], filledHeaders: [HeaderFill]) {
         let total = games.count
         var result: [Item] = []
         result.reserveCapacity(total)
+        var fills: [HeaderFill] = []
+        fills.reserveCapacity(min(total, 8))
 
         for (index, game) in games.enumerated() {
             progress?(index, total)
 
             let ip: IpBinInfo
             if game.isMenu || game.number == 1 {
-                // Prefer fields from the stock menu IP.BIN when present in the bundle;
-                // fall back to reading the on-card menu image.
-                if let read = IpBinReader.read(from: game) {
+                // Menu slot: prefer cache, then on-card image, then stock defaults.
+                if let cached = game.ipHeader {
+                    ip = cached
+                } else if let read = IpBinReader.read(from: game) {
                     ip = read
+                    fills.append(HeaderFill(gameID: game.id, ip: read))
                 } else {
                     switch menuKind {
                     case .gdMenu:
@@ -123,8 +142,11 @@ enum MenuListGenerator: Sendable {
                         )
                     }
                 }
+            } else if let cached = game.ipHeader {
+                ip = cached
             } else if let read = IpBinReader.read(from: game) {
                 ip = read
+                fills.append(HeaderFill(gameID: game.id, ip: read))
             } else {
                 ip = .fallback(name: game.name, serial: game.serial)
             }
@@ -139,6 +161,6 @@ enum MenuListGenerator: Sendable {
             )
         }
         progress?(total, total)
-        return result
+        return (result, fills)
     }
 }

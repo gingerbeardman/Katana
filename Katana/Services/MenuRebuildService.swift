@@ -27,6 +27,8 @@ enum MenuRebuildService: Sendable {
         var itemCount: Int
         var menuFolderPath: String
         var listByteCount: Int
+        /// IP headers read from disk during this rebuild (cache misses) for write-back.
+        var filledHeaders: [MenuListGenerator.HeaderFill]
     }
 
     /// Full rebuild: generate list → bake GDI → replace slot-01 image files.
@@ -46,7 +48,7 @@ enum MenuRebuildService: Sendable {
         // ~80% of wall time on large cards); bake runs on local temp; install is one
         // image copy. Headers 0…0.80 · bake 0.80…0.96 · install 0.96…1.0
         progress?("Reading game headers…", 0.02)
-        let items = MenuListGenerator.items(for: ordered, menuKind: kind) { done, total in
+        let built = MenuListGenerator.itemsWithHeaderFills(for: ordered, menuKind: kind) { done, total in
             let t = max(total, 1)
             // Report often enough for a smooth bar without flooding the UI.
             if done == 0 || done == total || done % 10 == 0 || t < 40 {
@@ -54,6 +56,7 @@ enum MenuRebuildService: Sendable {
                 progress?("Reading game headers… \(done)/\(total)", frac)
             }
         }
+        let items = built.items
 
         // Keys must match on-disk folders: menu `01`, games `002`… when max ≥ 100 (GCM).
         let maxNumber = ordered.map(\.number).max() ?? ordered.count
@@ -113,7 +116,8 @@ enum MenuRebuildService: Sendable {
             menuKind: kind,
             itemCount: items.count,
             menuFolderPath: menuFolder.path,
-            listByteCount: listText.utf8.count
+            listByteCount: listText.utf8.count,
+            filledHeaders: built.filledHeaders
         )
     }
 

@@ -21,6 +21,9 @@ nonisolated struct GameEntry: Identifiable, Codable, Hashable, Sendable {
     /// False after a fast scan until sizes / stored hashes are filled in the background.
     /// Default **false** so missing JSON keys (older caches) re-enrich instead of sticking at 0 MB.
     var detailsLoaded: Bool = false
+    /// Cached IP.BIN fields for LIST.INI rebuild (avoids re-reading every GDI on the card).
+    /// Filled on import / enrichment / inspector; cleared when the disc image hash changes.
+    var ipHeader: IpBinInfo? = nil
 
     var folderURL: URL {
         URL(fileURLWithPath: folderPath, isDirectory: true)
@@ -33,7 +36,7 @@ nonisolated struct GameEntry: Identifiable, Codable, Hashable, Sendable {
         contentSHA256 != nil && !(contentSHA256?.isEmpty ?? true)
     }
 
-    /// Whether lazy folder walk should still run for sizes / hash sidecars.
+    /// Whether lazy folder walk should still run for sizes / hash sidecars / missing IP header.
     ///
     /// GDI `disc.gdi` is a tiny cue file; provisional fast-scan size is often &lt; 1 MB and
     /// used to be mistaken for “fully loaded,” leaving the Size column at **0 MB**.
@@ -42,6 +45,8 @@ nonisolated struct GameEntry: Identifiable, Codable, Hashable, Sendable {
         if byteSize <= 0 { return true }
         // Provisional GDI image-only size (cue text), not full track payload.
         if format == .gdi, byteSize < 1_000_000 { return true }
+        // Warm menu rebuilds: fill IP headers while sizes load (skip menu slot defaults).
+        if ipHeader == nil, !isMenu, number != 1 { return true }
         return false
     }
 

@@ -842,6 +842,7 @@ enum CardOperations: Sendable {
                 }
 
                 // Prefer sizes we already measured — skip loadFolderDetails (slow FAT walk).
+                // Cache IP.BIN now so the next menu rebuild skips a per-track GDI read.
                 let entry = GameEntry(
                     id: slot.entryID,
                     number: slot.number,
@@ -854,7 +855,8 @@ enum CardOperations: Sendable {
                     payloadByteSize: payloadSize,
                     contentSHA256: contentHash,
                     isMenu: false,
-                    detailsLoaded: contentHash != nil
+                    detailsLoaded: contentHash != nil,
+                    ipHeader: ip
                 )
                 added.append(entry)
                 emit(.slotFinished(entry))

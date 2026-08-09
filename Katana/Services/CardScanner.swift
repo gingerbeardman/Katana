@@ -34,11 +34,13 @@ enum CardScanner: Sendable {
         var total: Int
     }
 
-    /// Lightweight sizes + optional stored content hash (no disc payload hashing).
+    /// Lightweight sizes + optional stored content hash + optional IP.BIN header.
     struct FolderDetails: Sendable {
         var byteSize: Int64
         var payloadByteSize: Int64
         var contentSHA256: String?
+        /// Filled when `loadIP` is true and the image has a readable header.
+        var ipHeader: IpBinInfo?
     }
 
     /// Scan a GDEMU card root. Safe to call from any isolation domain.
@@ -475,7 +477,11 @@ enum CardScanner: Sendable {
     // MARK: - Lazy details (after list is visible)
 
     /// Full folder size + payload size + stored hash sidecar (still no content hashing).
-    nonisolated static func loadFolderDetails(folderURL: URL) throws -> FolderDetails {
+    /// - Parameter loadIP: When set, also read IP.BIN for menu-list caching (rebuild speed).
+    nonisolated static func loadFolderDetails(
+        folderURL: URL,
+        loadIP: (imageFileName: String, format: DiscFormat)? = nil
+    ) throws -> FolderDetails {
         let contents = try FileManager.default.contentsOfDirectory(
             at: folderURL,
             includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
@@ -500,11 +506,20 @@ enum CardScanner: Sendable {
 
         // Prefer cheap aggregate JSON; skip full validHash re-walk on first enrich.
         let hash = ContentHashSidecar.readAggregate(in: folderURL)?.sha256
+        var ipHeader: IpBinInfo?
+        if let loadIP {
+            ipHeader = IpBinReader.read(
+                folderURL: folderURL,
+                imageFileName: loadIP.imageFileName,
+                format: loadIP.format
+            )
+        }
 
         return FolderDetails(
             byteSize: folderByteSize,
             payloadByteSize: payloadByteSize > 0 ? payloadByteSize : folderByteSize,
-            contentSHA256: hash
+            contentSHA256: hash,
+            ipHeader: ipHeader
         )
     }
 
