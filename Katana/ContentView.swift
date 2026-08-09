@@ -36,7 +36,7 @@ struct ContentView: View {
                             Label("Add", systemImage: "plus")
                         }
                         .disabled(!state.canAddGames)
-                        .help("Add disc images or game folders to the next free slots")
+                        .help("Add disc images or game folders. Hold ⌥ to keep source names (skip auto-rename).")
                     }
 
                     // --- Edit selection ---

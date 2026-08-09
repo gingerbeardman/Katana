@@ -2101,24 +2101,29 @@ final class AppState {
         panel.allowedContentTypes = types
 
         guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
-        Task { await importDiscURLs(panel.urls) }
+        // Capture Option now (before the async hop) — ⌥ Add keeps the source file/folder name.
+        let skipAutoRename = NSEvent.modifierFlags.contains(.option)
+        Task { await importDiscURLs(panel.urls, skipAutoRename: skipAutoRename) }
     }
 
     /// Drag-and-drop entry point (Finder → game list). URLs come from the AppKit drag
     /// pasteboard (2UP-style), not async `NSItemProvider` loads.
-    func handleDroppedURLs(_ urls: [URL]) {
+    /// - Parameter skipAutoRename: true when Option was held on drop (keeps source names).
+    func handleDroppedURLs(_ urls: [URL], skipAutoRename: Bool = false) {
         guard canAddGames, !urls.isEmpty else { return }
-        Task { await importDiscURLs(urls) }
+        Task { await importDiscURLs(urls, skipAutoRename: skipAutoRename) }
     }
 
-    func importDiscURLs(_ urls: [URL]) async {
+    /// - Parameter skipAutoRename: Option held at add/drop — force source names even when
+    ///   Settings “Automatically rename added games” is on.
+    func importDiscURLs(_ urls: [URL], skipAutoRename: Bool = false) async {
         guard canAddGames, let volume else { return }
         if !requestCardWriteAccess() { return }
         // Do not `.standardizedFileURL` — that drops security scope on the URL instance.
         let root = accessURL ?? volume.rootURL
         let snapshot = games
         let eventHandler = makeImportEventHandler()
-        let preferDatabaseNames = autoRenameAddedGames
+        let preferDatabaseNames = autoRenameAddedGames && !skipAutoRename
         let rates = TransferRateStore.estimates(volumeUUID: volume.volumeUUID)
 
         // Sandbox: keep security scope for open-panel / Finder-drop sources until copy finishes.

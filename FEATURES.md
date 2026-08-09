@@ -44,7 +44,6 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 - **Search** — filter by name, serial, or slot number
 - **Format badges** — GDI, CDI, CCD
 - **Reveal in Finder** for any selection
-- **Optional scroll-to-new-rows** while scanning and after adding games
 
 ## Renaming
 
@@ -69,7 +68,7 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 - **Honest card writes** — copies to the card bypass the macOS write cache (`F_NOCACHE`), so the bar tracks bytes physically on the card: no instant leap on big files, no long wait at a finished file's marker, and measured transfer rates stay true
 - **Formats** — GDI (cue + tracks), CDI, CCD (plus `.img` / `.sub` / `.cue` companions), game folders, or `.zip` archives
 - **Automatic renumbering** — existing folders are widened first when the digit count has to grow (99 → 100); menu slot stays **`01`**
-- **Import naming** — source file or folder name first (so variants stay distinguishable), then GameDB / IP.BIN serial when readable; a Settings toggle (on by default) **automatically renames added games** via GameDB lookup (IP.BIN serial) instead
+- **Import naming** — by default, **Automatically rename added games** (Settings) names each new slot from the GameDB via the IP.BIN serial (fallback: IP.BIN product name). Off uses the source file or folder name. **Hold ⌥** while confirming Add Games or while dropping files to keep source names for **that import only**
 - **Hashes on import** — content hashes are computed after add so new games join the duplicate suite; hashing is paused before delete / empty trash so FAT cards can free space cleanly
 - **Soft delete** — ⌫ / Delete moves games to `.katana-trash` (fast, undoable); remaining slots pack down with single-pass renames
 - **Delete Immediately** — ⌥⌫, or hold ⌥ in Game / context menus so **Delete** swaps to **Delete Immediately…** (Finder-style alternate); erases folders from the card now (slow for large GDI sets, with edge progress); confirmation; cannot be undone
@@ -132,8 +131,8 @@ Collapsible sections, each remembering its expanded state:
 - **No helper binaries** — no .NET runtime, no nested executables, no brotli dylibs in the app bundle; menu asset zips unpack **in-process** (sandbox-safe; no `/usr/bin/unzip`)
 - **List keys match folders** — menu stays in **`01`** (same as GDMENU Card Manager); game slots use card-wide width (`002`… on a 100+ game card) so GDmenu can resolve titles
 - **Menu type picker** — switch between GDmenu and openMenu from Settings or the Card menu
-- **Out-of-date banner** — a warning strip appears above the list when names or order no longer match the baked menu; cleared again if you reverse the change (e.g. add a game then delete it, or undo a rename)
-- **Prompt on quit** — you're asked before leaving with a stale menu image
+- **Out-of-date banner** — a warning strip appears above the list when names or order no longer match the baked menu; **fingerprint-based** dirty state clears if you reverse the change (e.g. add a game then delete it, or undo a rename)
+- **Prompt on quit** — you're asked before leaving with a stale menu image; quit-time rebuild skips UI thrash so exit stays responsive
 - **Progress** — headers (2–80%), bake stages (assets, tracks, disc.gdi), and byte-tracked install on the edge bar; bar reaches full width on completion; the status line shows where headers come from (**“270 cached · 12 from card”**)
 - **Cached IP headers** — import, enrichment, rebuilds, and the inspector store IP.BIN fields on each game **and in the on-disk card cache**, so rebuilds skip re-reading every GDI across launches; cleared when the disc content hash changes (homebrew images without a readable IP.BIN are re-read each time)
 - **Bundled stock assets** — GDmenu and openMenu packs ship inside the app as zip resources
@@ -207,7 +206,8 @@ Collapsible sections, each remembering its expanded state:
 | Sort alphabetically | Yes | Yes |
 | Drag-and-drop manual order | – | Yes |
 | Move up / down on card | Yes | – |
-| Auto-rename from IP.BIN / folder / file | Yes | Yes |
+| Auto-rename from GameDB / IP.BIN / folder / file | Yes | Yes |
+| ⌥ Add keeps source names (skip auto-rename) | Yes | – |
 | Manual case conversion | Yes | – |
 | Inline Finder-style rename | Yes | – |
 | Cover art (0GDTEX.PVR) | Yes | Yes |

@@ -72,6 +72,7 @@ struct KatanaApp: App {
                 }
                 .keyboardShortcut("i", modifiers: .command)
                 .disabled(!state.canAddGames)
+                .help("Add disc images or game folders. Hold ⌥ to keep source names (skip auto-rename).")
 
                 Button("Apply A–Z Order to Card") {
                     state.sortAlphabetically()

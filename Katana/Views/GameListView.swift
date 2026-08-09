@@ -223,8 +223,8 @@ struct GameListView: View {
         .gameListFileDrop(
             enabled: state.canAddGames,
             isTargeted: $isDropTargeted
-        ) { urls in
-            state.handleDroppedURLs(urls)
+        ) { urls, skipAutoRename in
+            state.handleDroppedURLs(urls, skipAutoRename: skipAutoRename)
         }
     }
 

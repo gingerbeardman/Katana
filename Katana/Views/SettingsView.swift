@@ -31,7 +31,7 @@ private struct GeneralSettingsPanel: View {
                     isOn: $state.autoRenameAddedGames
                 )
                 SettingsDescription(
-                    "Name each new game from the GameDB, looked up by the serial in its IP.BIN (falls back to the IP.BIN name). Off keeps the source file or folder name. On by default."
+                    "Name each new game from the GameDB, looked up by the serial in its IP.BIN (falls back to the IP.BIN name). Off keeps the source file or folder name. Hold ⌥ while adding or dropping to keep source names for that import only. On by default."
                 )
             }
 
