@@ -595,22 +595,18 @@ final class AppState {
     }
 
     /// Start Finder-style inline rename on a single game (table title cell).
-    /// Defers setting `renamingGameID` so context-menu teardown does not immediately
-    /// cancel the brand-new field editor (2UP activation pattern).
+    ///
+    /// Matches 2UP `beginRename`: set the rename target **immediately** in the same
+    /// turn as the menu/key action. The field mounts on the next SwiftUI pass (after
+    /// any context menu has torn down), and `InlineRenameField` retries first-responder
+    /// until the hosting cell is in a window — an extra `async` delay here only made
+    /// the first rename of a session race the table’s own focus/selection settle.
     func beginInlineRename(_ id: GameEntry.ID) {
         guard !isBusy, !isScanning, games.contains(where: { $0.id == id }) else { return }
         selection = [id]
         // If already renaming this row, leave the field alone.
         if renamingGameID == id { return }
-        renamingGameID = nil
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            guard !self.isBusy, !self.isScanning,
-                  self.selection == [id],
-                  self.games.contains(where: { $0.id == id })
-            else { return }
-            self.renamingGameID = id
-        }
+        renamingGameID = id
     }
 
     func cancelInlineRename() {
@@ -1065,6 +1061,8 @@ final class AppState {
         // Same card already open (sidebar / Open panel / restore) — keep list, no rescan.
         // Explicit Rescan / Clear Cache still passes forceRescan: true.
         if !forceRescan, !isScanning, isSameOpenVolume(as: url) {
+            // Re-bind write access — remounts keep the same path but kill the old scope.
+            _ = ensureCardWriteAccess()
             await refreshOpenVolumeChrome(for: url, persistRecents: true)
             LaunchTrace.mark("open early-return same volume")
             return
@@ -1739,8 +1737,19 @@ final class AppState {
         let pathChanged = volume?.rootURL.standardizedFileURL != resolved.rootURL.standardizedFileURL
         volume = resolved
         // Keep security-scope URL aligned when Finder renames /Volumes/Old → /Volumes/New.
+        // Must re-start scope — assigning the path alone leaves writes failing under sandbox.
         if pathChanged {
-            accessURL = resolved.rootURL
+            if let previous = accessURL {
+                previous.stopAccessingSecurityScopedResource()
+                accessURL = nil
+            }
+            let next = resolved.rootURL
+            if next.startAccessingSecurityScopedResource() {
+                accessURL = next
+            } else {
+                // Fall back to bookmark rebind (may refresh a stale scope).
+                _ = ensureCardWriteAccess()
+            }
         }
         await loadCachedHashRate(for: resolved.volumeUUID)
 
@@ -1821,6 +1830,10 @@ final class AppState {
         ) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
+                // Remount / other apps often drop sandbox write access while we're backgrounded.
+                if self.volume != nil {
+                    _ = self.ensureCardWriteAccess()
+                }
                 // Cheap when name/path unchanged; fixes renames that happened while we were in the background.
                 await self.refreshOpenVolumeIdentity()
             }
@@ -2080,6 +2093,11 @@ final class AppState {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed != game.name, !trimmed.isEmpty else { return }
 
+        if !ensureCardWriteAccess() {
+            lastError = Self.cardAccessHelp
+            return
+        }
+
         do {
             let previous = try CardOperations.rename(game: game, to: trimmed)
             // Disable animations around the row/title update — SwiftUI Table + subtitle
@@ -2102,7 +2120,34 @@ final class AppState {
             }
             undoManager.setActionName("Rename")
         } catch {
-            lastError = error.localizedDescription
+            // One retry after re-binding scope (stale access after remount is common).
+            if ensureCardWriteAccess(),
+               let index = games.firstIndex(where: { $0.id == id })
+            {
+                do {
+                    let previous = try CardOperations.rename(game: games[index], to: trimmed)
+                    var transaction = Transaction()
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        games[index].name = trimmed
+                        games[index].isMenu = GameEntry.isMenuName(trimmed) || games[index].number == 1
+                        markMenuNeedsRebuild()
+                    }
+                    persistNameCacheUpdates(for: [games[index]])
+                    if selection.contains(id) {
+                        rebuildInspectorSnapshot()
+                    }
+                    undoManager.registerUndo(withTarget: self) { target in
+                        target.rename(id: id, to: previous)
+                    }
+                    undoManager.setActionName("Rename")
+                    return
+                } catch {
+                    lastError = cardWriteErrorMessage(error)
+                    return
+                }
+            }
+            lastError = cardWriteErrorMessage(error)
         }
     }
 
@@ -2147,6 +2192,10 @@ final class AppState {
         newName: (GameEntry) -> String?
     ) {
         guard !targets.isEmpty, !isBusy else { return }
+        if !ensureCardWriteAccess() {
+            lastError = Self.cardAccessHelp
+            return
+        }
 
         var undos: [(UUID, String)] = []
         var skipped = 0
@@ -2166,7 +2215,20 @@ final class AppState {
                 games[index].isMenu = GameEntry.isMenuName(converted) || games[index].number == 1
                 undos.append((game.id, previous))
             } catch {
-                lastError = error.localizedDescription
+                // Stale scope mid-batch — rebind once and retry this item.
+                if ensureCardWriteAccess() {
+                    do {
+                        let previous = try CardOperations.rename(game: games[index], to: converted)
+                        games[index].name = converted
+                        games[index].isMenu = GameEntry.isMenuName(converted) || games[index].number == 1
+                        undos.append((game.id, previous))
+                        continue
+                    } catch {
+                        lastError = cardWriteErrorMessage(error)
+                        break
+                    }
+                }
+                lastError = cardWriteErrorMessage(error)
                 break
             }
         }
@@ -2875,5 +2937,91 @@ final class AppState {
         cachedHashBytesPerSecond = nil
         accessURL?.stopAccessingSecurityScopedResource()
         accessURL = nil
+    }
+
+    // MARK: - Security-scoped write access
+
+    /// Re-bind sandbox access before card mutations.
+    ///
+    /// Remounts, Finder renames, and other apps touching the volume often invalidate
+    /// the previous security-scoped URL while `/Volumes/…` still looks fine — writes
+    /// then fail with NSCocoaErrorDomain 513 (“don’t have permission to save…”).
+    @discardableResult
+    private func ensureCardWriteAccess() -> Bool {
+        guard let volume else { return false }
+        let root = volume.rootURL.standardizedFileURL
+
+        if accessURL != nil, probeCardWritable(root) {
+            return true
+        }
+
+        // Drop a dead scope (stop is safe even if already invalid).
+        if let previous = accessURL {
+            previous.stopAccessingSecurityScopedResource()
+            accessURL = nil
+        }
+
+        // 1) Fresh resolve from the security-scoped bookmark.
+        if let data = bookmarkData {
+            var isStale = false
+            if let url = try? URL(
+                resolvingBookmarkData: data,
+                options: [.withSecurityScope, .withoutUI],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            ), FileManager.default.fileExists(atPath: url.path) {
+                if url.startAccessingSecurityScopedResource() {
+                    accessURL = url
+                    if isStale {
+                        bookmarkData = VolumeStore.makeBookmark(for: url) ?? data
+                    }
+                    if probeCardWritable(url) { return true }
+                }
+            }
+        }
+
+        // 2) Open-panel / already-scoped URL for the live root.
+        if root.startAccessingSecurityScopedResource() {
+            accessURL = root
+            if probeCardWritable(root) { return true }
+        }
+
+        // 3) Path may still be writable outside a scope in some edge cases.
+        return probeCardWritable(root)
+    }
+
+    /// True when the sandbox can create and delete a tiny file on the card root.
+    private func probeCardWritable(_ root: URL) -> Bool {
+        let probe = root.appendingPathComponent(
+            ".katana-write-probe-\(UUID().uuidString)",
+            isDirectory: false
+        )
+        do {
+            try Data().write(to: probe, options: .atomic)
+            try FileManager.default.removeItem(at: probe)
+            return true
+        } catch {
+            try? FileManager.default.removeItem(at: probe)
+            return false
+        }
+    }
+
+    private static let cardAccessHelp =
+        "Can’t write to the card. Choose Card → Open Card… (or re-open from Recents) to restore access — common after remount, eject, or another app used the volume."
+
+    /// Map sandbox / FAT write failures to an actionable message.
+    private func cardWriteErrorMessage(_ error: Error) -> String {
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain, ns.code == NSFileWriteNoPermissionError || ns.code == 513 {
+            return Self.cardAccessHelp
+        }
+        let text = error.localizedDescription
+        if text.localizedCaseInsensitiveContains("permission")
+            || text.localizedCaseInsensitiveContains("don’t have permission")
+            || text.localizedCaseInsensitiveContains("don't have permission")
+        {
+            return Self.cardAccessHelp
+        }
+        return text
     }
 }

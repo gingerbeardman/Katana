@@ -60,21 +60,33 @@ struct InlineRenameField: NSViewRepresentable {
         guard attempts > 0 else { return }
         DispatchQueue.main.async {
             guard let window = field.window else {
+                // Not in the hierarchy yet (cold Table hosting / first rename of session).
                 focus(field, coordinator: coordinator, attempts: attempts - 1)
+                return
+            }
+            guard window.isKeyWindow else {
+                // Same pattern as 2UP table focus: wait briefly for key status.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) {
+                    focus(field, coordinator: coordinator, attempts: attempts - 1)
+                }
                 return
             }
             // makeNSView and the first updateNSView can both schedule focus. Once the
             // field editor is open, a second makeFirstResponder ends that brand-new
-            // session with NSTextMovementOther — make retries idempotent.
+            // session with NSTextMovementOther — make retries idempotent (2UP).
             if let editor = field.currentEditor() as? NSTextView {
                 coordinator.applyInitialSelection(in: editor)
                 return
             }
-            window.makeFirstResponder(field)
-            if let editor = field.currentEditor() as? NSTextView {
+            if window.makeFirstResponder(field),
+               let editor = field.currentEditor() as? NSTextView
+            {
                 coordinator.applyInitialSelection(in: editor)
             } else {
-                focus(field, coordinator: coordinator, attempts: attempts - 1)
+                // Table still settling first-responder (common on the first rename).
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) {
+                    focus(field, coordinator: coordinator, attempts: attempts - 1)
+                }
             }
         }
     }
@@ -199,6 +211,13 @@ struct RenameAwareTitleCell: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // Table caches cells by row identity — re-seed the draft when rename starts
+        // so a recycled cell does not open with a stale string.
+        .onChange(of: state.renamingGameID) { _, newID in
+            if newID == game.id {
+                draft = game.name
+            }
+        }
     }
 
     /// Full name when there is no extension; otherwise stem only (Finder-style).

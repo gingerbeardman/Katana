@@ -106,7 +106,8 @@ nonisolated struct DuplicateCacheRecord: Codable, Sendable {
     var signature: String
     var rows: [DuplicateCacheRow]
 
-    static let currentVersion = 1
+    /// Bump when match rules change so stale per-card caches are ignored.
+    static let currentVersion = 2
 }
 
 nonisolated struct DuplicateCacheRow: Codable, Sendable {
@@ -497,7 +498,25 @@ enum DuplicateDetector {
         if serialShared && serialIsWeak && namesSimilar {
             return (.weak, signals)
         }
+
+        // Name-only weak links are the noisiest path (sequels, series entries).
+        // Require that nothing hard contradicts "same game".
         if namesExact || namesSimilar {
+            // Distinct product codes → different retail SKUs (e.g. Virtua Tennis vs Virtua Tennis 2).
+            let serialsConflict = !a.serialNorm.isEmpty && !b.serialNorm.isEmpty && !serialShared
+            // Very different image sizes without hash/serial agreement → different dumps.
+            if sizesDifferMaterially {
+                return nil
+            }
+            // Soft name match + different serials: sequels / related titles, not duplicates.
+            if serialsConflict && !namesExact {
+                return nil
+            }
+            // "Game" vs "Game 2" / "Game II" even with empty or matching-ish names.
+            if looksLikeSequelPair(a, b) {
+                return nil
+            }
+            // Same title text, different serial, similar size — still weak (region renames / re-dumps).
             return (.weak, signals)
         }
         return nil
@@ -509,6 +528,65 @@ enum DuplicateDetector {
     nonisolated static func looksLikeMultiDiscPair(_ nameA: String, _ nameB: String) -> Bool {
         looksLikeMultiDiscPair(Features(game: stubEntry(name: nameA)), Features(game: stubEntry(name: nameB)))
     }
+
+    /// "Virtua Tennis" vs "Virtua Tennis 2", "Resident Evil 2" vs "Resident Evil 3", "Game" vs "Game II".
+    nonisolated static func looksLikeSequelPair(_ nameA: String, _ nameB: String) -> Bool {
+        looksLikeSequelPair(Features(game: stubEntry(name: nameA)), Features(game: stubEntry(name: nameB)))
+    }
+
+    nonisolated private static func looksLikeSequelPair(_ a: Features, _ b: Features) -> Bool {
+        // Exact same normalized title is a true rename/dup candidate, not a sequel.
+        if a.normalizedName == b.normalizedName { return false }
+
+        let stripA = stripSequelMarker(a.normalizedName)
+        let stripB = stripSequelMarker(b.normalizedName)
+        // At least one title carried a sequel token we removed, or both did.
+        let changed = stripA != a.normalizedName || stripB != b.normalizedName
+        guard changed else { return false }
+
+        let stemScore = nameSimilarity(
+            normalizedA: stripA,
+            bigramsA: bigramsOf(stripA),
+            normalizedB: stripB,
+            bigramsB: bigramsOf(stripB)
+        )
+        // Stems must match strongly after dropping "2" / "II" / etc.
+        return stemScore >= 0.90
+    }
+
+    /// Strip a trailing sequel ordinal: "2", "3", "ii", "iii", "2nd", "part 2", …
+    nonisolated static func stripSequelMarker(_ normalizedName: String) -> String {
+        var s = normalizedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty else { return s }
+        let range = NSRange(s.startIndex..., in: s)
+        for regex in sequelStripRegexes {
+            let replaced = regex.stringByReplacingMatches(in: s, range: range, withTemplate: "")
+            let trimmed = replaced
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .split { $0.isWhitespace }
+                .joined(separator: " ")
+            if trimmed != s, !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return s
+    }
+
+    private nonisolated static let sequelStripRegexes: [NSRegularExpression] = {
+        let patterns = [
+            // "… part 2", "… episode 3"
+            #"\s+(part|episode|ep|vol|volume)\s*[0-9ivxlcdm]+$"#,
+            // "… 2nd", "… 3rd", "… 4th"
+            #"\s+\d+(st|nd|rd|th)$"#,
+            // "… ii", "… iii", "… iv" (roman, whole token)
+            #"\s+[ivxlcdm]{1,6}$"#,
+            // "… 2", "… 2000" — only 1–2 digit trailing numbers (avoid "nba 2k")
+            #"\s+\d{1,2}$"#,
+        ]
+        return patterns.compactMap {
+            try? NSRegularExpression(pattern: $0, options: [.caseInsensitive])
+        }
+    }()
 
     nonisolated private static func looksLikeMultiDiscPair(_ a: Features, _ b: Features) -> Bool {
         if let da = a.discNumber, let db = b.discNumber, da != db {

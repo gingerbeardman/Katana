@@ -91,6 +91,50 @@ struct DuplicateDetectorTests {
         #expect(DuplicateDetector.nameSimilarity("Crazy Taxi", "Sonic") < 0.5)
     }
 
+    /// Sequels share a soft name score but are different products — must not group.
+    @Test func sequelsNotFlaggedAsNameOnlyDuplicates() {
+        let vt1 = entry(
+            number: 38,
+            name: "VIRTUA TENNIS",
+            serial: "MK-5105450",
+            size: 297_000_000
+        )
+        let vt2 = entry(
+            number: 39,
+            name: "VIRTUA TENNIS 2",
+            serial: "MK-5118650",
+            size: 1_008_000_000
+        )
+        #expect(DuplicateDetector.nameSimilarity(vt1.name, vt2.name) >= 0.82)
+        #expect(DuplicateDetector.looksLikeSequelPair(vt1.name, vt2.name))
+        let map = DuplicateDetector.analyze([vt1, vt2])
+        #expect(map.isEmpty)
+    }
+
+    @Test func sequelWithEmptySerialsAndDifferentSizesIgnored() {
+        let a = entry(number: 2, name: "Resident Evil 2", serial: "", size: 800_000_000)
+        let b = entry(number: 3, name: "Resident Evil 3", serial: "", size: 900_000_000)
+        #expect(DuplicateDetector.looksLikeSequelPair(a.name, b.name))
+        #expect(DuplicateDetector.analyze([a, b]).isEmpty)
+    }
+
+    @Test func trueNameDupWithoutSerialStillGroupsWhenSameSize() {
+        let a = entry(number: 2, name: "Homebrew Tool", serial: "", size: 50_000_000)
+        let b = entry(number: 3, name: "homebrew  tool", serial: "", size: 50_000_000)
+        let map = DuplicateDetector.analyze([a, b])
+        #expect(map[a.id] != nil)
+        #expect(map[b.id] != nil)
+    }
+
+    @Test func differentSerialSameNameSimilarSizeStillWeak() {
+        // Same display title, different product code, similar dump size (region renames).
+        let a = entry(number: 2, name: "Crazy Taxi", serial: "MK-51035", size: 400_000_000)
+        let b = entry(number: 5, name: "Crazy Taxi", serial: "T-9709N", size: 405_000_000)
+        let map = DuplicateDetector.analyze([a, b])
+        #expect(map[a.id]?.grade == .weak)
+        #expect(map[b.id]?.isRedundant == true)
+    }
+
     @Test func analysisSignatureStableForSameList() {
         let a = entry(number: 2, name: "Foo", serial: "T1", size: 10)
         let b = entry(number: 3, name: "Bar", serial: "T2", size: 20)

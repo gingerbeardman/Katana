@@ -18,7 +18,9 @@ enum CardOperations: Sendable {
         }
         let previous = game.name
         let url = game.folderURL.appendingPathComponent(nameFile)
-        try trimmed.write(to: url, atomically: true, encoding: .utf8)
+        // Non-atomic on purpose: FAT32/exFAT atomic replace (temp + rename) is flaky under
+        // the App Sandbox and often surfaces as “don’t have permission to save name.txt”.
+        try trimmed.write(to: url, atomically: false, encoding: .utf8)
         return previous
     }
 
