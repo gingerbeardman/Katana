@@ -2,7 +2,8 @@ import Foundation
 
 /// Minimal ISO 9660 Level-1 reader for extracting a single file (e.g. 0GDTEX.PVR).
 /// Supports single-file ISOs and multi-track GDI (directory on early data track, files on later).
-enum Iso9660FileExtractor: Sendable {
+/// Opt out of default MainActor isolation — used from hash/scan workers.
+nonisolated enum Iso9660FileExtractor: Sendable {
     private static let sectorSize = 2048
 
     /// A 2048-byte data track and its starting LBA (from disc.gdi).

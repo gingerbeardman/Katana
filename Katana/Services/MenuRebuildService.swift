@@ -1,6 +1,6 @@
 import Foundation
 
-/// Rebuilds the GDmenu / openMenu image in slot 01 so the on-console list matches disc order.
+/// Rebuilds the GDmenu / openMenu image in slot 01 so the on-console list matches card order.
 enum MenuRebuildService: Sendable {
     enum RebuildError: LocalizedError {
         case noVolume
@@ -42,20 +42,22 @@ enum MenuRebuildService: Sendable {
         let ordered = games.sorted { $0.number < $1.number }
         let kind = menuKind ?? detectMenuKind(games: ordered) ?? .gdMenu
 
-        // 0…0.55 reading headers · 0.55…0.85 bake · 0.85…1.0 install
-        progress?("Reading disc headers…", 0.02)
+        // Weight by real cost: headers are quick; bake dominates; install is I/O on the card.
+        // Headers 0…0.18 · bake 0.18…0.88 · install 0.88…1.0
+        progress?("Reading game headers…", 0.02)
         let items = MenuListGenerator.items(for: ordered, menuKind: kind) { done, total in
             let t = max(total, 1)
-            if done == 0 || done == total || done % 25 == 0 {
-                let frac = 0.02 + 0.53 * (Double(done) / Double(t))
-                progress?("Reading disc headers… \(done)/\(total)", frac)
+            // Report often enough for a smooth bar without flooding the UI.
+            if done == 0 || done == total || done % 10 == 0 || t < 40 {
+                let frac = 0.02 + 0.16 * (Double(done) / Double(t))
+                progress?("Reading game headers… \(done)/\(total)", frac)
             }
         }
 
-        // Keys must match on-disk folder names (001… not 01… when max ≥ 100).
+        // Keys must match on-disk folders: menu `01`, games `002`… when max ≥ 100 (GCM).
         let maxNumber = ordered.map(\.number).max() ?? ordered.count
         let listText = MenuListGenerator.makeList(kind: kind, items: items, maxNumber: maxNumber)
-        progress?("Building \(kind.displayName) image…", 0.58)
+        progress?("Building \(kind.displayName) image…", 0.18)
 
         let assets = try assetsURL(for: kind)
 
@@ -75,14 +77,19 @@ enum MenuRebuildService: Sendable {
                     listText: listText,
                     assetsRoot: assets,
                     outDir: outDir,
-                    truncate: true
+                    truncate: true,
+                    progress: { message, bakeFraction in
+                        // Map bake 0…1 → overall 0.18…0.88
+                        let overall = 0.18 + 0.70 * min(1, max(0, bakeFraction))
+                        progress?(message, overall)
+                    }
                 )
             )
         } catch {
             throw RebuildError.bakeFailed(error.localizedDescription)
         }
 
-        progress?("Installing menu into slot 01…", 0.88)
+        progress?("Installing menu into slot 01…", 0.90)
         let menuFolder = try installMenu(
             builtGDI: outDir,
             games: ordered,
@@ -274,11 +281,10 @@ enum MenuRebuildService: Sendable {
     ) throws -> URL {
         let fm = FileManager.default
 
-        // Prefer existing menu folder (number == 1), else create formatted "01"/"001".
+        // Prefer existing menu folder (number == 1). New menu is always `01` (GCM), never `001`.
         let menuGame = games.first(where: { $0.number == 1 })
-        let maxNumber = games.map(\.number).max() ?? 1
         let folderName = menuGame.map { URL(fileURLWithPath: $0.folderPath).lastPathComponent }
-            ?? FolderNumbering.format(1, maxNumber: max(maxNumber, 1))
+            ?? FolderNumbering.format(1)
 
         let menuFolder = rootURL.appendingPathComponent(folderName, isDirectory: true)
 

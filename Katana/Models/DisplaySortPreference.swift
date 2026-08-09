@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 
 /// View-only table sort, persisted per card volume.
-struct DisplaySortPreference: Codable, Hashable, Sendable {
+nonisolated struct DisplaySortPreference: Codable, Hashable, Sendable {
     enum Field: String, Codable, CaseIterable, Sendable {
         case number
         case name

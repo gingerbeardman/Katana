@@ -19,7 +19,7 @@ enum AutoRenameSource: String, CaseIterable, Identifiable, Sendable {
     var helpText: String {
         switch self {
         case .ipBin:
-            return "GameDB title for the disc serial, or the product name from IP.BIN."
+            return "GameDB title for the game serial, or the product name from IP.BIN."
         case .folderName:
             return "Use the on-card folder name (slot number unless you renamed the folder)."
         case .fileName:

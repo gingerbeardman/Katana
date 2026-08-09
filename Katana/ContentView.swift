@@ -48,8 +48,8 @@ struct ContentView: View {
                         }
                         .disabled(!state.canDeleteSelection)
                         .help(state.selection.count > 1
-                              ? "Remove \(state.selection.count) games and renumber"
-                              : "Remove selected game and renumber")
+                              ? "Soft-delete \(state.selection.count) games (⌫). Option-click / ⌥⌫ erases immediately."
+                              : "Soft-delete selected game (⌫). Option-click / ⌥⌫ erases immediately.")
                     }
 
                     ToolbarItem(id: "moveUp", placement: .primaryAction) {
@@ -59,7 +59,7 @@ struct ContentView: View {
                             Label("Up", systemImage: "arrow.up")
                         }
                         .disabled(!state.canMoveSelectionUp)
-                        .help("Move selection earlier on the disc (renumbers folders)")
+                        .help("Move selection earlier on the card (renumbers folders)")
                     }
                     .defaultCustomization(.hidden)
 
@@ -70,7 +70,7 @@ struct ContentView: View {
                             Label("Down", systemImage: "arrow.down")
                         }
                         .disabled(!state.canMoveSelectionDown)
-                        .help("Move selection later on the disc (renumbers folders)")
+                        .help("Move selection later on the card (renumbers folders)")
                     }
                     .defaultCustomization(.hidden)
 
@@ -99,7 +99,7 @@ struct ContentView: View {
                         Button {
                             state.sortAlphabetically()
                         } label: {
-                            Label("Apply A–Z to Disc", systemImage: "arrow.up.arrow.down.square")
+                            Label("Apply A–Z to Card", systemImage: "arrow.up.arrow.down.square")
                         }
                         .disabled(state.volume == nil || state.games.count < 2 || state.isBusy)
                         .help("Renumber folders A–Z on the SD card. Click table headers to sort the view only.")
@@ -173,12 +173,15 @@ struct ContentView: View {
         .overlay(alignment: .top) {
             VStack(spacing: 8) {
                 if let err = state.lastError {
-                    HStack {
+                    HStack(alignment: .top) {
                         Image(systemName: "exclamationmark.triangle.fill")
+                            .padding(.top, 2)
                         Text(err)
-                            .lineLimit(2)
+                            .lineLimit(6)
+                            .multilineTextAlignment(.leading)
+                            .textSelection(.enabled)
                             .numericText()
-                        Spacer()
+                        Spacer(minLength: 8)
                         Button("Dismiss") { state.lastError = nil }
                             .buttonStyle(.borderless)
                     }

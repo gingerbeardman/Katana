@@ -1,7 +1,8 @@
 import Foundation
 
 /// Checks the public GitHub Releases feed for a newer Katana version.
-enum UpdateChecker: Sendable {
+/// Opt out of default MainActor isolation — `check()` runs from a background Task.
+nonisolated enum UpdateChecker: Sendable {
     /// Stable public releases API (JSON). Same data as the Releases page / atom feed.
     nonisolated static let latestReleaseURL = URL(
         string: "https://api.github.com/repos/gingerbeardman/Katana/releases/latest"
@@ -59,7 +60,7 @@ enum UpdateChecker: Sendable {
             throw CheckError.badResponse
         }
 
-        let decoded = try JSONDecoder.github.decode(GitHubRelease.self, from: data)
+        let decoded = try Self.githubDecoder.decode(GitHubRelease.self, from: data)
         guard !decoded.draft, !decoded.prerelease else {
             throw CheckError.noRelease
         }
@@ -84,6 +85,13 @@ enum UpdateChecker: Sendable {
             currentVersion: current
         )
     }
+
+    /// Process-wide decoder for the GitHub releases API.
+    private static let githubDecoder: JSONDecoder = {
+        let d = JSONDecoder()
+        d.dateDecodingStrategy = .iso8601
+        return d
+    }()
 
     /// Strip a leading `v` and whitespace (`v1.2.0` → `1.2.0`).
     nonisolated static func normalizeVersion(_ raw: String) -> String {
@@ -125,7 +133,7 @@ enum UpdateChecker: Sendable {
 
 // MARK: - GitHub API
 
-private struct GitHubRelease: Decodable, Sendable {
+private nonisolated struct GitHubRelease: Decodable, Sendable {
     var tagName: String
     var htmlURL: String
     var draft: Bool
@@ -139,12 +147,4 @@ private struct GitHubRelease: Decodable, Sendable {
         case prerelease
         case publishedAt = "published_at"
     }
-}
-
-private extension JSONDecoder {
-    static let github: JSONDecoder = {
-        let d = JSONDecoder()
-        d.dateDecodingStrategy = .iso8601
-        return d
-    }()
 }

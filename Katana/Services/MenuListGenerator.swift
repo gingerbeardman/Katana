@@ -1,6 +1,6 @@
 import Foundation
 
-/// Builds GDmenu `LIST.INI` / openMenu `OPENMENU.INI` text from the on-disc game order.
+/// Builds GDmenu `LIST.INI` / openMenu `OPENMENU.INI` text from the on-card game order.
 enum MenuListGenerator: Sendable {
     /// One LIST.INI / OPENMENU.INI entry.
     nonisolated struct Item: Sendable {
@@ -12,9 +12,9 @@ enum MenuListGenerator: Sendable {
 
     /// Format a list key to match **on-disk** folder names for this card.
     ///
-    /// Width follows the card’s max slot (same as `FolderNumbering`), not each
-    /// entry’s own magnitude. Otherwise a 100+ game card keeps folders `001`…
-    /// while LIST.INI said `01`…`99` and GDmenu could not open most titles.
+    /// Same rules as `FolderNumbering`: menu is always `01`; other slots use
+    /// card-wide width (`002`… on a 100+ game card). Mixing `01` + `002` matches
+    /// GDMENU Card Manager and real GDEMU cards.
     nonisolated static func formatFolderNumber(_ number: Int, maxNumber: Int) -> String {
         FolderNumbering.format(number, maxNumber: maxNumber)
     }
@@ -85,7 +85,7 @@ enum MenuListGenerator: Sendable {
         sb += "\n"
     }
 
-    /// Build items for every game in disc order (slot numbers as-is).
+    /// Build items for every game in card slot order (slot numbers as-is).
     /// Reads IP.BIN off the main actor for fields GDmenu displays.
     nonisolated static func items(
         for games: [GameEntry],

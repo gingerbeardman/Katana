@@ -2,12 +2,12 @@ import AppKit
 import SwiftUI
 
 /// Game table with **display-only** column sorting (Brutify / 2UP style).
-/// `AppState.games` stays in on-disc slot order; table sort never renumbers folders.
+/// `AppState.games` stays in on-card slot order; table sort never renumbers folders.
 /// Sort preference is remembered per card volume across sessions.
 struct GameListView: View {
     @Bindable var state: AppState
 
-    /// SwiftUI Table sort state — view only, not disc order.
+    /// SwiftUI Table sort state — view only, not card slot order.
     @State private var sortOrder: [KeyPathComparator<GameEntry>] = DisplaySortPreference.mostRecentFirst.comparators
     /// Bumped when we must remount the Table so column header chevrons match `sortOrder`.
     /// SwiftUI Table often keeps stale NSTableView sort indicators when `sortOrder` is
@@ -20,7 +20,7 @@ struct GameListView: View {
         state.maxGameNumber
     }
 
-    /// Filtered list sorted for display. Does not mutate disc order.
+    /// Filtered list sorted for display. Does not mutate card slot order.
     private var displayedGames: [GameEntry] {
         state.filteredGames.sorted(using: sortOrder)
     }
@@ -145,7 +145,11 @@ struct GameListView: View {
                     )
                 } else if state.isMutating {
                     if let fraction = state.mutationProgress {
-                        edgeProgressBar(fraction: fraction, color: .accentColor)
+                        edgeProgressBar(
+                            fraction: fraction,
+                            color: .accentColor,
+                            segmentEnds: state.mutationProgressSegments ?? []
+                        )
                     } else {
                         indeterminateEdgeProgressBar(color: .accentColor)
                     }
@@ -300,7 +304,7 @@ struct GameListView: View {
         HStack(spacing: 8) {
             Image(systemName: "arrow.up.arrow.down.circle")
                 .foregroundStyle(.secondary)
-            Text("Sorted by \(state.displaySort.summary) — disc slot numbers unchanged.")
+            Text("Sorted by \(state.displaySort.summary) — card slot numbers unchanged.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer(minLength: 8)
@@ -396,14 +400,14 @@ struct GameListView: View {
 
         Divider()
 
-        Button("Move Up on Disc") {
+        Button("Move Up on Card") {
             state.selection = selectedIDs
             state.moveSelection(up: true)
         }
         .disabled(state.isBusy || !canMove(selectedIDs, up: true))
         .help("Changes SD folder numbers (not table sort)")
 
-        Button("Move Down on Disc") {
+        Button("Move Down on Card") {
             state.selection = selectedIDs
             state.moveSelection(up: false)
         }
@@ -420,10 +424,18 @@ struct GameListView: View {
 
         Divider()
 
+        // Adjacent pair: MenuOptionAlternates marks Immediately as ⌥-alternate of Delete.
         Button(multi ? "Delete \(count) Games" : "Delete", role: .destructive) {
-            state.delete(ids: selectedIDs)
+            state.delete(ids: selectedIDs, permanent: false)
         }
         .disabled(count == 0 || state.isBusy)
+        .help("Soft-delete to card trash (fast, undoable). Hold ⌥ for Delete Immediately.")
+
+        Button(multi ? "Delete \(count) Games Immediately…" : "Delete Immediately…", role: .destructive) {
+            state.delete(ids: selectedIDs, permanent: true)
+        }
+        .disabled(count == 0 || state.isBusy)
+        .help("Erase from the card now — slow for large games; cannot be undone")
     }
 
     private func canMove(_ ids: Set<GameEntry.ID>, up: Bool) -> Bool {
@@ -432,19 +444,46 @@ struct GameListView: View {
         return up ? first > 0 : last < state.games.count - 1
     }
 
-    /// 2pt edge progress (scan accent / rebuild orange / mutation accent).
-    private func edgeProgressBar(fraction: Double, color: Color) -> some View {
-        GeometryReader { geo in
+    /// Edge progress (scan accent / rebuild orange / mutation accent).
+    /// - Parameter segmentEnds: cumulative ends 0…1 for multi-file import dividers
+    ///   (segment width ∝ file size — a 640 MB track is a wide band, a 2 MB track a thin one).
+    private func edgeProgressBar(
+        fraction: Double,
+        color: Color,
+        segmentEnds: [Double] = []
+    ) -> some View {
+        // Internal file boundaries only (skip 0 and 1). Dual-tone ticks — not blendMode —
+        // so they read on both the accent fill and the empty track (difference blended
+        // against the table underneath and disappeared).
+        let boundaries = segmentEnds.filter { $0 > 0.002 && $0 < 0.998 }
+        let barHeight: CGFloat = boundaries.isEmpty ? 2 : 5
+        let clamped = max(0, min(1, fraction))
+        return GeometryReader { geo in
+            let w = max(geo.size.width, 1)
             ZStack(alignment: .leading) {
                 Rectangle()
-                    .fill(Color.primary.opacity(0.08))
+                    .fill(Color.primary.opacity(0.10))
                 Rectangle()
                     .fill(color)
-                    .frame(width: geo.size.width * max(0, min(1, fraction)))
-                    .animation(.linear(duration: 0.2), value: fraction)
+                    .frame(width: w * clamped)
+                    .animation(.linear(duration: 0.12), value: clamped)
+
+                ForEach(Array(boundaries.enumerated()), id: \.offset) { _, end in
+                    // White halo + dark core: visible on blue fill and pale track.
+                    ZStack {
+                        Rectangle()
+                            .fill(Color.white.opacity(0.95))
+                            .frame(width: 3, height: barHeight)
+                        Rectangle()
+                            .fill(Color.black.opacity(0.72))
+                            .frame(width: 1.5, height: barHeight)
+                    }
+                    .frame(width: 3, height: barHeight)
+                    .position(x: w * end, y: barHeight / 2)
+                }
             }
         }
-        .frame(height: 2)
+        .frame(height: barHeight)
         .allowsHitTesting(false)
     }
 

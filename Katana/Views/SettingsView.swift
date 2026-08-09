@@ -31,7 +31,7 @@ private struct GeneralSettingsPanel: View {
                     isOn: $state.duplicatesEnabled
                 )
                 SettingsDescription(
-                    "Sidebar, list chips, hashing, and Card menu actions for finding copies. On by default — turn off after you’ve cleaned the card."
+                    "Sidebar, list chips, hashing, and Card menu actions for finding copies. Off by default — turn on when you want to clean the card."
                 )
 
                 if state.duplicatesEnabled {

@@ -4,7 +4,9 @@ import os
 /// Process-relative launch timing.
 /// Always on in DEBUG; also when env `KATANA_TRACE_LAUNCH=1`.
 /// Logs to Console (`subsystem com.gingerbeardman.Katana`) and stderr.
-enum LaunchTrace {
+///
+/// Opt out of the project’s default MainActor isolation — marks fire from scan/hash workers.
+nonisolated enum LaunchTrace {
     private static let log = Logger(subsystem: "com.gingerbeardman.Katana", category: "Launch")
     private static let t0 = CFAbsoluteTimeGetCurrent()
     private static let enabled: Bool = {

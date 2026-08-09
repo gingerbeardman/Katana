@@ -556,7 +556,7 @@ enum DuplicateDetector {
 
     /// Strip a trailing sequel ordinal: "2", "3", "ii", "iii", "2nd", "part 2", …
     nonisolated static func stripSequelMarker(_ normalizedName: String) -> String {
-        var s = normalizedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let s = normalizedName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return s }
         let range = NSRange(s.startIndex..., in: s)
         for regex in sequelStripRegexes {

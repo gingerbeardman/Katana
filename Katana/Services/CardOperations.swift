@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Immediate, on-disk mutations. No deferred "save" — the SD card is the source of truth.
@@ -10,30 +11,39 @@ enum CardOperations: Sendable {
     // MARK: - Rename
 
     /// Write `name.txt` immediately. Returns previous name for undo.
+    /// - Parameter cardRoot: Security-scoped card root when available. Child URLs built from
+    ///   this keep sandbox write access; path-only `game.folderURL` does not.
     @discardableResult
-    nonisolated static func rename(game: GameEntry, to newName: String) throws -> String {
+    nonisolated static func rename(game: GameEntry, to newName: String, cardRoot: URL? = nil) throws -> String {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             throw OperationError.emptyName
         }
         let previous = game.name
-        let url = game.folderURL.appendingPathComponent(nameFile)
+        let folder = scopedFolderURL(for: game, under: cardRoot)
+        let url = folder.appendingPathComponent(nameFile)
         // Non-atomic on purpose: FAT32/exFAT atomic replace (temp + rename) is flaky under
         // the App Sandbox and often surfaces as “don’t have permission to save name.txt”.
         try trimmed.write(to: url, atomically: false, encoding: .utf8)
         return previous
     }
 
-    // MARK: - Delete (soft → same-volume trash, pack gaps)
+    // MARK: - Delete (soft → trash, or permanent wipe, then pack gaps)
 
-    /// Soft-delete one or more games into `.katana-trash/`, then pack remaining numbers.
-    /// Uses single-pass renames when packing down (half the I/O of two-phase renumber).
-    /// Returns updated remaining games — callers should **not** full-rescan.
+    /// Remove one or more games, then pack remaining numbers.
+    ///
+    /// - Parameter permanent: When `false` (default), **soft-delete** into `.katana-trash/`
+    ///   (fast move; undoable). When `true`, **immediately erase** the folders from the card
+    ///   (slow for large GDI sets; not undoable).
+    /// - Returns updated remaining games — callers should **not** full-rescan.
+    ///   `trashed` is empty when `permanent` is true.
     nonisolated static func delete(
         gameIDs: Set<UUID>,
         games: [GameEntry],
         rootURL: URL,
-        progress: (@Sendable (String) -> Void)? = nil
+        permanent: Bool = false,
+        progress: (@Sendable (String) -> Void)? = nil,
+        fractionProgress: (@Sendable (Double) -> Void)? = nil
     ) throws -> BatchDeleteResult {
         guard !gameIDs.isEmpty else {
             throw OperationError.gameNotFound
@@ -45,24 +55,55 @@ enum CardOperations: Sendable {
         }
 
         let previousOrder = games.map(\.id)
-        let trashRoot = try ensureDir(rootURL.appendingPathComponent(trashFolderName, isDirectory: true))
-        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
-
         var trashed: [TrashedGame] = []
-        trashed.reserveCapacity(toDelete.count)
+        trashed.reserveCapacity(permanent ? 0 : toDelete.count)
 
-        for game in toDelete {
-            progress?("Trashing \(game.name)…")
-            let trashName = "\(stamp)_\(FolderNumbering.format(game.number))_\(sanitize(game.name))"
-            let trashURL = uniqueURL(trashRoot.appendingPathComponent(trashName, isDirectory: true))
-            try FileManager.default.moveItem(at: game.folderURL, to: trashURL)
-            trashed.append(
-                TrashedGame(
-                    game: game,
-                    trashURL: trashURL,
-                    originalIndex: games.firstIndex(where: { $0.id == game.id }) ?? 0
+        if permanent {
+            // Pre-size all victims so the edge bar reflects large tracks.
+            var plans: [(game: GameEntry, folder: URL, bytes: Int64)] = []
+            plans.reserveCapacity(toDelete.count)
+            var totalBytes: Int64 = 0
+            for game in toDelete {
+                let folder = scopedFolderURL(for: game, under: rootURL)
+                let bytes = max(1, directoryByteSize(at: folder) ?? game.byteSize)
+                plans.append((game, folder, bytes))
+                totalBytes += bytes
+            }
+            totalBytes = max(1, totalBytes)
+            let counter = ProgressByteCounter(total: totalBytes, report: fractionProgress)
+            fractionProgress?(0)
+
+            for (index, plan) in plans.enumerated() {
+                progress?(
+                    "Deleting \(plan.game.name)… (\(index + 1)/\(plans.count))"
                 )
-            )
+                let base = counter.completed
+                try removeTree(at: plan.folder) { wipedInFolder in
+                    counter.report(base + wipedInFolder)
+                }
+                counter.add(plan.bytes)
+            }
+        } else {
+            let trashRoot = try ensureDir(rootURL.appendingPathComponent(trashFolderName, isDirectory: true))
+            let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+
+            for (index, game) in toDelete.enumerated() {
+                progress?("Trashing \(game.name)… (\(index + 1)/\(toDelete.count))")
+                fractionProgress?(Double(index) / Double(max(toDelete.count, 1)))
+                let trashName = "\(stamp)_\(FolderNumbering.format(game.number))_\(sanitize(game.name))"
+                let trashURL = uniqueURL(trashRoot.appendingPathComponent(trashName, isDirectory: true))
+                // Must move via scoped root — `URL(fileURLWithPath:)` drops security scope.
+                let source = scopedFolderURL(for: game, under: rootURL)
+                try FileManager.default.moveItem(at: source, to: trashURL)
+                trashed.append(
+                    TrashedGame(
+                        game: game,
+                        trashURL: trashURL,
+                        originalIndex: games.firstIndex(where: { $0.id == game.id }) ?? 0
+                    )
+                )
+            }
+            fractionProgress?(1)
         }
 
         // Remaining keep list order; pack into 01…n with as few renames as possible.
@@ -104,14 +145,23 @@ enum CardOperations: Sendable {
         )
     }
 
-    /// Convenience single delete.
+    /// Convenience single delete (soft by default).
     nonisolated static func delete(
         gameID: UUID,
         games: [GameEntry],
         rootURL: URL,
-        progress: (@Sendable (String) -> Void)? = nil
+        permanent: Bool = false,
+        progress: (@Sendable (String) -> Void)? = nil,
+        fractionProgress: (@Sendable (Double) -> Void)? = nil
     ) throws -> BatchDeleteResult {
-        try delete(gameIDs: [gameID], games: games, rootURL: rootURL, progress: progress)
+        try delete(
+            gameIDs: [gameID],
+            games: games,
+            rootURL: rootURL,
+            permanent: permanent,
+            progress: progress,
+            fractionProgress: fractionProgress
+        )
     }
 
     /// Restore soft-deleted games into `currentGames` order at their recorded indices.
@@ -132,13 +182,19 @@ enum CardOperations: Sendable {
             uniqueKeysWithValues: currentGames.map { ($0.id, $0) }
         )
 
+        let trashRoot = rootURL.appendingPathComponent(trashFolderName, isDirectory: true)
         let sorted = trashed.sorted { $0.originalIndex > $1.originalIndex }
         for item in sorted {
             let staged = tmp.appendingPathComponent(item.game.id.uuidString, isDirectory: true)
             if FileManager.default.fileExists(atPath: staged.path) {
                 try FileManager.default.removeItem(at: staged)
             }
-            try FileManager.default.moveItem(at: item.trashURL, to: staged)
+            // Trash URL may be path-only (scope lost) — re-home under scoped root.
+            let trashSource = trashRoot.appendingPathComponent(
+                item.trashURL.lastPathComponent,
+                isDirectory: true
+            )
+            try FileManager.default.moveItem(at: trashSource, to: staged)
             pathByID[item.game.id] = staged.path
             restoredByID[item.game.id] = item.game
             let insertIndex = min(max(0, item.originalIndex), order.count)
@@ -177,7 +233,7 @@ enum CardOperations: Sendable {
     // MARK: - Trash
 
     /// Soft-deleted packages under `.katana-trash/` (top-level items + total bytes).
-    struct TrashSummary: Sendable, Equatable {
+    nonisolated struct TrashSummary: Sendable, Equatable {
         var itemCount: Int
         var totalBytes: Int64
 
@@ -218,11 +274,19 @@ enum CardOperations: Sendable {
 
     /// Permanently delete everything under `.katana-trash/`.
     /// Safe if missing (returns zeros). Does not affect numbered game slots.
+    ///
+    /// - Important: `rootURL` must be the live security-scoped card root. Child URLs are
+    ///   rebuilt with `appendingPathComponent` — never use path-only URLs from enumeration
+    ///   (those drop App Sandbox write access on FAT volumes).
     nonisolated static func emptyTrash(
         rootURL: URL,
         progress: (@Sendable (String) -> Void)? = nil
     ) throws -> EmptyTrashResult {
-        try emptyTrashFolder(
+        // Start scope if the URL carries it. Do **not** stop here — Katana holds card
+        // access for the whole session (2UP pattern). A balancing stop in a worker would
+        // drop the session grant mid-use when this is the same URL AppState is holding.
+        _ = rootURL.startAccessingSecurityScopedResource()
+        return try emptyTrashFolder(
             rootURL.appendingPathComponent(trashFolderName, isDirectory: true),
             progress: progress
         )
@@ -237,29 +301,101 @@ enum CardOperations: Sendable {
             return EmptyTrashResult(itemCount: 0, bytesFreed: 0)
         }
 
-        let contents = try fm.contentsOfDirectory(
-            at: trashRoot,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        )
-        guard !contents.isEmpty else {
+        // Path names only, then rebuild under `trashRoot` so every delete target inherits
+        // the security-scoped parent. Include AppleDouble `._*` (no skipsHiddenFiles).
+        let names = (try? fm.contentsOfDirectory(atPath: trashRoot.path)) ?? []
+        guard !names.isEmpty else {
             try? fm.removeItem(at: trashRoot)
             return EmptyTrashResult(itemCount: 0, bytesFreed: 0)
         }
 
         progress?("Emptying trash…")
         var bytes: Int64 = 0
-        for (index, url) in contents.enumerated() {
-            bytes += directoryByteSize(at: url) ?? 0
-            try fm.removeItem(at: url)
-            if index % 5 == 0 || index == contents.count - 1 {
-                progress?("Emptying trash… \(index + 1)/\(contents.count)")
+        var removed = 0
+        var firstError: Error?
+
+        for (index, name) in names.enumerated() {
+            let target = trashRoot.appendingPathComponent(name, isDirectory: true)
+            bytes += directoryByteSize(at: target) ?? 0
+            do {
+                try removeTree(at: target)
+                removed += 1
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+            if index % 5 == 0 || index == names.count - 1 {
+                progress?("Emptying trash… \(index + 1)/\(names.count)")
             }
         }
+
         if let left = try? fm.contentsOfDirectory(atPath: trashRoot.path), left.isEmpty {
             try? fm.removeItem(at: trashRoot)
         }
-        return EmptyTrashResult(itemCount: contents.count, bytesFreed: bytes)
+
+        // If nothing was removed and something failed, surface the first error.
+        if removed == 0, let firstError {
+            throw firstError
+        }
+        // Partial success is OK — remaining items stay for a later Empty Trash.
+        return EmptyTrashResult(itemCount: removed, bytesFreed: bytes)
+    }
+
+    /// Bottom-up delete for FAT: clear xattrs, remove files, then directories.
+    /// Prefer path-based APIs; rebuild every child under `root` (scope-safe).
+    /// - Parameter onBytesRemoved: Approximate bytes freed so far under this root (for progress).
+    nonisolated private static func removeTree(
+        at root: URL,
+        onBytesRemoved: (@Sendable (Int64) -> Void)? = nil
+    ) throws {
+        try removeTree(at: root, bytesSoFar: 0, onBytesRemoved: onBytesRemoved)
+    }
+
+    @discardableResult
+    nonisolated private static func removeTree(
+        at root: URL,
+        bytesSoFar: Int64,
+        onBytesRemoved: (@Sendable (Int64) -> Void)?
+    ) throws -> Int64 {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDir) else { return bytesSoFar }
+
+        clearExtendedAttributes(at: root.path)
+        var done = bytesSoFar
+
+        if isDir.boolValue {
+            let children = (try? fm.contentsOfDirectory(atPath: root.path)) ?? []
+            for name in children {
+                // Skip AppleDouble noise names handled as regular files below.
+                done = try removeTree(
+                    at: root.appendingPathComponent(name, isDirectory: false),
+                    bytesSoFar: done,
+                    onBytesRemoved: onBytesRemoved
+                )
+            }
+        } else {
+            let size = fileByteSize(at: root)
+            done += max(0, size)
+            onBytesRemoved?(done)
+        }
+
+        do {
+            try fm.removeItem(atPath: root.path)
+        } catch {
+            // Last resort: URL form (some sandboxed stacks prefer one or the other).
+            try fm.removeItem(at: root)
+        }
+        return done
+    }
+
+    nonisolated private static func clearExtendedAttributes(at path: String) {
+        path.withCString { pathPtr in
+            _ = removexattr(pathPtr, "com.apple.quarantine", 0)
+            _ = removexattr(pathPtr, "com.apple.provenance", 0)
+            // Drop Finder info / resource-fork companions on FAT.
+            _ = removexattr(pathPtr, "com.apple.FinderInfo", 0)
+            _ = removexattr(pathPtr, "com.apple.ResourceFork", 0)
+        }
     }
 
     /// Whether `.katana-trash` exists and has content.
@@ -315,8 +451,11 @@ enum CardOperations: Sendable {
         case slotFinished(GameEntry)
         /// Slot failed after prepare — remove the provisional row (folder cleaned up).
         case slotFailed(UUID)
-        /// Overall 0…1 for the edge progress bar.
+        /// Overall 0…1 for the edge progress bar (legacy; prefer `copyProgress`).
         case fraction(Double)
+        /// Per-file copy progress: fraction jumps to a segment end only after that file
+        /// finishes (size-weighted notches). `segmentEnds` are cumulative 0…1 dividers.
+        case copyProgress(fraction: Double, segmentEnds: [Double])
         /// Status line / busy caption.
         case message(String)
     }
@@ -324,6 +463,7 @@ enum CardOperations: Sendable {
     /// Copy disc packages/images into the next free slots. Existing folders are renumbered
     /// first when digit width must grow (e.g. 99 → 100).
     ///
+    /// Accepts folders, disc images, multi-select GDI/CCD track sets, and `.zip` archives.
     /// When `onEvent` is set, each new slot is prepared (folder + name) before hashing/copy
     /// so the table can show rows immediately with a per-file spinner.
     nonisolated static func importDiscs(
@@ -344,31 +484,34 @@ enum CardOperations: Sendable {
             return ImportResult(games: games, added: [], skipped: [])
         }
 
-        var resolved: [DiscImportSource] = []
-        var skipped: [(URL, String)] = []
-        var seenPackages = Set<String>()
-
-        for url in sources {
-            do {
-                let source = try resolveImportSource(url)
-                let key = source.packageURL.standardizedFileURL.path
-                    + "|" + (source.fileNames?.sorted().joined(separator: ",") ?? "*")
-                if seenPackages.contains(key) {
-                    skipped.append((url, "Duplicate selection"))
-                    continue
-                }
-                // Refuse importing from the open card itself.
-                let rootPath = rootURL.standardizedFileURL.path
-                let pkgPath = source.packageURL.standardizedFileURL.path
-                if pkgPath == rootPath || pkgPath.hasPrefix(rootPath + "/") {
-                    skipped.append((url, "Source is already on this card"))
-                    continue
-                }
-                seenPackages.insert(key)
-                resolved.append(source)
-            } catch {
-                skipped.append((url, error.localizedDescription))
+        emit(.message("Resolving packages…"))
+        let discovery = resolveImportSources(sources)
+        defer {
+            for temp in discovery.temporaryRoots {
+                try? FileManager.default.removeItem(at: temp)
             }
+        }
+
+        var resolved: [DiscImportSource] = []
+        var skipped = discovery.skipped
+        var seenPackages = Set<String>()
+        let rootPath = rootURL.standardizedFileURL.path
+
+        for source in discovery.sources {
+            let key = source.packageURL.standardizedFileURL.path
+                + "|" + (source.fileNames?.sorted().joined(separator: ",") ?? "*")
+            if seenPackages.contains(key) {
+                skipped.append((source.packageURL, "Duplicate selection"))
+                continue
+            }
+            // Refuse importing from the open card itself.
+            let pkgPath = source.packageURL.standardizedFileURL.path
+            if pkgPath == rootPath || pkgPath.hasPrefix(rootPath + "/") {
+                skipped.append((source.packageURL, "Source is already on this card"))
+                continue
+            }
+            seenPackages.insert(key)
+            resolved.append(source)
         }
 
         guard !resolved.isEmpty else {
@@ -431,8 +574,24 @@ enum CardOperations: Sendable {
         // Re-read after renumber so free-slot search sees final names.
         var occupied = try occupiedSlotNumbers(on: rootURL)
 
-        for (offset, source) in resolved.enumerated() {
-            // Skip any slot still occupied (gaps, stale memory, concurrent mounts).
+        /// One on-card slot ready for hash + byte-weighted copy.
+        struct PreparedSlot {
+            var source: DiscImportSource
+            var dest: URL
+            var entryID: UUID
+            var number: Int
+            var imageName: String
+            var preferred: String
+            var willRenameSingle: Bool
+            var format: DiscFormat
+            var provisionalName: String
+            var files: [(from: URL, to: URL, name: String, size: Int64)]
+        }
+
+        // Prepare every slot first so we can size-weight the whole import (not equal per file/slot).
+        var prepared: [PreparedSlot] = []
+        prepared.reserveCapacity(resolved.count)
+        for source in resolved {
             while occupied.contains(nextNumber) {
                 nextNumber += 1
             }
@@ -440,24 +599,19 @@ enum CardOperations: Sendable {
             nextNumber += 1
             let widthMax = max(newTotal, number, occupied.max() ?? 0)
             let folderName = FolderNumbering.format(number, maxNumber: widthMax)
-            // Final image name on the card (single-file imports become disc.*).
             var imageName = source.imageFileName
             let preferred = preferredImageName(for: source.imageFileName)
             let willRenameSingle = source.fileNames?.count == 1 && preferred != source.imageFileName
             if willRenameSingle {
                 imageName = preferred
             }
-
             let format = discFormat(for: imageName)
-            // Provisional title from source path — refined after IP.BIN is available.
             let provisionalName = importDisplayName(source: source, ip: nil).name
             let entryID = UUID()
             let dest = rootURL.appendingPathComponent(folderName, isDirectory: true)
             if fm.fileExists(atPath: dest.path) {
                 throw OperationError.destinationExists(folderName)
             }
-
-            // Create folder + name immediately so the table can show the row mid-copy.
             try fm.createDirectory(at: dest, withIntermediateDirectories: true)
             occupied.insert(number)
             try provisionalName.write(
@@ -465,8 +619,23 @@ enum CardOperations: Sendable {
                 atomically: true,
                 encoding: .utf8
             )
+            let files = try packageCopyPlan(source: source, dest: dest)
+            prepared.append(
+                PreparedSlot(
+                    source: source,
+                    dest: dest,
+                    entryID: entryID,
+                    number: number,
+                    imageName: imageName,
+                    preferred: preferred,
+                    willRenameSingle: willRenameSingle,
+                    format: format,
+                    provisionalName: provisionalName,
+                    files: files
+                )
+            )
 
-            var provisional = GameEntry(
+            let provisional = GameEntry(
                 id: entryID,
                 number: number,
                 name: provisionalName,
@@ -481,102 +650,220 @@ enum CardOperations: Sendable {
                 detailsLoaded: false
             )
             emit(.slotPrepared(provisional))
-            emit(.slotActive(entryID))
-            // Fraction starts this slot (completed slots / total).
-            emit(.fraction(Double(offset) / Double(totalSlots)))
+        }
+
+        // Global byte plan → segment ends proportional to each file’s size (thick track = wide
+        // segment). Fill jumps one notch only when that file fully finishes — no mid-file crawl —
+        // so a long track holds at the previous marker, then snaps forward when done.
+        let allFiles = prepared.flatMap(\.files)
+        let totalCopyBytes = max(1, allFiles.reduce(Int64(0)) { $0 + $1.size })
+        let totalFileCount = allFiles.count
+        var segmentEnds: [Double] = []
+        segmentEnds.reserveCapacity(totalFileCount)
+        var cumulative: Int64 = 0
+        for file in allFiles {
+            cumulative += max(file.size, 1)
+            segmentEnds.append(min(1, Double(cumulative) / Double(totalCopyBytes)))
+        }
+        if let last = segmentEnds.indices.last {
+            segmentEnds[last] = 1
+        }
+        emit(.copyProgress(fraction: 0, segmentEnds: segmentEnds))
+
+        var filesCompleted = 0
+
+        /// Advance the bar to the notch for the just-finished file. Stays below 1.0 until the
+        /// whole import (including post-copy finalize/hash) completes — no full-bar dead wait.
+        func emitFileCompletedProgress() {
+            filesCompleted += 1
+            guard totalFileCount > 0, filesCompleted > 0 else {
+                emit(.copyProgress(fraction: 0, segmentEnds: segmentEnds))
+                return
+            }
+            let idx = min(filesCompleted, segmentEnds.count) - 1
+            var fraction = segmentEnds[idx]
+            if filesCompleted >= totalFileCount {
+                // Last file is on the card; finalize (hash / IP.BIN / name) may still run.
+                fraction = min(fraction, 0.99)
+            }
+            emit(.copyProgress(fraction: fraction, segmentEnds: segmentEnds))
+        }
+
+        // Copy first (sized notches). Hash on source after each package’s files land so we
+        // never re-walk multi‑GB tracks on the card (`loadFolderDetails`).
+        for (offset, slot) in prepared.enumerated() {
+            emit(.slotActive(slot.entryID))
+            var imageName = slot.imageName
 
             do {
-                // Hash payload on the **source** volume (usually much faster than re-reading the SD).
-                // Digest uses canonical on-card names so it matches a post-copy hash of dest.
-                var precomputedHash: ContentHashSidecar.ComputeResult?
-                if let sources = try? payloadSourcesForImport(source: source, destImageName: imageName),
-                   !sources.isEmpty
-                {
-                    emit(.message("Hashing \(offset + 1)/\(totalSlots)… \(source.hintName)"))
-                    precomputedHash = try? ContentHashSidecar.compute(sources: sources)
+                let fileCount = slot.files.count
+                for (fileIndex, file) in slot.files.enumerated() {
+                    let label = fileCount > 1
+                        ? "Copying \(offset + 1)/\(totalSlots)… \(file.name) (\(fileIndex + 1)/\(fileCount))"
+                        : "Copying \(offset + 1)/\(totalSlots)… \(slot.source.hintName)"
+                    emit(.message(label))
+
+                    var isDir: ObjCBool = false
+                    if fm.fileExists(atPath: file.from.path, isDirectory: &isDir), isDir.boolValue {
+                        try fm.copyItem(at: file.from, to: file.to)
+                        emitFileCompletedProgress()
+                        continue
+                    }
+
+                    // Stream large tracks (opaque FileManager.copyItem hides I/O errors on FAT);
+                    // progress only updates after the whole file lands.
+                    try copyFileWithProgress(
+                        from: file.from,
+                        to: file.to,
+                        expectedSize: file.size,
+                        onProgress: { _ in }
+                    )
+                    emitFileCompletedProgress()
                 }
 
-                emit(.message("Copying \(offset + 1)/\(totalSlots)… \(source.hintName)"))
-                try copyPackage(source: source, to: dest)
-
-                // Prefer disc.* names when we copied a single image file.
-                if willRenameSingle {
-                    let from = dest.appendingPathComponent(source.imageFileName)
-                    let to = dest.appendingPathComponent(preferred)
+                if slot.willRenameSingle {
+                    let from = slot.dest.appendingPathComponent(slot.source.imageFileName)
+                    let to = slot.dest.appendingPathComponent(slot.preferred)
                     if fm.fileExists(atPath: from.path), !fm.fileExists(atPath: to.path) {
                         try? fm.moveItem(at: from, to: to)
-                        imageName = preferred
-                        provisional.imageFileName = imageName
+                        imageName = slot.preferred
                     }
                 }
 
-                // Write sidecars from the precomputed digest (tiny write; no SD re-read of the disc).
+                // Bar holds at the last completed-file notch (≤0.99 after the final track)
+                // while we write hash / name / serial — not a second full re-read of tracks.
+                emit(.message("Finalizing \(offset + 1)/\(totalSlots)… \(slot.source.hintName)"))
+
                 var contentHash: String?
-                var payloadSize: Int64 = 0
-                if let computed = precomputedHash {
-                    do {
-                        try ContentHashSidecar.write(computed, to: dest)
+                var payloadSize: Int64 = slot.files.reduce(Int64(0)) { $0 + $1.size }
+                if let sources = try? payloadSourcesForImport(
+                    source: slot.source,
+                    destImageName: imageName
+                ), !sources.isEmpty {
+                    // Still hash on the *source* volume (usually faster than the SD card).
+                    if let computed = try? ContentHashSidecar.compute(sources: sources) {
+                        try? ContentHashSidecar.write(computed, to: slot.dest)
                         contentHash = computed.sha256
                         payloadSize = computed.payloadSize
-                    } catch {
-                        // Fall back to post-import hashing in the UI if sidecar write fails.
-                        contentHash = nil
                     }
                 }
 
                 let ip = IpBinReader.read(
-                    folderURL: dest,
+                    folderURL: slot.dest,
                     imageFileName: imageName,
-                    format: format
+                    format: slot.format
                 )
-                // Like GDMENU Card Manager: default title from source file/folder name so
-                // homebrew variants (same IP.BIN) stay distinct. GameDB/IP are fallbacks only.
-                let resolvedName = importDisplayName(source: source, ip: ip)
+                let resolvedName = importDisplayName(source: slot.source, ip: ip)
 
                 try resolvedName.name.write(
-                    to: dest.appendingPathComponent(nameFile),
+                    to: slot.dest.appendingPathComponent(nameFile),
                     atomically: true,
                     encoding: .utf8
                 )
                 if !resolvedName.serial.isEmpty {
                     try resolvedName.serial.write(
-                        to: dest.appendingPathComponent(serialFile),
+                        to: slot.dest.appendingPathComponent(serialFile),
                         atomically: true,
                         encoding: .utf8
                     )
                 }
 
-                let details = try? CardScanner.loadFolderDetails(folderURL: dest)
+                // Prefer sizes we already measured — skip loadFolderDetails (slow FAT walk).
                 let entry = GameEntry(
-                    id: entryID,
-                    number: number,
+                    id: slot.entryID,
+                    number: slot.number,
                     name: resolvedName.name,
                     serial: resolvedName.serial,
-                    format: format,
+                    format: slot.format,
                     imageFileName: imageName,
-                    folderPath: dest.path,
-                    byteSize: details?.byteSize ?? payloadSize,
-                    payloadByteSize: payloadSize > 0 ? payloadSize : (details?.payloadByteSize ?? 0),
-                    contentSHA256: contentHash ?? details?.contentSHA256,
+                    folderPath: slot.dest.path,
+                    byteSize: payloadSize,
+                    payloadByteSize: payloadSize,
+                    contentSHA256: contentHash,
                     isMenu: false,
-                    detailsLoaded: details != nil || contentHash != nil
+                    detailsLoaded: contentHash != nil
                 )
                 added.append(entry)
                 emit(.slotFinished(entry))
-                emit(.fraction(Double(offset + 1) / Double(totalSlots)))
             } catch {
-                try? fm.removeItem(at: dest)
-                occupied.remove(number)
-                emit(.slotFailed(entryID))
+                try? fm.removeItem(at: slot.dest)
+                occupied.remove(slot.number)
+                emit(.slotFailed(slot.entryID))
                 throw error
             }
         }
 
+        emit(.copyProgress(fraction: 1, segmentEnds: segmentEnds))
+        emit(.message("Added \(added.count) game\(added.count == 1 ? "" : "s")"))
         return ImportResult(
             games: updatedExisting + added,
             added: added,
             skipped: skipped
         )
+    }
+
+    // MARK: - Import resolve (grouping + GDI + zip)
+
+    /// Result of turning dropped/picked URLs into copyable packages.
+    struct ImportDiscovery: Sendable {
+        var sources: [DiscImportSource]
+        var skipped: [(url: URL, reason: String)]
+        /// Temp extract roots (zip) — caller must delete after import.
+        var temporaryRoots: [URL]
+    }
+
+    /// Resolve one or many selection URLs: multi-select GDI/CCD sets, folders, images, `.zip`.
+    nonisolated static func resolveImportSources(_ urls: [URL]) -> ImportDiscovery {
+        var sources: [DiscImportSource] = []
+        var skipped: [(URL, String)] = []
+        var temporaryRoots: [URL] = []
+        var looseFiles: [URL] = []
+
+        for url in urls {
+            let ext = url.pathExtension.lowercased()
+            if ext == "zip" {
+                do {
+                    let extracted = try extractZipForImport(url)
+                    temporaryRoots.append(extracted)
+                    let found = discoverPackages(under: extracted, depth: 0)
+                    if found.isEmpty {
+                        skipped.append((url, "No disc image found inside archive"))
+                    } else {
+                        sources.append(contentsOf: found)
+                    }
+                } catch {
+                    skipped.append((url, error.localizedDescription))
+                }
+                continue
+            }
+
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else {
+                skipped.append((url, OperationError.importUnreadable(url.lastPathComponent).localizedDescription))
+                continue
+            }
+            if isDir.boolValue {
+                do {
+                    sources.append(try resolveImportSource(url))
+                } catch {
+                    // Nested packages (e.g. folder of game folders).
+                    let nested = discoverPackages(under: url, depth: 0)
+                    if nested.isEmpty {
+                        skipped.append((url, error.localizedDescription))
+                    } else {
+                        sources.append(contentsOf: nested)
+                    }
+                }
+            } else {
+                looseFiles.append(url)
+            }
+        }
+
+        let grouped = groupLooseImportFiles(looseFiles)
+        sources.append(contentsOf: grouped.sources)
+        skipped.append(contentsOf: grouped.skipped)
+
+        return ImportDiscovery(sources: sources, skipped: skipped, temporaryRoots: temporaryRoots)
     }
 
     /// Turn a user-selected file or folder into a copyable disc package.
@@ -588,17 +875,7 @@ enum CardOperations: Sendable {
         }
 
         if isDir.boolValue {
-            let names = try fm.contentsOfDirectory(atPath: url.path)
-                .filter { !$0.hasPrefix(".") }
-            guard let image = detectImageName(in: names) else {
-                throw OperationError.importNoDiscImage(url.lastPathComponent)
-            }
-            return DiscImportSource(
-                packageURL: url.standardizedFileURL,
-                fileNames: nil,
-                imageFileName: image,
-                hintName: url.lastPathComponent
-            )
+            return try resolveFolderPackage(url)
         }
 
         let ext = url.pathExtension.lowercased()
@@ -607,15 +884,7 @@ enum CardOperations: Sendable {
 
         switch ext {
         case "gdi":
-            // Whole GDI set lives next to the cue file.
-            let names = try fm.contentsOfDirectory(atPath: parent.path)
-                .filter { !$0.hasPrefix(".") }
-            return DiscImportSource(
-                packageURL: parent.standardizedFileURL,
-                fileNames: nil,
-                imageFileName: name,
-                hintName: (name as NSString).deletingPathExtension
-            )
+            return try resolveGDIPackage(gdiURL: url)
         case "cdi":
             return DiscImportSource(
                 packageURL: parent.standardizedFileURL,
@@ -624,23 +893,264 @@ enum CardOperations: Sendable {
                 hintName: (name as NSString).deletingPathExtension
             )
         case "ccd":
-            // CloneCCD-style: .ccd + .img + optional .sub
-            let base = (name as NSString).deletingPathExtension
-            var files = [name]
-            for companion in ["\(base).img", "\(base).sub", "\(base).cue"] {
-                if fm.fileExists(atPath: parent.appendingPathComponent(companion).path) {
-                    files.append(companion)
-                }
-            }
-            return DiscImportSource(
-                packageURL: parent.standardizedFileURL,
-                fileNames: files,
-                imageFileName: name,
-                hintName: base
-            )
+            return resolveCCDPackage(ccdURL: url)
+        case "zip":
+            // Use `resolveImportSources` so the extract temp is cleaned up after import.
+            throw OperationError.importUnsupported(url.lastPathComponent)
         default:
             throw OperationError.importUnsupported(url.lastPathComponent)
         }
+    }
+
+    /// Folder that already looks like a GDEMU game package.
+    nonisolated private static func resolveFolderPackage(_ url: URL) throws -> DiscImportSource {
+        let fm = FileManager.default
+        let names = try fm.contentsOfDirectory(atPath: url.path)
+            .filter { !$0.hasPrefix(".") }
+        guard let image = detectImageName(in: names) else {
+            throw OperationError.importNoDiscImage(url.lastPathComponent)
+        }
+        let ext = (image as NSString).pathExtension.lowercased()
+        switch ext {
+        case "gdi":
+            let gdiURL = url.appendingPathComponent(image)
+            var source = try resolveGDIPackage(gdiURL: gdiURL)
+            // Prefer folder name for display when the package is a game folder.
+            source.hintName = url.lastPathComponent
+            return source
+        case "ccd":
+            var source = resolveCCDPackage(ccdURL: url.appendingPathComponent(image))
+            source.hintName = url.lastPathComponent
+            return source
+        case "cdi":
+            return DiscImportSource(
+                packageURL: url.standardizedFileURL,
+                fileNames: [image],
+                imageFileName: image,
+                hintName: url.lastPathComponent
+            )
+        default:
+            return DiscImportSource(
+                packageURL: url.standardizedFileURL,
+                fileNames: nil,
+                imageFileName: image,
+                hintName: url.lastPathComponent
+            )
+        }
+    }
+
+    /// GDI cue + only the track files it names (not the whole parent directory).
+    nonisolated static func resolveGDIPackage(gdiURL: URL) throws -> DiscImportSource {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: gdiURL.path) else {
+            throw OperationError.importUnreadable(gdiURL.lastPathComponent)
+        }
+        let parent = gdiURL.deletingLastPathComponent()
+        let gdiName = gdiURL.lastPathComponent
+        let text = (try? String(contentsOf: gdiURL, encoding: .utf8))
+            ?? (try? String(contentsOf: gdiURL, encoding: .isoLatin1))
+            ?? ""
+        let tracks = gdiReferencedFileNames(in: text)
+        var files: [String] = [gdiName]
+        var missing: [String] = []
+        for track in tracks {
+            let path = parent.appendingPathComponent(track).path
+            if fm.fileExists(atPath: path) {
+                if !files.contains(track) { files.append(track) }
+            } else {
+                missing.append(track)
+            }
+        }
+        // Fall back: if the cue listed nothing parseable, copy siblings that look like tracks
+        // only when the cue was empty of names — never dump the whole parent.
+        if tracks.isEmpty {
+            let siblings = (try? fm.contentsOfDirectory(atPath: parent.path)) ?? []
+            for name in siblings where !name.hasPrefix(".") {
+                let ext = (name as NSString).pathExtension.lowercased()
+                if ["bin", "raw", "iso", "img"].contains(ext), !files.contains(name) {
+                    files.append(name)
+                }
+            }
+        } else if files.count == 1, !missing.isEmpty {
+            throw OperationError.importMissingTracks(gdiName, missing)
+        }
+
+        return DiscImportSource(
+            packageURL: parent.standardizedFileURL,
+            fileNames: files,
+            imageFileName: gdiName,
+            hintName: (gdiName as NSString).deletingPathExtension
+        )
+    }
+
+    /// CloneCCD-style: `.ccd` + matching `.img` / `.sub` / `.cue` when present.
+    nonisolated static func resolveCCDPackage(ccdURL: URL) -> DiscImportSource {
+        let fm = FileManager.default
+        let parent = ccdURL.deletingLastPathComponent()
+        let name = ccdURL.lastPathComponent
+        let base = (name as NSString).deletingPathExtension
+        var files = [name]
+        for companion in ["\(base).img", "\(base).sub", "\(base).cue"] {
+            if fm.fileExists(atPath: parent.appendingPathComponent(companion).path) {
+                files.append(companion)
+            }
+        }
+        return DiscImportSource(
+            packageURL: parent.standardizedFileURL,
+            fileNames: files,
+            imageFileName: name,
+            hintName: base
+        )
+    }
+
+    /// Parse track file names from a `.gdi` cue (shared Redump-aware parser).
+    nonisolated static func gdiReferencedFileNames(in text: String) -> [String] {
+        GdiCue.referencedFileNames(in: text)
+    }
+
+    /// Multi-select Finder drop: group files that form one or more disc packages.
+    nonisolated private static func groupLooseImportFiles(
+        _ urls: [URL]
+    ) -> (sources: [DiscImportSource], skipped: [(URL, String)]) {
+        guard !urls.isEmpty else { return ([], []) }
+
+        var sources: [DiscImportSource] = []
+        var skipped: [(URL, String)] = []
+        var claimed = Set<String>() // standardized paths claimed by a package
+
+        // Group by parent directory so multi-select from one folder becomes one+ packages.
+        var byParent: [String: [URL]] = [:]
+        for url in urls {
+            let parent = url.deletingLastPathComponent().standardizedFileURL.path
+            byParent[parent, default: []].append(url)
+        }
+
+        for (_, files) in byParent {
+            // GDI packages first (each cue owns its tracks).
+            let gdis = files.filter { $0.pathExtension.lowercased() == "gdi" }
+            for gdi in gdis {
+                do {
+                    let source = try resolveGDIPackage(gdiURL: gdi)
+                    sources.append(source)
+                    claimed.insert(gdi.standardizedFileURL.path)
+                    for name in source.fileNames ?? [] {
+                        let path = gdi.deletingLastPathComponent()
+                            .appendingPathComponent(name)
+                            .standardizedFileURL.path
+                        claimed.insert(path)
+                    }
+                } catch {
+                    skipped.append((gdi, error.localizedDescription))
+                    claimed.insert(gdi.standardizedFileURL.path)
+                }
+            }
+
+            // CCD packages.
+            let ccds = files.filter { $0.pathExtension.lowercased() == "ccd" }
+            for ccd in ccds {
+                let path = ccd.standardizedFileURL.path
+                if claimed.contains(path) { continue }
+                let source = resolveCCDPackage(ccdURL: ccd)
+                sources.append(source)
+                claimed.insert(path)
+                for name in source.fileNames ?? [] {
+                    let p = ccd.deletingLastPathComponent()
+                        .appendingPathComponent(name)
+                        .standardizedFileURL.path
+                    claimed.insert(p)
+                }
+            }
+
+            // Lone CDIs.
+            for cdi in files where cdi.pathExtension.lowercased() == "cdi" {
+                let path = cdi.standardizedFileURL.path
+                if claimed.contains(path) { continue }
+                do {
+                    sources.append(try resolveImportSource(cdi))
+                    claimed.insert(path)
+                } catch {
+                    skipped.append((cdi, error.localizedDescription))
+                    claimed.insert(path)
+                }
+            }
+
+            // Leftover files (tracks without a cue, random docs, etc.).
+            for url in files {
+                let path = url.standardizedFileURL.path
+                if claimed.contains(path) { continue }
+                let ext = url.pathExtension.lowercased()
+                if ["bin", "raw", "iso", "img", "sub", "cue"].contains(ext) {
+                    skipped.append((
+                        url,
+                        "Track/companion file needs its .gdi or .ccd (select the cue with the tracks)"
+                    ))
+                } else {
+                    skipped.append((
+                        url,
+                        OperationError.importUnsupported(url.lastPathComponent).localizedDescription
+                    ))
+                }
+                claimed.insert(path)
+            }
+        }
+
+        return (sources, skipped)
+    }
+
+    /// Walk a directory tree (bounded depth) for importable packages — used after zip extract.
+    nonisolated private static func discoverPackages(under root: URL, depth: Int) -> [DiscImportSource] {
+        guard depth < 4 else { return [] }
+        let fm = FileManager.default
+        guard let children = try? fm.contentsOfDirectory(
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var sources: [DiscImportSource] = []
+        var looseFiles: [URL] = []
+
+        for child in children {
+            let isDir = (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            if isDir {
+                if let pkg = try? resolveFolderPackage(child) {
+                    sources.append(pkg)
+                } else {
+                    sources.append(contentsOf: discoverPackages(under: child, depth: depth + 1))
+                }
+            } else if child.pathExtension.lowercased() == "zip" {
+                // Nested zip: extract under this root so outer import cleanup removes it.
+                let nested = root.appendingPathComponent(
+                    ".katana-nested-\(UUID().uuidString)",
+                    isDirectory: true
+                )
+                if (try? FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)) != nil,
+                   (try? ZipExtractor.extract(zipURL: child, to: nested)) != nil
+                {
+                    sources.append(contentsOf: discoverPackages(under: nested, depth: depth + 1))
+                }
+            } else {
+                looseFiles.append(child)
+            }
+        }
+
+        let grouped = groupLooseImportFiles(looseFiles)
+        sources.append(contentsOf: grouped.sources)
+        return sources
+    }
+
+    nonisolated private static func extractZipForImport(_ zipURL: URL) throws -> URL {
+        let fm = FileManager.default
+        let dest = fm.temporaryDirectory
+            .appendingPathComponent("katana-import-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: dest, withIntermediateDirectories: true)
+        do {
+            try ZipExtractor.extract(zipURL: zipURL, to: dest)
+        } catch {
+            try? fm.removeItem(at: dest)
+            throw OperationError.importArchiveFailed(zipURL.lastPathComponent, error.localizedDescription)
+        }
+        return dest
     }
 
     /// Payload files to hash for import, using **destination** names and **source** content paths.
@@ -671,32 +1181,128 @@ enum CardOperations: Sendable {
         return sources
     }
 
-    nonisolated private static func copyPackage(source: DiscImportSource, to dest: URL) throws {
+    /// Files to copy for a package, with on-disk sizes for byte-weighted progress.
+    /// Always expands to **leaf files** so folder drops get per-file segment markers.
+    nonisolated private static func packageCopyPlan(
+        source: DiscImportSource,
+        dest: URL
+    ) throws -> [(from: URL, to: URL, name: String, size: Int64)] {
         let fm = FileManager.default
+        var pairs: [(from: URL, to: URL, name: String)] = []
+
         if let fileNames = source.fileNames {
             for name in fileNames {
                 let from = source.packageURL.appendingPathComponent(name)
-                let to = dest.appendingPathComponent(name)
                 guard fm.fileExists(atPath: from.path) else {
                     throw OperationError.importUnreadable(name)
                 }
-                try fm.copyItem(at: from, to: to)
+                pairs.append((from, dest.appendingPathComponent(name), name))
             }
-            return
+        } else {
+            // Flatten package folder → regular files only (skip nested trash/tmp).
+            let names = try fm.contentsOfDirectory(atPath: source.packageURL.path)
+                .filter { !$0.hasPrefix(".") }
+                .filter { $0 != trashFolderName && $0 != tmpFolderName }
+                .sorted()
+            for name in names {
+                let from = source.packageURL.appendingPathComponent(name)
+                var isDir: ObjCBool = false
+                guard fm.fileExists(atPath: from.path, isDirectory: &isDir) else { continue }
+                if isDir.boolValue {
+                    // One-level expand (unusual for GDEMU packages).
+                    let kids = (try? fm.contentsOfDirectory(atPath: from.path)) ?? []
+                    for kid in kids where !kid.hasPrefix(".") {
+                        let childFrom = from.appendingPathComponent(kid)
+                        var childDir: ObjCBool = false
+                        guard fm.fileExists(atPath: childFrom.path, isDirectory: &childDir),
+                              !childDir.boolValue
+                        else { continue }
+                        let rel = "\(name)/\(kid)"
+                        pairs.append((
+                            childFrom,
+                            dest.appendingPathComponent(name).appendingPathComponent(kid),
+                            rel
+                        ))
+                    }
+                } else {
+                    pairs.append((from, dest.appendingPathComponent(name), name))
+                }
+            }
         }
 
-        let names = try fm.contentsOfDirectory(atPath: source.packageURL.path)
-            .filter { !$0.hasPrefix(".") }
-        for name in names {
-            // Skip nested manager trash/tmp if someone selected a card root by mistake
-            // (already blocked) or odd packages.
-            if name == trashFolderName || name == tmpFolderName {
-                continue
-            }
-            let from = source.packageURL.appendingPathComponent(name)
-            let to = dest.appendingPathComponent(name)
-            try fm.copyItem(at: from, to: to)
+        return pairs.map { pair in
+            let size = fileByteSize(at: pair.from)
+            return (pair.from, pair.to, pair.name, max(size, 1))
         }
+    }
+
+    nonisolated private static func fileByteSize(at url: URL) -> Int64 {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        if fm.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+            // Directory packages: sum regular files one level deep (good enough for progress).
+            let kids = (try? fm.contentsOfDirectory(atPath: url.path)) ?? []
+            return kids.reduce(Int64(0)) { sum, name in
+                let child = url.appendingPathComponent(name)
+                let s = (try? fm.attributesOfItem(atPath: child.path)[.size] as? Int64) ?? 0
+                return sum + max(0, s)
+            }
+        }
+        if let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+           let size = values.fileSize
+        {
+            return Int64(size)
+        }
+        return (try? fm.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
+    }
+
+    /// Stream a file copy so large GDI tracks report progress (`FileManager.copyItem` is opaque).
+    nonisolated private static func copyFileWithProgress(
+        from source: URL,
+        to dest: URL,
+        expectedSize: Int64,
+        onProgress: (_ bytesWrittenInFile: Int64) -> Void
+    ) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if fm.fileExists(atPath: dest.path) {
+            try fm.removeItem(at: dest)
+        }
+        fm.createFile(atPath: dest.path, contents: nil)
+        let reader = try FileHandle(forReadingFrom: source)
+        let writer = try FileHandle(forWritingTo: dest)
+        defer {
+            try? reader.close()
+            try? writer.close()
+        }
+
+        let chunkSize = 512 * 1024 // 512 KB — smoother bar on mid-size tracks
+        var written: Int64 = 0
+        var lastReport: Int64 = 0
+        // Report often enough that a 640 MB track moves many notches, not one.
+        let reportEvery = max(Int64(256 * 1024), expectedSize / 100) // ≥ every 1% of this file
+
+        while true {
+            let data: Data
+            do {
+                guard let chunk = try reader.read(upToCount: chunkSize) else { break }
+                if chunk.isEmpty { break }
+                data = chunk
+            } catch {
+                throw OperationError.importUnreadable(source.lastPathComponent)
+            }
+            do {
+                try writer.write(contentsOf: data)
+            } catch {
+                throw OperationError.importUnreadable(dest.lastPathComponent)
+            }
+            written += Int64(data.count)
+            if written - lastReport >= reportEvery {
+                lastReport = written
+                onProgress(written)
+            }
+        }
+        onProgress(written)
     }
 
     nonisolated private static func detectImageName(in names: [String]) -> String? {
@@ -861,7 +1467,8 @@ enum CardOperations: Sendable {
 
         for (id, number) in desiredNumbers {
             guard let path = pathByID[id] else { continue }
-            let from = URL(fileURLWithPath: path, isDirectory: true)
+            // Stay under `rootURL` so sandbox security scope is preserved.
+            let from = scopedFolderURL(path: path, under: rootURL)
             let finalName = FolderNumbering.format(number, maxNumber: maxNumber)
             planned.append(Planned(id: id, from: from, number: number, finalName: finalName))
         }
@@ -928,7 +1535,7 @@ enum CardOperations: Sendable {
             var phaseMoves: [(id: UUID, from: URL, phaseA: URL, finalName: String, number: Int)] = []
             for item in planned {
                 guard let path = pathByID[item.id] else { continue }
-                let from = URL(fileURLWithPath: path, isDirectory: true)
+                let from = scopedFolderURL(path: path, under: rootURL)
                 let finalName = FolderNumbering.format(item.number, maxNumber: maxNumber)
                 if from.lastPathComponent == finalName,
                    from.deletingLastPathComponent().standardizedFileURL == rootURL.standardizedFileURL {
@@ -1006,6 +1613,23 @@ enum CardOperations: Sendable {
         let cleaned = name.components(separatedBy: invalid).joined(separator: "-")
         return String(cleaned.prefix(40)).trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    /// Folder URL under a security-scoped card root (App Sandbox).
+    ///
+    /// `URL(fileURLWithPath: game.folderPath)` drops security scope even when the path
+    /// is the same as a scoped volume — all card mutations must go through `rootURL`
+    /// + last path component instead.
+    nonisolated static func scopedFolderURL(for game: GameEntry, under rootURL: URL?) -> URL {
+        scopedFolderURL(path: game.folderPath, under: rootURL)
+    }
+
+    nonisolated static func scopedFolderURL(path: String, under rootURL: URL?) -> URL {
+        let name = URL(fileURLWithPath: path, isDirectory: true).lastPathComponent
+        if let rootURL {
+            return rootURL.appendingPathComponent(name, isDirectory: true)
+        }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
 }
 
 struct TrashedGame: Sendable {
@@ -1021,6 +1645,42 @@ struct BatchDeleteResult: Sendable {
     var updatedGames: [GameEntry]
 }
 
+/// Thread-safe byte progress for permanent delete (avoids mutating captured `var` in Sendable closures).
+/// `nonisolated` opts out of default MainActor isolation (delete runs off the main actor).
+private nonisolated final class ProgressByteCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Int64 = 0
+    private let total: Int64
+    private let report: (@Sendable (Double) -> Void)?
+
+    init(total: Int64, report: (@Sendable (Double) -> Void)?) {
+        self.total = max(1, total)
+        self.report = report
+    }
+
+    var completed: Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func add(_ bytes: Int64) {
+        lock.lock()
+        value += max(0, bytes)
+        let frac = min(1, Double(value) / Double(total))
+        lock.unlock()
+        report?(frac)
+    }
+
+    func report(_ absoluteCompleted: Int64) {
+        lock.lock()
+        value = max(value, absoluteCompleted)
+        let frac = min(1, Double(value) / Double(total))
+        lock.unlock()
+        report?(frac)
+    }
+}
+
 enum OperationError: LocalizedError {
     case emptyName
     case gameNotFound
@@ -1031,6 +1691,8 @@ enum OperationError: LocalizedError {
     case importNoDiscImage(String)
     case importUnsupported(String)
     case importUnreadable(String)
+    case importMissingTracks(String, [String])
+    case importArchiveFailed(String, String)
 
     var errorDescription: String? {
         switch self {
@@ -1044,9 +1706,16 @@ enum OperationError: LocalizedError {
         case .importNoDiscImage(let name):
             return "No disc image (.gdi / .cdi / .ccd) found in “\(name)”."
         case .importUnsupported(let name):
-            return "Unsupported file “\(name)”. Choose a .gdi, .cdi, .ccd, or a game folder."
+            return "Unsupported file “\(name)”. Choose a disc image (.gdi / .cdi / .ccd), .zip, or a game folder."
         case .importUnreadable(let name):
             return "Cannot read “\(name)”."
+        case .importMissingTracks(let gdi, let tracks):
+            let list = tracks.prefix(4).joined(separator: ", ")
+            let more = tracks.count > 4 ? "…" : ""
+            let plural = tracks.count == 1 ? "" : "s"
+            return "“\(gdi)” is missing track file\(plural): \(list)\(more)."
+        case .importArchiveFailed(let name, let reason):
+            return "Could not open archive “\(name)”: \(reason)"
         }
     }
 }

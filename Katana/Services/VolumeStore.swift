@@ -13,10 +13,10 @@ struct RememberedVolume: Codable, Identifiable, Hashable, Sendable {
     var displayPath: String { lastPath }
 }
 
-private struct VolumePreferences: Codable, Sendable {
+private nonisolated struct VolumePreferences: Codable, Sendable {
     var lastVolumeUUID: String?
     var recents: [RememberedVolume]
-    /// Per-volume visual table sort (does not affect disc numbering).
+    /// Per-volume visual table sort (does not affect on-card slot numbering).
     var displaySortByVolume: [String: DisplaySortPreference]
     /// Per-volume GDmenu vs openMenu preference (rebuild target).
     var menuKindByVolume: [String: MenuKind]

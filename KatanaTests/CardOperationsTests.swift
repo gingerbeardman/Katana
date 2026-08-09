@@ -160,6 +160,7 @@ struct CardOperationsTests {
         var preparedName: String?
         var sawFinished = false
         var lastFraction: Double = -1
+        var sawSegmentedProgress = false
 
         let games = try loadEntries(root: root)
         let result = try CardOperations.importDiscs(
@@ -178,6 +179,9 @@ struct CardOperationsTests {
                     sawFinished = true
                 case .fraction(let f):
                     lastFraction = f
+                case .copyProgress(let f, let ends):
+                    lastFraction = f
+                    if ends.count >= 1 { sawSegmentedProgress = true }
                 default:
                     break
                 }
@@ -188,6 +192,7 @@ struct CardOperationsTests {
         #expect(preparedName == "SoulCalibur")
         #expect(sawFinished)
         #expect(lastFraction == 1)
+        #expect(sawSegmentedProgress)
         #expect(result.added.count == 1)
         #expect(result.added[0].name == "SoulCalibur")
     }
@@ -277,6 +282,217 @@ struct CardOperationsTests {
         #expect(fm.fileExists(atPath: root.appendingPathComponent("01/name.txt").path))
     }
 
+    @Test func gdiReferencedFileNamesParsesCue() {
+        let text = """
+        3
+        1 0 4 2048 track01.bin 0
+        2 45000 4 2048 "track 03.iso" 0
+        3 50000 0 2352 subdir\\track04.raw 0
+        """
+        let names = CardOperations.gdiReferencedFileNames(in: text)
+        #expect(names == ["track01.bin", "track 03.iso", "track04.raw"])
+    }
+
+    /// Redump Power Smash cue: quoted names with spaces; IP.BIN lives on data tracks.
+    @Test func redumpQuotedGdiCueAndIPBIN() throws {
+        let text = """
+        3
+        1     0 4 2352 "Power Smash - Sega Professional Tennis (Japan) (Track 1).bin" 0
+        2   300 0 2352 "Power Smash - Sega Professional Tennis (Japan) (Track 2).bin" 0
+        3 45000 4 2352 "Power Smash - Sega Professional Tennis (Japan) (Track 3).bin" 0
+        """
+        let names = GdiCue.referencedFileNames(in: text)
+        #expect(names.count == 3)
+        #expect(names[0].contains("(Track 1).bin"))
+        #expect(names[1].contains("(Track 2).bin"))
+        #expect(names[2].contains("(Track 3).bin"))
+        let dataTracks = GdiCue.dataTracksForIPBIN(in: text)
+        #expect(dataTracks.count == 2)
+        #expect(dataTracks[0].lba >= 45_000) // HD first
+        #expect(dataTracks.map(\.fileName) == [names[2], names[0]])
+
+        let folder = URL(fileURLWithPath:
+            "/Users/matt/Downloads/1234_JD/almstcmpltdrmcst/almstcmpltdrmcst/Power Smash - Sega Professional Tennis (Japan)",
+            isDirectory: true
+        )
+        guard FileManager.default.fileExists(atPath: folder.path) else { return }
+
+        let gdiName = (try? FileManager.default.contentsOfDirectory(atPath: folder.path))?
+            .first { $0.lowercased().hasSuffix(".gdi") && !$0.hasPrefix(".") }
+        guard let gdiName else { return }
+
+        let ip = IpBinReader.read(folderURL: folder, imageFileName: gdiName, format: .gdi)
+        #expect(ip != nil, "IP.BIN should resolve via quoted GDI track names")
+        #expect(ip?.productNumber == "HDR-0113")
+        #expect(ip?.name.uppercased().contains("POWER SMASH") == true)
+    }
+
+    @Test func copyProgressSegmentsAreByteWeighted() throws {
+        // Two tracks + cue → size-weighted notches; fill jumps only after each file completes.
+        let fm = FileManager.default
+        let root = try makeFixture(names: ["GDMENU"])
+        defer { try? fm.removeItem(at: root) }
+        let src = fm.temporaryDirectory.appendingPathComponent("katana-seg-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: src, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: src) }
+
+        let gdi = """
+        2
+        1 0 4 2048 small.bin 0
+        2 45000 4 2048 large.bin 0
+        """
+        try gdi.write(to: src.appendingPathComponent("game.gdi"), atomically: true, encoding: .utf8)
+        try Data(repeating: 1, count: 100).write(to: src.appendingPathComponent("small.bin"))
+        try Data(repeating: 2, count: 900).write(to: src.appendingPathComponent("large.bin"))
+
+        var lastEnds: [Double] = []
+        var maxFraction: Double = 0
+        var midFractions: [Double] = []
+        let games = try loadEntries(root: root)
+        _ = try CardOperations.importDiscs(
+            sources: [src.appendingPathComponent("game.gdi")],
+            games: games,
+            rootURL: root,
+            onEvent: { event in
+                if case .copyProgress(let f, let ends) = event {
+                    maxFraction = max(maxFraction, f)
+                    if ends.count >= 2 { lastEnds = ends }
+                    // Before the final 1.0 emit, bar must stay under full (finalize hold).
+                    if f < 1 { midFractions.append(f) }
+                }
+            }
+        )
+        #expect(maxFraction == 1)
+        #expect(lastEnds.count == 3) // gdi + small + large
+        // Largest segment should be the last track (900 bytes of ~1000+ payload).
+        guard lastEnds.count >= 2 else { return }
+        let starts = [0.0] + lastEnds.dropLast()
+        let widths = zip(starts, lastEnds).map { $1 - $0 }
+        #expect(widths.max()! >= 0.7) // large.bin dominates
+        // Discrete notches: every pre-final fraction is a segment end (or 0), never mid-file crawl.
+        let notchSet = Set(lastEnds.map { ($0 * 1000).rounded() / 1000 })
+        for f in midFractions where f > 0 {
+            let rounded = (f * 1000).rounded() / 1000
+            // Cap after last file is 0.99, not a free-running byte fraction.
+            #expect(notchSet.contains(rounded) || abs(f - 0.99) < 0.001)
+        }
+        #expect(midFractions.contains(where: { abs($0 - 0.99) < 0.001 })
+                || midFractions.allSatisfy { $0 < 1 })
+    }
+
+    @Test func resolveGDIPackageCopiesOnlyCueTracks() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("katana-gdi-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        let gdi = """
+        2
+        1 0 4 2048 track01.bin 0
+        2 45000 4 2048 track03.bin 0
+        """
+        try gdi.write(to: dir.appendingPathComponent("game.gdi"), atomically: true, encoding: .utf8)
+        try Data("a".utf8).write(to: dir.appendingPathComponent("track01.bin"))
+        try Data("b".utf8).write(to: dir.appendingPathComponent("track03.bin"))
+        try Data("noise".utf8).write(to: dir.appendingPathComponent("readme.txt"))
+        try Data("other".utf8).write(to: dir.appendingPathComponent("other.cdi"))
+
+        let source = try CardOperations.resolveGDIPackage(gdiURL: dir.appendingPathComponent("game.gdi"))
+        #expect(source.imageFileName == "game.gdi")
+        #expect(Set(source.fileNames ?? []) == Set(["game.gdi", "track01.bin", "track03.bin"]))
+        #expect(!(source.fileNames ?? []).contains("readme.txt"))
+        #expect(!(source.fileNames ?? []).contains("other.cdi"))
+    }
+
+    @Test func multiSelectGroupsGDIAndTracksIntoOnePackage() throws {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("katana-multi-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        let gdi = """
+        2
+        1 0 4 2048 track01.bin 0
+        2 45000 4 2048 track03.bin 0
+        """
+        let gdiURL = dir.appendingPathComponent("set.gdi")
+        try gdi.write(to: gdiURL, atomically: true, encoding: .utf8)
+        let t1 = dir.appendingPathComponent("track01.bin")
+        let t3 = dir.appendingPathComponent("track03.bin")
+        try Data("a".utf8).write(to: t1)
+        try Data("b".utf8).write(to: t3)
+
+        // Simulate Finder multi-select of cue + tracks (order shouldn't matter).
+        let discovery = CardOperations.resolveImportSources([t3, gdiURL, t1])
+        #expect(discovery.sources.count == 1)
+        #expect(discovery.skipped.isEmpty)
+        #expect(Set(discovery.sources[0].fileNames ?? []) == Set(["set.gdi", "track01.bin", "track03.bin"]))
+    }
+
+    /// Real Redump-style set with quoted track names (spaces + parentheses).
+    @Test func resolvePowerSmashExampleIfPresent() throws {
+        let folder = URL(fileURLWithPath:
+            "/Users/matt/Downloads/1234_JD/almstcmpltdrmcst/almstcmpltdrmcst/Power Smash - Sega Professional Tennis (Japan)",
+            isDirectory: true
+        )
+        guard FileManager.default.fileExists(atPath: folder.path) else { return }
+
+        let source = try CardOperations.resolveImportSource(folder)
+        #expect(source.imageFileName.hasSuffix(".gdi"))
+        let names = Set(source.fileNames ?? [])
+        #expect(names.contains(source.imageFileName))
+        #expect(names.contains { $0.contains("(Track 1).bin") })
+        #expect(names.contains { $0.contains("(Track 2).bin") })
+        #expect(names.contains { $0.contains("(Track 3).bin") })
+        // Must not pull the sibling .7z into the game folder.
+        #expect(!names.contains { $0.lowercased().hasSuffix(".7z") })
+
+        // Multi-select cue + tracks (no folder) should group to one package.
+        let gdi = folder.appendingPathComponent(source.imageFileName)
+        let tracks = (source.fileNames ?? []).filter { $0 != source.imageFileName }.map {
+            folder.appendingPathComponent($0)
+        }
+        let discovery = CardOperations.resolveImportSources([tracks[0], gdi] + Array(tracks.dropFirst()))
+        #expect(discovery.sources.count == 1)
+        #expect(Set(discovery.sources[0].fileNames ?? []) == names)
+    }
+
+    @Test func importZipWithGameFolder() throws {
+        let root = try makeFixture(names: ["GDMENU"])
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let fm = FileManager.default
+        let work = fm.temporaryDirectory.appendingPathComponent("katana-zip-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: work, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: work) }
+
+        let gameDir = work.appendingPathComponent("SHIPPLAY", isDirectory: true)
+        try fm.createDirectory(at: gameDir, withIntermediateDirectories: true)
+        try Data("gdi".utf8).write(to: gameDir.appendingPathComponent("disc.gdi"))
+        try Data("track".utf8).write(to: gameDir.appendingPathComponent("track01.bin"))
+
+        // Build a store-only ZIP (method 0) with local file headers ZipExtractor understands.
+        let zipURL = work.appendingPathComponent("pack.zip")
+        try writeMinimalStoreZip(
+            at: zipURL,
+            entries: [
+                ("SHIPPLAY/disc.gdi", Data("gdi".utf8)),
+                ("SHIPPLAY/track01.bin", Data("track".utf8)),
+            ]
+        )
+
+        let games = try loadEntries(root: root)
+        let result = try CardOperations.importDiscs(
+            sources: [zipURL],
+            games: games,
+            rootURL: root
+        )
+        #expect(result.added.count == 1)
+        #expect(result.skipped.isEmpty)
+        #expect(fm.fileExists(atPath: root.appendingPathComponent("02/disc.gdi").path))
+        #expect(fm.fileExists(atPath: root.appendingPathComponent("02/track01.bin").path))
+    }
+
     // MARK: - Fixtures
 
     private func makeFixture(names: [String]) throws -> URL {
@@ -293,6 +509,78 @@ struct CardOperationsTests {
             try Data("x".utf8).write(to: folder.appendingPathComponent("disc.cdi"))
         }
         return root
+    }
+
+    /// Minimal ZIP with store (method 0) entries for import tests.
+    private func writeMinimalStoreZip(at url: URL, entries: [(String, Data)]) throws {
+        var data = Data()
+        var central = Data()
+        var offsets: [UInt32] = []
+
+        for (name, payload) in entries {
+            let nameData = Data(name.utf8)
+            offsets.append(UInt32(data.count))
+            // Local file header
+            data.append(contentsOf: u32(0x0403_4b50))
+            data.append(contentsOf: u16(20)) // version
+            data.append(contentsOf: u16(0)) // flags
+            data.append(contentsOf: u16(0)) // method store
+            data.append(contentsOf: u16(0)) // time
+            data.append(contentsOf: u16(0)) // date
+            data.append(contentsOf: u32(0)) // crc (0 ok for our reader)
+            data.append(contentsOf: u32(UInt32(payload.count)))
+            data.append(contentsOf: u32(UInt32(payload.count)))
+            data.append(contentsOf: u16(UInt16(nameData.count)))
+            data.append(contentsOf: u16(0)) // extra
+            data.append(nameData)
+            data.append(payload)
+
+            // Central directory header
+            central.append(contentsOf: u32(0x0201_4b50))
+            central.append(contentsOf: u16(20))
+            central.append(contentsOf: u16(20))
+            central.append(contentsOf: u16(0))
+            central.append(contentsOf: u16(0))
+            central.append(contentsOf: u16(0))
+            central.append(contentsOf: u16(0))
+            central.append(contentsOf: u32(0))
+            central.append(contentsOf: u32(UInt32(payload.count)))
+            central.append(contentsOf: u32(UInt32(payload.count)))
+            central.append(contentsOf: u16(UInt16(nameData.count)))
+            central.append(contentsOf: u16(0))
+            central.append(contentsOf: u16(0))
+            central.append(contentsOf: u16(0))
+            central.append(contentsOf: u16(0))
+            central.append(contentsOf: u32(0))
+            central.append(contentsOf: u32(offsets.last!))
+            central.append(nameData)
+        }
+
+        let centralOffset = UInt32(data.count)
+        data.append(central)
+        // End of central directory
+        data.append(contentsOf: u32(0x0605_4b50))
+        data.append(contentsOf: u16(0))
+        data.append(contentsOf: u16(0))
+        data.append(contentsOf: u16(UInt16(entries.count)))
+        data.append(contentsOf: u16(UInt16(entries.count)))
+        data.append(contentsOf: u32(UInt32(central.count)))
+        data.append(contentsOf: u32(centralOffset))
+        data.append(contentsOf: u16(0))
+        try data.write(to: url)
+    }
+
+    private func u16(_ v: UInt16) -> [UInt8] {
+        [UInt8(v & 0xff), UInt8((v >> 8) & 0xff)]
+    }
+
+    private func u32(_ v: UInt32) -> [UInt8] {
+        [
+            UInt8(v & 0xff),
+            UInt8((v >> 8) & 0xff),
+            UInt8((v >> 16) & 0xff),
+            UInt8((v >> 24) & 0xff),
+        ]
     }
 
     private func loadEntries(root: URL) throws -> [GameEntry] {

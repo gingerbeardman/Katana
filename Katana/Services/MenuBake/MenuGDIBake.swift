@@ -13,6 +13,8 @@ nonisolated enum MenuGDIBake: Sendable {
         var assetsRoot: URL
         var outDir: URL
         var truncate: Bool = true
+        /// Optional bake progress: message + fraction **within this bake** (0…1).
+        var progress: (@Sendable (String, Double) -> Void)? = nil
     }
 
     /// Bake a complete menu_gdi directory at `options.outDir`.
@@ -20,6 +22,7 @@ nonisolated enum MenuGDIBake: Sendable {
         let fm = FileManager.default
         let volId = options.kind.volumeIdentifier
         let listName = options.kind.listFileName
+        let report = options.progress
 
         let tempRoot = fm.temporaryDirectory
             .appendingPathComponent("menugdi-native-\(UUID().uuidString)", isDirectory: true)
@@ -56,11 +59,14 @@ nonisolated enum MenuGDIBake: Sendable {
             throw BakeError.missingAssets(ipbin.path)
         }
 
+        report?("Staging menu assets…", 0.05)
         try copyDirectory(from: menuData, to: dataPath)
+        report?("Staging menu assets…", 0.20)
         try copyDirectory(from: menuGdi, to: cdiPath)
         if fm.fileExists(atPath: menuLow.path) {
             try copyDirectory(from: menuLow, to: lowdataPath)
         }
+        report?("Writing list…", 0.30)
 
         let listData = Data(options.listText.utf8)
         try listData.write(to: lowdataPath.appendingPathComponent(listName), options: .atomic)
@@ -78,6 +84,7 @@ nonisolated enum MenuGDIBake: Sendable {
             (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
         }
 
+        report?("Building low-density track…", 0.40)
         try builder.createFirstTrack(
             destinationIso: cdiPath.appendingPathComponent("track01.iso"),
             files: lowFiles
@@ -89,16 +96,19 @@ nonisolated enum MenuGDIBake: Sendable {
             cdda.append(track04)
         }
 
+        report?("Building high-density tracks…", 0.55)
         let tracks = try builder.buildGDROM(
             dataDirectory: dataPath,
             ipBinURL: ipbin,
             cddaTracks: cdda,
             outDir: cdiPath
         )
+        report?("Writing disc.gdi…", 0.92)
         try builder.updateGdiFile(
             tracks: tracks,
             gdiPath: cdiPath.appendingPathComponent("disc.gdi")
         )
+        report?("Bake complete", 1.0)
     }
 
     // MARK: - Helpers

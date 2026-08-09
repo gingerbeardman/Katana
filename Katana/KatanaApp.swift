@@ -7,6 +7,9 @@ struct KatanaApp: App {
 
     init() {
         LaunchTrace.mark("KatanaApp.init")
+        // Wire Delete → Delete Immediately… as ⌥-alternates on native NSMenus
+        // (SwiftUI has no isAlternate API; pattern from 2UP).
+        MenuOptionAlternates.install()
     }
 
     var body: some Scene {
@@ -70,7 +73,7 @@ struct KatanaApp: App {
                 .keyboardShortcut("n", modifiers: [.command, .shift])
                 .disabled(!state.canAddGames)
 
-                Button("Apply A–Z Order to Disc") {
+                Button("Apply A–Z Order to Card") {
                     state.sortAlphabetically()
                 }
                 .disabled(state.volume == nil || state.isBusy)
@@ -111,7 +114,7 @@ struct KatanaApp: App {
                     .help(
                         state.isBusy
                             ? "Wait for the current operation (e.g. menu rebuild) to finish before hashing."
-                            : "Background SHA-256 of disc payload; writes sidecars. Not available during menu rebuild."
+                            : "Background SHA-256 of game payload; writes sidecars. Not available during menu rebuild."
                     )
 
                     Button(state.isStoppingHashing ? "Stopping…" : "Stop Hashing") {
@@ -177,6 +180,8 @@ struct KatanaApp: App {
                 }
                 .disabled(state.selection.isEmpty || state.isBusy)
 
+                // Pair: soft Delete + ⌥-alternate Delete Immediately… (wired on the
+                // native NSMenu by MenuOptionAlternates — only one row shows at a time).
                 Button(state.selection.count > 1
                        ? "Delete \(state.selection.count) Games"
                        : "Delete Selected") {
@@ -185,16 +190,26 @@ struct KatanaApp: App {
                 .keyboardShortcut(.delete, modifiers: [])
                 // ⌫ must delete characters in a text field, not games.
                 .disabled(!state.canDeleteSelection || state.isTextInputFocused)
+                .help("Soft-delete to card trash (fast, undoable). Hold ⌥ for Delete Immediately.")
+
+                Button(state.selection.count > 1
+                       ? "Delete \(state.selection.count) Games Immediately…"
+                       : "Delete Immediately…") {
+                    state.deleteSelectedImmediately()
+                }
+                .keyboardShortcut(.delete, modifiers: [.option])
+                .disabled(!state.canDeleteSelection || state.isTextInputFocused)
+                .help("Erase from the card now — not moved to trash; cannot be undone")
 
                 Divider()
 
-                Button("Move Up on Disc") {
+                Button("Move Up on Card") {
                     state.moveSelection(up: true)
                 }
                 .disabled(!state.canMoveSelectionUp || state.isBusy)
                 .help("Lower SD slot number for the selection (not table sort)")
 
-                Button("Move Down on Disc") {
+                Button("Move Down on Card") {
                     state.moveSelection(up: false)
                 }
                 .disabled(!state.canMoveSelectionDown || state.isBusy)

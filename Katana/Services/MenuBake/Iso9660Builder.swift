@@ -518,7 +518,7 @@ nonisolated final class Iso9660Builder: @unchecked Sendable {
         for di in dirs {
             primaryLocation[ObjectIdentifier(di)] = UInt32(focus / sector)
             let dirLen = di.dataSize()
-            var buf = [UInt8](repeating: 0, count: Int(dirLen))
+            let buf = [UInt8](repeating: 0, count: Int(dirLen))
             // Locations for dirs are temporary; rewritten after path-table push with LBA.
             // We'll rebuild directory bytes after final locations are known.
             fixedRegions.insert(

@@ -9,7 +9,7 @@ struct ScanResult: Sendable {
     var durationMilliseconds: Int
 }
 
-/// Disc scanning runs **off the main actor** (project defaults to MainActor isolation).
+/// Card scanning runs **off the main actor** (project defaults to MainActor isolation).
 ///
 /// Initial scan is intentionally **lazy**:
 /// - Lists file *names*, finds the disc image, reads `name.txt` / `serial.txt`, stats the image only.
@@ -170,7 +170,7 @@ enum CardScanner: Sendable {
         }
 
         // Load cache from Application Support first (SSD) — do not wait on SD readdir.
-        let cached = try await LaunchTrace.measureAsync("CardCacheStore.load") {
+        let cached = await LaunchTrace.measureAsync("CardCacheStore.load") {
             try? await CardCacheStore.shared.load(volumeUUID: volume.volumeUUID)
         }
         LaunchTrace.mark("CardCacheStore.load entries=\(cached?.entries.count ?? 0)")

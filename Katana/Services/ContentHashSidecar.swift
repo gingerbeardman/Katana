@@ -307,7 +307,7 @@ enum HashError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .noPayload: return "No disc payload files to hash."
+        case .noPayload: return "No game payload files to hash."
         case .unreadable(let name): return "Could not read \(name)."
         }
     }

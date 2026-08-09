@@ -11,8 +11,8 @@ struct MenuListGeneratorTests {
         #expect(MenuListGenerator.formatFolderNumber(1000) == "1000")
     }
 
-    /// On a 100+ game card every list key uses 3 digits so they match folders `001`…`278`.
-    @Test func listKeysUseCardWideWidth() {
+    /// On a 100+ game card: menu stays `01` (GCM); game slots use 3-digit keys (`002`…).
+    @Test func listKeysMatchGCMFolderLayout() {
         let items = [
             MenuListGenerator.Item(
                 number: 1,
@@ -34,12 +34,12 @@ struct MenuListGeneratorTests {
             ),
         ]
         let text = MenuListGenerator.makeGDMenuList(items: items, maxNumber: 278)
-        #expect(text.contains("001.name=GDMENU"))
+        #expect(text.hasPrefix("[GDMENU]\n01.name=GDMENU") || text.contains("\n01.name=GDMENU"))
+        #expect(text.contains("01.name=GDMENU"))
         #expect(text.contains("002.name=Sonic"))
         #expect(text.contains("100.name=Jet Grind Radio"))
-        // No 2-digit keys on a 3-digit card (avoid substring false positives on "001").
-        #expect(!text.contains("\n01.name="))
-        #expect(!text.hasPrefix("01.name="))
+        // Menu must not be written as 001; games must not use 2-digit keys.
+        #expect(!text.contains("001.name="))
         #expect(!text.contains("\n02.name="))
     }
 

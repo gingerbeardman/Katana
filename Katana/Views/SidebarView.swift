@@ -96,7 +96,7 @@ struct SidebarView: View {
                     let freeLine: String = {
                         var s = "\(state.formatSize(free, capacityHint: total)) free of \(state.formatSize(total, capacityHint: total))"
                         if !state.trashSummary.isEmpty {
-                            let trashSize = state.formatSize(
+                            let trashSize = state.formatTrashSize(
                                 state.trashSummary.totalBytes,
                                 capacityHint: total
                             )

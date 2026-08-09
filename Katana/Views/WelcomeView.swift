@@ -93,7 +93,7 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         WelcomeFeature(
             icon: "pencil.and.list.clipboard",
             title: "Rename & Reorder",
-            description: "Edit names, sort A–Z, or drag order onto the disc. Changes write immediately — undo with ⌘Z."
+            description: "Edit names, sort A–Z, or renumber games on the card. Changes write immediately — undo with ⌘Z."
         ),
         WelcomeFeature(
             icon: "square.stack.3d.up.badge.a",

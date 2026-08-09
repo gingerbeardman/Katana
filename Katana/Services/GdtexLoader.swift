@@ -70,19 +70,15 @@ enum GdtexLoader: Sendable {
     /// Pull 0GDTEX.PVR from GDI data tracks via ISO 9660 (multi-track aware).
     private nonisolated static func extractFromGDI(folderURL: URL, gdiFileName: String) -> Data? {
         let gdiURL = folderURL.appendingPathComponent(gdiFileName)
-        guard let text = try? String(contentsOf: gdiURL, encoding: .utf8) else { return nil }
+        let text = (try? String(contentsOf: gdiURL, encoding: .utf8))
+            ?? (try? String(contentsOf: gdiURL, encoding: .isoLatin1))
+        guard let text else { return nil }
 
         var tracks: [Iso9660FileExtractor.DataTrack] = []
-        for line in text.split(whereSeparator: \.isNewline) {
-            let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-            guard parts.count >= 5,
-                  let lba = UInt32(parts[1]),
-                  let type = Int(parts[2]),
-                  type == 4
-            else { continue }
-            let trackURL = folderURL.appendingPathComponent(parts[4])
+        for track in GdiCue.parseTracks(in: text) where track.type == 4 {
+            let trackURL = folderURL.appendingPathComponent(track.fileName)
             guard FileManager.default.fileExists(atPath: trackURL.path) else { continue }
-            tracks.append(.init(lba: lba, url: trackURL))
+            tracks.append(.init(lba: UInt32(track.lba), url: trackURL))
         }
         guard !tracks.isEmpty else { return nil }
         return Iso9660FileExtractor.extract(named: "0GDTEX.PVR", tracks: tracks)

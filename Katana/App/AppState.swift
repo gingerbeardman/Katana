@@ -40,7 +40,7 @@ final class AppState {
     /// Bumped while the table is filling so the list can scroll to the newest row.
     var scrollTargetGameID: GameEntry.ID?
     var searchText: String = ""
-    /// Master switch for the duplicates suite (sidebar, markers, commands). Default **on** (opt-out).
+    /// Master switch for the duplicates suite (sidebar, markers, commands). Default **off**.
     var duplicatesEnabled: Bool = AppState.loadDuplicatesEnabled() {
         didSet {
             UserDefaults.standard.set(duplicatesEnabled, forKey: AppState.duplicatesEnabledKey)
@@ -117,6 +117,8 @@ final class AppState {
     var busyMessage: String?
     /// 0…1 for mutation edge bar (`nil` while busy = indeterminate).
     var mutationProgress: Double?
+    /// Cumulative segment ends (0…1) for multi-file import dividers; size-weighted.
+    var mutationProgressSegments: [Double]?
     /// Rows currently hashing/copying during Add Games (per-row spinner).
     private(set) var activeImportGameIDs: Set<UUID> = []
     /// Live scan progress for the status line / table chrome (`nil` when idle).
@@ -229,10 +231,10 @@ final class AppState {
         return UserDefaults.standard.bool(forKey: isInspectorPresentedKey)
     }
 
-    /// Default on — feature is opt-out.
+    /// Default off until the user opts in (Settings / View menu).
     private static func loadDuplicatesEnabled() -> Bool {
         if UserDefaults.standard.object(forKey: duplicatesEnabledKey) == nil {
-            return true
+            return false
         }
         return UserDefaults.standard.bool(forKey: duplicatesEnabledKey)
     }
@@ -266,9 +268,14 @@ final class AppState {
         return formatSize(game.byteSize)
     }
 
-    /// Volume chrome: sidebar free/capacity/trash and title-bar totals — **GB** when large.
+    /// Volume chrome: sidebar free/capacity and title-bar totals — **GB** when large.
     func formatSize(_ bytes: Int64, capacityHint: Int64?) -> String {
         ByteCount.volumeSizeString(for: bytes, integerMegabytes: sizesAsIntegerMB, capacityHint: capacityHint)
+    }
+
+    /// Soft-deleted trash size — never formats non-empty trash as `0 GB` (min `0.1 GB`).
+    func formatTrashSize(_ bytes: Int64, capacityHint: Int64?) -> String {
+        ByteCount.trashSizeString(for: bytes, integerMegabytes: sizesAsIntegerMB, capacityHint: capacityHint)
     }
 
     private static func loadInspectorSections() -> [String: Bool] {
@@ -418,7 +425,7 @@ final class AppState {
     /// Full detail for tooltips (rate, counts).
     var hashingHelpText: String {
         guard let progress = hashingProgress else {
-            return "Hashing disc content"
+            return "Hashing game content"
         }
         var lines = ["\(progress.completedCount) of \(progress.totalCount) games"]
         if progress.hashedBytes > 0 {
@@ -454,7 +461,7 @@ final class AppState {
     var filteredGames: [GameEntry] {
         // Never remove rows for “Show duplicates only” — that reflows the table.
         // Non-dups are dimmed via `isDeemphasizedInList` once analysis finishes.
-        var list = games
+        let list = games
 
         let q = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return list }
@@ -1068,12 +1075,19 @@ final class AppState {
             return
         }
 
-        // If caller already started security scope, keep it; otherwise try now.
+        // Session grant: stop previous card, bind this URL (Open panel / bookmark resolve).
+        // Hold access for the whole session — same model as 2UP’s SecurityScopedBookmarkStore.
         if accessURL?.standardizedFileURL != url.standardizedFileURL {
-            stopAccess()
-            if url.startAccessingSecurityScopedResource() {
-                accessURL = url
-            }
+            accessURL?.stopAccessingSecurityScopedResource()
+            accessURL = nil
+        }
+        if bookmarkData == nil {
+            bookmarkData = preexistingBookmark
+        }
+        // Bind before scan/mutations so every I/O uses a live scoped root.
+        let existingAccessOK = accessURL.map { probeCardWritable($0) } ?? false
+        if !existingAccessOK {
+            _ = bindCardAccess(url, replaceBookmarkIfStale: false, existingBookmark: preexistingBookmark ?? bookmarkData)
         }
 
         lastError = nil
@@ -1104,11 +1118,14 @@ final class AppState {
         }
         let preferredForEarly = lockedVolumeUUID
 
+        // Prefer the scoped session URL for identity/chrome so rootURL keeps write access.
+        let scopedOpenURL = accessURL ?? url
+
         // Show volume chrome immediately; table fills as folders are identified.
         // Resolve off main — capacity/read-only queries can stall on slow SD readers.
         let earlyVolume = await LaunchTrace.measureAsync("VolumeIdentity.resolve (detached)") {
             await Task.detached(priority: .userInitiated) {
-                try? VolumeIdentity.resolve(rootURL: url, preferredUUID: preferredForEarly)
+                try? VolumeIdentity.resolve(rootURL: scopedOpenURL, preferredUUID: preferredForEarly)
             }.value
         }
         if let resolved = earlyVolume {
@@ -1127,12 +1144,6 @@ final class AppState {
         // Let SwiftUI paint chrome before scan work.
         await Task.yield()
 
-        // Keep any preexisting security-scope bookmark for this open; refresh off the
-        // critical path (bookmark creation can stall seconds on some SD readers).
-        if bookmarkData == nil {
-            bookmarkData = preexistingBookmark
-        }
-
         do {
             // Recent / reopen: paint from Application Support cache without waiting on SD readdir.
             let preferSnapshot = !forceRescan
@@ -1141,15 +1152,15 @@ final class AppState {
             }
 
             let preferredForScan = lockedVolumeUUID
-            var firstProgressAt: CFAbsoluteTime?
+            let scanRoot = accessURL ?? url
+            let firstProgressMark = FirstProgressMark()
             let result = try await LaunchTrace.measureAsync("CardScanner.scan preferSnapshot=\(preferSnapshot)") {
                 try await CardScanner.scan(
-                    rootURL: url,
+                    rootURL: scanRoot,
                     preferSnapshotCache: preferSnapshot,
                     preferredVolumeUUID: preferredForScan
                 ) { event in
-                    if firstProgressAt == nil {
-                        firstProgressAt = CFAbsoluteTimeGetCurrent()
+                    firstProgressMark.markOnce {
                         LaunchTrace.mark(
                             "scan first progress: \(event.entries.count) entries completed=\(event.completed)/\(event.total)"
                         )
@@ -1207,7 +1218,8 @@ final class AppState {
             startLazyDetailEnrichment(volumeUUID: result.volume.volumeUUID)
 
             let rememberVolume = result.volume
-            let rememberRoot = url
+            // Persist bookmark for the scoped session URL, not a path-only rebuild.
+            let rememberRoot = accessURL ?? url
             let rememberBookmark = bookmarkData
             let needsNotDup = notDuplicateKeys.isEmpty
             Task {
@@ -1283,9 +1295,7 @@ final class AppState {
                 if Task.isCancelled { return }
                 let end = min(i + batchSize, work.count)
                 let batch = Array(work[i..<end])
-                var batchResults: [(UUID, CardScanner.FolderDetails)] = []
-                batchResults.reserveCapacity(batch.count)
-                await withTaskGroup(of: (UUID, CardScanner.FolderDetails)?.self) { group in
+                let batchResults = await withTaskGroup(of: (UUID, CardScanner.FolderDetails)?.self) { group in
                     for item in batch {
                         group.addTask {
                             guard let details = try? CardScanner.loadFolderDetails(
@@ -1294,9 +1304,12 @@ final class AppState {
                             return (item.id, details)
                         }
                     }
+                    var collected: [(UUID, CardScanner.FolderDetails)] = []
+                    collected.reserveCapacity(batch.count)
                     for await result in group {
-                        if let result { batchResults.append(result) }
+                        if let result { collected.append(result) }
                     }
+                    return collected
                 }
                 if !batchResults.isEmpty {
                     await MainActor.run {
@@ -1640,7 +1653,7 @@ final class AppState {
     }
 
     /// Prefer saved choice for picker; always set `bakedMenuKind` from what’s on the card.
-    /// Detection may open the menu disc image (IP.BIN) — always off the main actor.
+    /// Detection may open the menu image (IP.BIN) — always off the main actor.
     private func resolveMenuKind(for volumeUUID: String, games: [GameEntry]) async {
         let snapshot = games
         let detected = await LaunchTrace.measureAsync("detectMenuKind (detached)") {
@@ -1866,8 +1879,10 @@ final class AppState {
     /// Permanently remove soft-deleted games from `.katana-trash` (with confirmation).
     func emptyCardTrash() {
         guard let volume, !isBusy, !volume.isReadOnly else { return }
+        if !requestCardWriteAccess() { return }
 
-        let root = volume.rootURL
+        // Session-held security-scoped root (2UP pattern) — never re-standardize.
+        let root = accessURL ?? volume.rootURL
         let volumeName = volume.volumeName
         let capacity = volume.totalBytes
         let progress = makeProgressHandler()
@@ -1884,7 +1899,7 @@ final class AppState {
             }
 
             let countWord = summary.itemCount == 1 ? "item" : "items"
-            let sizeLabel = formatSize(summary.totalBytes, capacityHint: capacity)
+            let sizeLabel = formatTrashSize(summary.totalBytes, capacityHint: capacity)
 
             let alert = NSAlert()
             alert.messageText = "Empty card Trash?"
@@ -1905,14 +1920,31 @@ final class AppState {
             }
             guard alert.runModal() == .alertFirstButtonReturn else { return }
 
+            // Re-bind if needed; stop background hashers so FAT can delete open files.
+            if !requestCardWriteAccess() { return }
+            await cancelBackgroundCardReaders()
+            let liveRoot = accessURL ?? root
+
             beginMutation("Emptying trash…")
             defer { endMutation() }
+
             do {
-                let result = try await Task.detached(priority: .userInitiated) {
-                    try CardOperations.emptyTrash(rootURL: root, progress: progress)
-                }.value
+                var result: CardOperations.EmptyTrashResult
+                do {
+                    result = try await Task.detached(priority: .userInitiated) {
+                        try CardOperations.emptyTrash(rootURL: liveRoot, progress: progress)
+                    }.value
+                } catch {
+                    // One retry after re-grant if the session grant died mid-dialog.
+                    guard isPermissionError(error), requestCardWriteAccess() else { throw error }
+                    let retryRoot = accessURL ?? liveRoot
+                    result = try await Task.detached(priority: .userInitiated) {
+                        try CardOperations.emptyTrash(rootURL: retryRoot, progress: progress)
+                    }.value
+                }
+
                 let preferred = self.volume?.volumeUUID
-                if let resolved = try? VolumeIdentity.resolve(rootURL: root, preferredUUID: preferred) {
+                if let resolved = try? VolumeIdentity.resolve(rootURL: liveRoot, preferredUUID: preferred) {
                     self.volume = resolved
                 }
                 refreshTrashSummary()
@@ -1920,15 +1952,33 @@ final class AppState {
                     flash("Trash was empty")
                 } else {
                     let sizeNote = result.bytesFreed > 0
-                        ? " · \(formatSize(result.bytesFreed, capacityHint: capacity)) freed"
+                        ? " · \(formatTrashSize(result.bytesFreed, capacityHint: capacity)) freed"
                         : ""
-                    flash("Emptied trash · \(result.itemCount) item\(result.itemCount == 1 ? "" : "s")\(sizeNote)")
+                    let still = trashSummary.itemCount
+                    if still > 0 {
+                        flash("Emptied \(result.itemCount) item\(result.itemCount == 1 ? "" : "s")\(sizeNote) · \(still) left")
+                    } else {
+                        flash("Emptied trash · \(result.itemCount) item\(result.itemCount == 1 ? "" : "s")\(sizeNote)")
+                    }
                 }
             } catch {
-                lastError = error.localizedDescription
+                lastError = cardWriteErrorMessage(error)
                 refreshTrashSummary()
             }
         }
+    }
+
+    /// Stop hashing / lazy readers so FAT delete and renames are not blocked by open files.
+    private func cancelBackgroundCardReaders() async {
+        if isHashingActive || isStoppingHashing {
+            stopContentHashing()
+            // Hash worker finishes the current file before idle — give it a moment.
+            for _ in 0..<50 {
+                if !isHashingActive { break }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+        }
+        cancelLazyDetailEnrichment()
     }
 
     func eject() async {
@@ -1981,10 +2031,16 @@ final class AppState {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
         panel.treatsFilePackagesAsDirectories = true
-        panel.message = "Select Dreamcast disc images or game folders (.gdi / .cdi / .ccd)"
+        panel.message = "Select disc images, game folders, multi-track sets, or .zip archives"
         panel.prompt = "Add to Card"
-        var types: [UTType] = [.folder]
+        var types: [UTType] = [.folder, .zip]
         for ext in ["gdi", "cdi", "ccd"] {
+            if let t = UTType(filenameExtension: ext) {
+                types.append(t)
+            }
+        }
+        // Multi-select track companions (.bin/.raw/…) allowed so Finder multi-drop matches the panel.
+        for ext in ["bin", "raw", "iso", "img", "sub", "cue"] {
             if let t = UTType(filenameExtension: ext) {
                 types.append(t)
             }
@@ -2004,7 +2060,9 @@ final class AppState {
 
     func importDiscURLs(_ urls: [URL]) async {
         guard canAddGames, let volume else { return }
-        let root = volume.rootURL
+        if !requestCardWriteAccess() { return }
+        // Do not `.standardizedFileURL` — that drops security scope on the URL instance.
+        let root = accessURL ?? volume.rootURL
         let snapshot = games
         let eventHandler = makeImportEventHandler()
 
@@ -2022,7 +2080,7 @@ final class AppState {
             }
         }
 
-        beginMutation("Adding \(urls.count) disc\(urls.count == 1 ? "" : "s")…", progress: 0)
+        beginMutation("Adding \(urls.count) game\(urls.count == 1 ? "" : "s")…", progress: 0)
         defer { endMutation() }
 
         do {
@@ -2055,7 +2113,7 @@ final class AppState {
             if result.added.isEmpty {
                 let reason = result.skipped.first?.reason ?? "Nothing to add"
                 lastError = reason
-                flash("No discs added")
+                flash("No games added")
             } else {
                 let skipNote = result.skipped.isEmpty
                     ? ""
@@ -2072,7 +2130,7 @@ final class AppState {
                 }
             }
         } catch {
-            lastError = error.localizedDescription
+            lastError = cardWriteErrorMessage(error)
             // Clear mutation lock before rescan (`rescan` guards on `!isBusy`).
             endMutation()
             // Full rescan is safest after a partial import failure.
@@ -2093,13 +2151,11 @@ final class AppState {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed != game.name, !trimmed.isEmpty else { return }
 
-        if !ensureCardWriteAccess() {
-            lastError = Self.cardAccessHelp
-            return
-        }
+        if !requestCardWriteAccess() { return }
 
+        let cardRoot = accessURL ?? volume?.rootURL
         do {
-            let previous = try CardOperations.rename(game: game, to: trimmed)
+            let previous = try CardOperations.rename(game: game, to: trimmed, cardRoot: cardRoot)
             // Disable animations around the row/title update — SwiftUI Table + subtitle
             // reflow was shifting the entire split view under the titlebar.
             var transaction = Transaction()
@@ -2120,12 +2176,16 @@ final class AppState {
             }
             undoManager.setActionName("Rename")
         } catch {
-            // One retry after re-binding scope (stale access after remount is common).
-            if ensureCardWriteAccess(),
+            // Permission → prompt to re-grant, then retry once.
+            if isPermissionError(error), requestCardWriteAccess(),
                let index = games.firstIndex(where: { $0.id == id })
             {
                 do {
-                    let previous = try CardOperations.rename(game: games[index], to: trimmed)
+                    let previous = try CardOperations.rename(
+                        game: games[index],
+                        to: trimmed,
+                        cardRoot: accessURL ?? volume?.rootURL
+                    )
                     var transaction = Transaction()
                     transaction.disablesAnimations = true
                     withTransaction(transaction) {
@@ -2171,7 +2231,7 @@ final class AppState {
         applyBulkRename(to: selectedGames, actionName: "Lowercase") { $0.name.lowercasedName }
     }
 
-    /// Auto-rename selection from IP.BIN / folder name / disc file name (GCM-style).
+    /// Auto-rename selection from IP.BIN / folder name / image file name (GCM-style).
     func autoRenameSelection(from source: AutoRenameSource) {
         autoRename(ids: selection, from: source)
     }
@@ -2192,10 +2252,7 @@ final class AppState {
         newName: (GameEntry) -> String?
     ) {
         guard !targets.isEmpty, !isBusy else { return }
-        if !ensureCardWriteAccess() {
-            lastError = Self.cardAccessHelp
-            return
-        }
+        if !requestCardWriteAccess() { return }
 
         var undos: [(UUID, String)] = []
         var skipped = 0
@@ -2209,16 +2266,25 @@ final class AppState {
             }
             guard converted != game.name else { continue }
             guard let index = games.firstIndex(where: { $0.id == game.id }) else { continue }
+            let cardRoot = accessURL ?? volume?.rootURL
             do {
-                let previous = try CardOperations.rename(game: games[index], to: converted)
+                let previous = try CardOperations.rename(
+                    game: games[index],
+                    to: converted,
+                    cardRoot: cardRoot
+                )
                 games[index].name = converted
                 games[index].isMenu = GameEntry.isMenuName(converted) || games[index].number == 1
                 undos.append((game.id, previous))
             } catch {
-                // Stale scope mid-batch — rebind once and retry this item.
-                if ensureCardWriteAccess() {
+                // Permission mid-batch — prompt re-grant and retry this item once.
+                if isPermissionError(error), requestCardWriteAccess() {
                     do {
-                        let previous = try CardOperations.rename(game: games[index], to: converted)
+                        let previous = try CardOperations.rename(
+                            game: games[index],
+                            to: converted,
+                            cardRoot: accessURL ?? volume?.rootURL
+                        )
                         games[index].name = converted
                         games[index].isMenu = GameEntry.isMenuName(converted) || games[index].number == 1
                         undos.append((game.id, previous))
@@ -2263,32 +2329,77 @@ final class AppState {
     }
 
     func deleteSelected() {
-        delete(ids: selection)
+        delete(ids: selection, permanent: false)
     }
 
-    func delete(id: UUID) {
-        delete(ids: [id])
+    /// Option-modified delete: wipe from the card now (slow for large GDI sets; no undo).
+    func deleteSelectedImmediately() {
+        delete(ids: selection, permanent: true)
     }
 
-    func delete(ids: Set<UUID>) {
+    func delete(id: UUID, permanent: Bool = false) {
+        delete(ids: [id], permanent: permanent)
+    }
+
+    /// - Parameter permanent: Soft-delete to `.katana-trash` (default) or erase folders now.
+    func delete(ids: Set<UUID>, permanent: Bool = false) {
         guard !isBusy, let volume, !ids.isEmpty else { return }
+        if !requestCardWriteAccess() { return }
         let snapshot = games
         let victims = snapshot.filter { ids.contains($0.id) }
         guard !victims.isEmpty else { return }
-        let root = volume.rootURL
+
         let label = victims.count == 1 ? victims[0].name : "\(victims.count) games"
+
+        if permanent {
+            let alert = NSAlert()
+            alert.messageText = victims.count == 1
+                ? "Delete “\(victims[0].name)” immediately?"
+                : "Delete \(victims.count) games immediately?"
+            alert.informativeText = """
+            Files are erased from the card now (slow for large multi-track games). This cannot be undone — they are not moved to \(CardOperations.trashFolderName).
+
+            Use Delete (without Option) to soft-delete instead.
+            """
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Delete Immediately")
+            alert.addButton(withTitle: "Cancel")
+            let wipe = alert.buttons[0]
+            wipe.hasDestructiveAction = false
+            if #available(macOS 11.0, *) {
+                wipe.bezelColor = .systemRed
+            }
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+
+        // Prefer the live security-scoped root URL instance (never re-standardize — drops scope).
+        let root = accessURL ?? volume.rootURL
         let progress = makeProgressHandler()
+        let fractionHandler: @Sendable (Double) -> Void = { [weak self] fraction in
+            Task { @MainActor [weak self] in
+                guard let self, self.busyMessage != nil else { return }
+                self.mutationProgress = min(1, max(0, fraction))
+            }
+        }
 
         Task {
-            beginMutation("Removing \(label)…")
+            // Post-drop auto-hash may still have these folders open — FAT then fails later deletes.
+            await cancelBackgroundCardReaders()
+            beginMutation(
+                permanent ? "Deleting \(label)…" : "Removing \(label)…",
+                progress: 0
+            )
             defer { endMutation() }
             do {
+                let liveRoot = accessURL ?? root
                 let result = try await Task.detached {
                     try CardOperations.delete(
                         gameIDs: ids,
                         games: snapshot,
-                        rootURL: root,
-                        progress: progress
+                        rootURL: liveRoot,
+                        permanent: permanent,
+                        progress: progress,
+                        fractionProgress: fractionHandler
                     )
                 }.value
 
@@ -2300,15 +2411,25 @@ final class AppState {
                 refreshTrashSummary()
                 scheduleDuplicateRecompute()
                 invalidateCacheAsync()
-                flash("Removed \(label)")
+                flash(permanent ? "Deleted \(label)" : "Removed \(label)")
 
-                undoManager.registerUndo(withTarget: self) { target in
-                    target.undelete(trashed: result.trashed)
+                if !permanent, !result.trashed.isEmpty {
+                    undoManager.registerUndo(withTarget: self) { target in
+                        target.undelete(trashed: result.trashed)
+                    }
+                    undoManager.setActionName(
+                        victims.count == 1 ? "Delete \(victims[0].name)" : "Delete \(victims.count) Games"
+                    )
                 }
-                undoManager.setActionName(victims.count == 1 ? "Delete \(victims[0].name)" : "Delete \(victims.count) Games")
             } catch {
-                lastError = error.localizedDescription
-                // Recover from partial renumber if needed.
+                let ns = error as NSError
+                LaunchTrace.mark(
+                    "delete FAIL permanent=\(permanent) root=\(root.path) access=\(accessURL?.path ?? "nil") \(ns.domain) \(ns.code): \(ns.localizedDescription)"
+                )
+                if isPermissionError(error) {
+                    _ = requestCardWriteAccess()
+                }
+                lastError = cardWriteErrorMessage(error)
                 await rescan()
             }
         }
@@ -2316,8 +2437,9 @@ final class AppState {
 
     private func undelete(trashed: [TrashedGame]) {
         guard !isBusy, let volume, !trashed.isEmpty else { return }
+        if !requestCardWriteAccess() { return }
         let snapshot = games
-        let root = volume.rootURL
+        let root = accessURL ?? volume.rootURL
         let label = trashed.count == 1 ? trashed[0].game.name : "\(trashed.count) games"
         let progress = makeProgressHandler()
 
@@ -2343,7 +2465,10 @@ final class AppState {
                 invalidateCacheAsync()
                 flash("Restored \(label)")
             } catch {
-                lastError = error.localizedDescription
+                if isPermissionError(error) {
+                    _ = requestCardWriteAccess()
+                }
+                lastError = cardWriteErrorMessage(error)
                 await rescan()
             }
         }
@@ -2407,10 +2532,11 @@ final class AppState {
         preserveSelection: Set<GameEntry.ID>? = nil
     ) {
         guard let volume else { return }
+        if !requestCardWriteAccess() { return }
         let previous = games.map(\.id)
         guard orderedIDs != previous else { return }
         let snapshot = games
-        let root = volume.rootURL
+        let root = accessURL ?? volume.rootURL
         let keepSelection = preserveSelection ?? selection
         let progress = makeProgressHandler()
 
@@ -2439,7 +2565,10 @@ final class AppState {
                 }
                 undoManager.setActionName(actionName)
             } catch {
-                lastError = error.localizedDescription
+                if isPermissionError(error) {
+                    _ = requestCardWriteAccess()
+                }
+                lastError = cardWriteErrorMessage(error)
                 await rescan()
             }
         }
@@ -2461,7 +2590,7 @@ final class AppState {
         }
     }
 
-    /// After a successful bake: list matches disc and baked kind matches the picker.
+    /// After a successful bake: list matches the card and baked kind matches the picker.
     func clearMenuNeedsRebuild() {
         menuContentDirty = false
         bakedMenuKind = menuKind
@@ -2493,36 +2622,44 @@ final class AppState {
         // Allow quit-time rebuild even if `isBusy` was set by the quit handler.
         guard !isScanning, !isRebuildingMenu else { return false }
         if busyMessage != nil, !isHandlingQuit { return false }
+        if !requestCardWriteAccess() {
+            flash("Card write access is required to rebuild the menu")
+            return false
+        }
 
         let snapshot = games
-        guard let root = volume?.rootURL else { return false }
+        // Keep security-scoped URL instance (no `.standardizedFileURL`).
+        guard let root = accessURL ?? volume?.rootURL else { return false }
         let kind = menuKind
 
         isRebuildingMenu = true
         rebuildProgress = 0
         statusText = "Rebuilding \(kind.displayName)…"
         defer {
-            isRebuildingMenu = false
-            rebuildProgress = nil
             if !isHandlingQuit {
                 busyMessage = nil
             }
         }
         do {
+            // Progress is applied on MainActor without requiring `isRebuildingMenu` still true —
+            // a defer that cleared the flag used to drop the final 1.0 hop, so the bar stopped
+            // short of full width when the rebuild finished.
+            let progressRelay = RebuildProgressRelay(self)
             let result = try await Task.detached(priority: .userInitiated) {
                 try MenuRebuildService.rebuild(
                     games: snapshot,
                     rootURL: root,
                     menuKind: kind,
-                    progress: { [weak self] message, fraction in
-                        Task { @MainActor in
-                            guard let self, self.isRebuildingMenu else { return }
-                            self.rebuildProgress = min(1, max(0, fraction))
-                            self.statusText = message
-                        }
+                    progress: { message, fraction in
+                        progressRelay.update(message: message, fraction: fraction)
                     }
                 )
             }.value
+
+            // Ensure the bar paints full before we hide it.
+            rebuildProgress = 1
+            statusText = "Installed \(result.menuKind.displayName)"
+            try? await Task.sleep(for: .milliseconds(200))
 
             // Light refresh of the menu row size / name; full rescan is unnecessary.
             if let idx = games.firstIndex(where: { $0.number == 1 }) {
@@ -2548,9 +2685,13 @@ final class AppState {
             invalidateCacheAsync()
             flash("Rebuilt \(result.menuKind.displayName) · \(result.itemCount) items")
             statusText = "\(result.menuKind.displayName) rebuilt · \(result.itemCount) items · \(formatSize(Int64(result.listByteCount))) list"
+            isRebuildingMenu = false
+            rebuildProgress = nil
             return true
         } catch {
-            lastError = error.localizedDescription
+            isRebuildingMenu = false
+            rebuildProgress = nil
+            lastError = cardWriteErrorMessage(error)
             refreshStatus()
             return false
         }
@@ -2716,6 +2857,7 @@ final class AppState {
     private func beginMutation(_ message: String, progress: Double? = nil) {
         busyMessage = message
         mutationProgress = progress
+        mutationProgressSegments = nil
         statusText = message
     }
 
@@ -2723,6 +2865,7 @@ final class AppState {
     private func endMutation() {
         busyMessage = nil
         mutationProgress = nil
+        mutationProgressSegments = nil
         activeImportGameIDs = []
         if volume != nil {
             refreshStatus()
@@ -2732,7 +2875,7 @@ final class AppState {
     /// Progress updates from background file ops → edge bar caption + subtitle.
     private func makeProgressHandler() -> @Sendable (String) -> Void {
         { [weak self] message in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self, self.busyMessage != nil else { return }
                 self.busyMessage = message
                 self.statusText = message
@@ -2743,7 +2886,7 @@ final class AppState {
     /// Live import events → table rows + edge progress (MainActor hop).
     private func makeImportEventHandler() -> @Sendable (CardOperations.ImportEvent) -> Void {
         { [weak self] event in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.applyImportEvent(event)
             }
         }
@@ -2788,6 +2931,11 @@ final class AppState {
 
         case .fraction(let value):
             mutationProgress = min(1, max(0, value))
+
+        case .copyProgress(let fraction, let segmentEnds):
+            mutationProgress = min(1, max(0, fraction))
+            // Only show dividers when there are multiple real segments.
+            mutationProgressSegments = segmentEnds.count > 1 ? segmentEnds : nil
 
         case .message(let text):
             busyMessage = text
@@ -2880,7 +3028,9 @@ final class AppState {
             trashSummary = .empty
             return
         }
-        let root = volume.rootURL
+        // Prefer the live security-scoped root — path-only `volume.rootURL` can fail
+        // listing under the sandbox and falsely report an empty trash (0 GB).
+        let root = accessURL ?? volume.rootURL
         let uuid = volume.volumeUUID
         Task.detached(priority: .utility) {
             let summary = CardOperations.trashSummary(on: root)
@@ -2940,28 +3090,29 @@ final class AppState {
     }
 
     // MARK: - Security-scoped write access
+    //
+    // Model matches 2UP’s SecurityScopedBookmarkStore:
+    // - User grants a folder once (Open panel / restored app-scoped bookmark).
+    // - We `startAccessingSecurityScopedResource()` and **hold it for the session**.
+    // - Stop only on eject / switch card / quit — never around individual mutations.
 
-    /// Re-bind sandbox access before card mutations.
-    ///
-    /// Remounts, Finder renames, and other apps touching the volume often invalidate
-    /// the previous security-scoped URL while `/Volumes/…` still looks fine — writes
-    /// then fail with NSCocoaErrorDomain 513 (“don’t have permission to save…”).
+    /// Hold (or re-acquire) write access to the open card. Does not show UI.
     @discardableResult
     private func ensureCardWriteAccess() -> Bool {
         guard let volume else { return false }
-        let root = volume.rootURL.standardizedFileURL
 
-        if accessURL != nil, probeCardWritable(root) {
-            return true
+        // Prefer the live session grant — probe with a real create+delete.
+        if let access = accessURL {
+            if probeCardWritable(access) {
+                return true
+            }
+            // Re-start on the same URL (remount sometimes needs a fresh startAccessing).
+            if access.startAccessingSecurityScopedResource(), probeCardWritable(access) {
+                return true
+            }
         }
 
-        // Drop a dead scope (stop is safe even if already invalid).
-        if let previous = accessURL {
-            previous.stopAccessingSecurityScopedResource()
-            accessURL = nil
-        }
-
-        // 1) Fresh resolve from the security-scoped bookmark.
+        // Re-resolve app-scoped bookmark (requires bookmarks.app-scope entitlement).
         if let data = bookmarkData {
             var isStale = false
             if let url = try? URL(
@@ -2970,24 +3121,45 @@ final class AppState {
                 relativeTo: nil,
                 bookmarkDataIsStale: &isStale
             ), FileManager.default.fileExists(atPath: url.path) {
-                if url.startAccessingSecurityScopedResource() {
-                    accessURL = url
-                    if isStale {
-                        bookmarkData = VolumeStore.makeBookmark(for: url) ?? data
-                    }
-                    if probeCardWritable(url) { return true }
+                if bindCardAccess(url, replaceBookmarkIfStale: isStale, existingBookmark: data) {
+                    return true
                 }
             }
         }
 
-        // 2) Open-panel / already-scoped URL for the live root.
-        if root.startAccessingSecurityScopedResource() {
-            accessURL = root
-            if probeCardWritable(root) { return true }
+        // Last resort: volume URL may still be the original panel/scoped instance.
+        if bindCardAccess(volume.rootURL, replaceBookmarkIfStale: false, existingBookmark: bookmarkData) {
+            return true
         }
 
-        // 3) Path may still be writable outside a scope in some edge cases.
-        return probeCardWritable(root)
+        return false
+    }
+
+    /// Start security scope on `url`, probe write, store as session `accessURL`, refresh bookmark.
+    @discardableResult
+    private func bindCardAccess(
+        _ url: URL,
+        replaceBookmarkIfStale: Bool,
+        existingBookmark: Data?
+    ) -> Bool {
+        let started = url.startAccessingSecurityScopedResource()
+        // Even when startAccessing returns false, process may already hold a grant for this path.
+        if probeCardWritable(url) {
+            if let previous = accessURL,
+               previous.standardizedFileURL != url.standardizedFileURL
+            {
+                previous.stopAccessingSecurityScopedResource()
+            }
+            accessURL = url
+            if replaceBookmarkIfStale || bookmarkData == nil {
+                bookmarkData = VolumeStore.makeBookmark(for: url) ?? existingBookmark ?? bookmarkData
+            }
+            return true
+        }
+        if started {
+            url.stopAccessingSecurityScopedResource()
+        }
+        return false
     }
 
     /// True when the sandbox can create and delete a tiny file on the card root.
@@ -2997,11 +3169,16 @@ final class AppState {
             isDirectory: false
         )
         do {
-            try Data().write(to: probe, options: .atomic)
+            // Non-atomic: FAT32 atomic temp+replace often false-negatives under sandbox.
+            try Data().write(to: probe, options: [])
             try FileManager.default.removeItem(at: probe)
             return true
         } catch {
             try? FileManager.default.removeItem(at: probe)
+            let ns = error as NSError
+            LaunchTrace.mark(
+                "probeCardWritable FAIL path=\(root.path) accessURL=\(accessURL?.path ?? "nil") \(ns.domain) \(ns.code): \(ns.localizedDescription)"
+            )
             return false
         }
     }
@@ -3009,19 +3186,152 @@ final class AppState {
     private static let cardAccessHelp =
         "Can’t write to the card. Choose Card → Open Card… (or re-open from Recents) to restore access — common after remount, eject, or another app used the volume."
 
+    /// Ensures write access; if the bookmark is dead, prompts to re-grant via Open panel.
+    @discardableResult
+    private func requestCardWriteAccess() -> Bool {
+        if ensureCardWriteAccess() { return true }
+        return promptToRegrantCardAccess()
+    }
+
+    /// Modal: explain expired access, then NSOpenPanel so the user re-selects the card root.
+    @discardableResult
+    private func promptToRegrantCardAccess() -> Bool {
+        guard let volume else { return false }
+        let name = volume.volumeName
+
+        let alert = NSAlert()
+        alert.messageText = "Card access expired"
+        alert.informativeText = """
+        macOS revoked write access to “\(name)” (common after remount, eject, or another app used the volume).
+
+        Select the card root again to grant access and continue.
+        """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Grant Access…")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.directoryURL = volume.rootURL
+        panel.message = "Select “\(name)” (the folder with 01, 02, … game slots)"
+        panel.prompt = "Grant Access"
+
+        guard panel.runModal() == .OK, let url = panel.url else { return false }
+
+        // Panel URLs carry security scope — bind it before probing.
+        let previous = accessURL
+        guard url.startAccessingSecurityScopedResource() else {
+            lastError = Self.cardAccessHelp
+            return false
+        }
+        if !probeCardWritable(url) {
+            url.stopAccessingSecurityScopedResource()
+            lastError = "Still can’t write to the selected folder. Make sure you chose the GDEMU card root (not a game slot)."
+            return false
+        }
+
+        if let previous, previous.standardizedFileURL != url.standardizedFileURL {
+            previous.stopAccessingSecurityScopedResource()
+        }
+        accessURL = url
+        bookmarkData = VolumeStore.makeBookmark(for: url) ?? bookmarkData
+
+        // Same card → keep the list; only refresh chrome + recents bookmark.
+        if isSameOpenVolume(as: url) {
+            let preferred = volume.volumeUUID
+            if let resolved = try? VolumeIdentity.resolve(rootURL: url, preferredUUID: preferred) {
+                self.volume = resolved
+                let rememberVolume = resolved
+                let rememberRoot = url
+                let rememberBookmark = bookmarkData
+                Task {
+                    try? await VolumeStore.shared.remember(
+                        volume: rememberVolume,
+                        rootURL: rememberRoot,
+                        existingBookmark: rememberBookmark
+                    )
+                    await reloadRecents()
+                }
+            }
+            flash("Access restored")
+            return true
+        }
+
+        // Different folder — open it as a new card; caller must not continue the old mutation.
+        Task { await open(url: url) }
+        flash("Opened a different card")
+        return false
+    }
+
     /// Map sandbox / FAT write failures to an actionable message.
+    /// Always appends Cocoa domain/code/path so Console / screenshots carry real diagnostics.
     private func cardWriteErrorMessage(_ error: Error) -> String {
         let ns = error as NSError
-        if ns.domain == NSCocoaErrorDomain, ns.code == NSFileWriteNoPermissionError || ns.code == 513 {
-            return Self.cardAccessHelp
+        var tech = "\(ns.domain) \(ns.code)"
+        if let path = ns.userInfo[NSFilePathErrorKey] as? String {
+            tech += " · \(path)"
+        } else if let url = ns.userInfo[NSURLErrorKey] as? URL {
+            tech += " · \(url.path)"
         }
         let text = error.localizedDescription
-        if text.localizedCaseInsensitiveContains("permission")
+        let isPerm = (ns.domain == NSCocoaErrorDomain
+            && (ns.code == NSFileWriteNoPermissionError || ns.code == 513))
+            || text.localizedCaseInsensitiveContains("permission")
             || text.localizedCaseInsensitiveContains("don’t have permission")
             || text.localizedCaseInsensitiveContains("don't have permission")
-        {
-            return Self.cardAccessHelp
+        if isPerm {
+            return "\(Self.cardAccessHelp)\n(\(tech): \(text))"
         }
-        return text
+        return "\(text)\n(\(tech))"
+    }
+
+    private func isPermissionError(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == NSCocoaErrorDomain, ns.code == NSFileWriteNoPermissionError || ns.code == 513 {
+            return true
+        }
+        let text = error.localizedDescription
+        return text.localizedCaseInsensitiveContains("permission")
+            || text.localizedCaseInsensitiveContains("don’t have permission")
+            || text.localizedCaseInsensitiveContains("don't have permission")
+    }
+}
+
+// MARK: - Concurrency helpers
+
+/// One-shot flag for LaunchTrace “first progress” (Sendable-safe vs capturing `var`).
+/// `nonisolated` opts out of default MainActor isolation so scan workers can call it.
+private nonisolated final class FirstProgressMark: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didMark = false
+
+    func markOnce(_ body: () -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didMark else { return }
+        didMark = true
+        body()
+    }
+}
+
+/// Weak MainActor hop for rebuild progress from a detached bake task.
+private nonisolated final class RebuildProgressRelay: @unchecked Sendable {
+    private weak var state: AppState?
+
+    init(_ state: AppState) {
+        self.state = state
+    }
+
+    func update(message: String, fraction: Double) {
+        let target = state
+        Task { @MainActor in
+            guard let target else { return }
+            target.rebuildProgress = min(1, max(0, fraction))
+            target.statusText = message
+        }
     }
 }

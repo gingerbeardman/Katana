@@ -13,7 +13,7 @@ struct InspectorSnapshot: Equatable {
     var content: Content = .empty
     var maxNumber: Int = 1
     var menuDisplayName: String = MenuKind.gdMenu.displayName
-    var duplicatesEnabled: Bool = true
+    var duplicatesEnabled: Bool = false
     var isBusy: Bool = false
     var focusNameFieldToken: Int = 0
 

@@ -53,8 +53,10 @@ enum VolumeIdentity: Sendable {
             isReadOnly = !FileManager.default.isWritableFile(atPath: rootURL.path)
         }
 
+        // Keep the caller’s URL instance. `.standardizedFileURL` drops security-scope
+        // (App Sandbox write access) — same trap 2UP/Brutify avoid for granted roots.
         return CardVolume(
-            rootURL: rootURL.standardizedFileURL,
+            rootURL: rootURL,
             volumeUUID: uuid,
             volumeName: name,
             freeBytes: values.volumeAvailableCapacity.map { Int64($0) },
@@ -104,7 +106,7 @@ enum ScanError: LocalizedError {
         case .unreadable(let url, let reason):
             return "Cannot read \(url.path): \(reason)"
         case .noDiscImage(let url):
-            return "No disc image found in \(url.lastPathComponent)"
+            return "No disc image (.gdi / .cdi / .ccd) found in \(url.lastPathComponent)"
         }
     }
 }

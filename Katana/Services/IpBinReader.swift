@@ -36,25 +36,17 @@ enum IpBinReader: Sendable {
 
     nonisolated private static func readFromGDI(folderURL: URL, gdiFileName: String) -> IpBinInfo? {
         let gdiURL = folderURL.appendingPathComponent(gdiFileName)
-        guard let text = try? String(contentsOf: gdiURL, encoding: .utf8) else { return nil }
-        // GDI lines: track LBA type sectorSize filename offset
-        // Prefer the first high-density data track (type 4, LBA >= 45000), else second data track.
-        var candidates: [(lba: Int, file: String)] = []
-        for line in text.split(whereSeparator: \.isNewline) {
-            let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-            guard parts.count >= 5, let lba = Int(parts[1]), let type = Int(parts[2]), type == 4 else { continue }
-            candidates.append((lba, parts[4]))
-        }
-        // High-density first (LBA >= 45000), then any other data track after the first low-density.
-        let ordered = candidates.sorted { a, b in
-            let aHi = a.lba >= 45000
-            let bHi = b.lba >= 45000
-            if aHi != bHi { return aHi && !bHi }
-            return a.lba < b.lba
-        }
-        for cand in ordered {
-            let trackURL = folderURL.appendingPathComponent(cand.file)
-            if let info = readHeader(from: trackURL, maxSearch: 64 * 1024) {
+        let text = (try? String(contentsOf: gdiURL, encoding: .utf8))
+            ?? (try? String(contentsOf: gdiURL, encoding: .isoLatin1))
+        guard let text else { return nil }
+
+        // Quote-aware parse (Redump: `… 2352 "Game (Track 1).bin" 0`). Space-splitting
+        // alone breaks on those names and never opens the track → no serial / IP title.
+        let candidates = GdiCue.dataTracksForIPBIN(in: text)
+        for track in candidates {
+            let trackURL = folderURL.appendingPathComponent(track.fileName)
+            // 2352-byte sectors often put the IP.BIN header a few bytes in; 256 KB is plenty.
+            if let info = readHeader(from: trackURL, maxSearch: 256 * 1024) {
                 return info
             }
         }

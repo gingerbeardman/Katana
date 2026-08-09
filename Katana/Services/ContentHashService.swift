@@ -169,10 +169,15 @@ final class ContentHashService {
 
         let queue = missing
         task = Task.detached(priority: .utility) { [weak self] in
+            // Copy weak optional to a `let` before nested concurrent hops (Swift 6:
+            // “captured var self in concurrently-executing code”).
+            // Run-local state (remainingByPath, publishProgress, …) stays captured from
+            // startFilling; only instance members go through `service`.
             // Cheap readdir/stat pass so remaining GB / ETA aren't based on disc.gdi-only sizes.
             for game in queue {
                 if Task.isCancelled { break }
-                let stillCurrent = await MainActor.run { self?.runGeneration == generation }
+                let service = self
+                let stillCurrent = await MainActor.run { service?.runGeneration == generation }
                 guard stillCurrent else { break }
 
                 let path = game.folderPath
@@ -181,7 +186,7 @@ final class ContentHashService {
                     ?? ContentHashService.estimatedPayloadBytes(for: game)
 
                 await MainActor.run {
-                    guard let self, self.runGeneration == generation else { return }
+                    guard let service, service.runGeneration == generation else { return }
                     if remainingByPath[path] != nil {
                         remainingByPath[path] = sized
                     }
@@ -191,7 +196,8 @@ final class ContentHashService {
 
             for game in queue {
                 if Task.isCancelled { break }
-                let stillCurrent = await MainActor.run { self?.runGeneration == generation }
+                let service = self
+                let stillCurrent = await MainActor.run { service?.runGeneration == generation }
                 guard stillCurrent else { break }
 
                 let folder = game.folderURL
@@ -200,11 +206,11 @@ final class ContentHashService {
                 // Skip if a sidecar appeared (or details enrichment) since we queued.
                 if let existing = ContentHashSidecar.validHash(in: folder) {
                     await MainActor.run {
-                        guard let self, self.runGeneration == generation else { return }
+                        guard let service, service.runGeneration == generation else { return }
                         remainingByPath.removeValue(forKey: path)
                         completedCount += 1
                         hashedBytes += existing.payloadSize
-                        self.onHashed?(path, existing.sha256, existing.payloadSize)
+                        service.onHashed?(path, existing.sha256, existing.payloadSize)
                         publishProgress()
                     }
                     continue
@@ -215,10 +221,10 @@ final class ContentHashService {
                     ?? ContentHashService.estimatedPayloadBytes(for: game)
 
                 await MainActor.run {
-                    guard let self, self.runGeneration == generation else { return }
+                    guard let service, service.runGeneration == generation else { return }
                     remainingByPath[path] = preSize
                     recalibrateTinyEstimates()
-                    self.setCurrentFolder(path)
+                    service.setCurrentFolder(path)
                     publishProgress()
                 }
 
@@ -234,7 +240,7 @@ final class ContentHashService {
                 // Always record the in-flight folder when we still own this generation
                 // (including after cancel — cancel does not bump generation).
                 await MainActor.run {
-                    guard let self, self.runGeneration == generation else { return }
+                    guard let service, service.runGeneration == generation else { return }
                     remainingByPath.removeValue(forKey: path)
                     completedCount += 1
 
@@ -245,7 +251,7 @@ final class ContentHashService {
                             timedSeconds += elapsed
                             measuredSampleCount += 1
                         }
-                        self.onHashed?(path, record.sha256, record.payloadSize)
+                        service.onHashed?(path, record.sha256, record.payloadSize)
                         recalibrateTinyEstimates()
                     }
                     publishProgress()
@@ -254,19 +260,20 @@ final class ContentHashService {
                 // Stop after the current file when user cancelled (or startFilling superseded us).
                 if Task.isCancelled { break }
                 let cancelled = await MainActor.run { () -> Bool in
-                    guard let self else { return true }
-                    return self.runGeneration != generation || self.isCancelling
+                    guard let service else { return true }
+                    return service.runGeneration != generation || service.isCancelling
                 }
                 if cancelled { break }
                 try? await Task.sleep(for: .milliseconds(50))
             }
 
+            let service = self
             await MainActor.run {
-                guard let self else { return }
+                guard let service else { return }
                 // Own this run (normal complete or user cancel). A newer startFilling bumps
                 // generation and takes over finishIdle for itself.
-                if self.runGeneration == generation {
-                    self.finishIdle()
+                if service.runGeneration == generation {
+                    service.finishIdle()
                 }
             }
         }

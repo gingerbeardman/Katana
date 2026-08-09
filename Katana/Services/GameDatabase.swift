@@ -4,7 +4,8 @@ import Foundation
 ///
 /// Source: [GameDB-Dreamcast](https://github.com/niemasd/GameDB-Dreamcast) (GPL-3.0),
 /// rebuilt via `Tools/scripts/build-gamedb.py` into `Resources/GameDB/dreamcast-titles.json`.
-enum GameDatabase: Sendable {
+/// Opt out of default MainActor isolation — title lookup runs during card scan off-main.
+nonisolated enum GameDatabase: Sendable {
     struct Entry: Sendable, Hashable {
         var title: String
         var region: String
@@ -151,7 +152,7 @@ enum GameDatabase: Sendable {
     }
 
     /// Lazy, process-wide table (immutable after load).
-    private nonisolated(unsafe) static let sharedTitles: [String: Entry] = {
+    private static let sharedTitles: [String: Entry] = {
         LaunchTrace.mark("GameDatabase.sharedTitles lazy init")
         return loadFromBundle()
     }()

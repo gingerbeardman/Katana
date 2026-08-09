@@ -63,6 +63,57 @@ enum ByteCount: Sendable {
         return "\(formatted) GB"
     }
 
+    /// Soft-deleted trash size for sidebar / Empty Trash copy.
+    ///
+    /// Same GB/MB policy as volume chrome, but **never** reports `0 GB` when `bytes > 0`:
+    /// amounts under ~0.5 GB (which whole-GB rounding would collapse) show as at least
+    /// `0.1 GB`.
+    nonisolated static func trashSizeString(
+        for bytes: Int64,
+        integerMegabytes: Bool = true,
+        capacityHint: Int64? = nil
+    ) -> String {
+        // Non-empty trash with unknown/zero measured size (e.g. size walk blocked) still
+        // must not read as “0 GB” — floor at 0.1 GB.
+        let value = max(0, bytes)
+        guard value > 0 else {
+            let hint = capacityHint ?? 0
+            if hint >= Int64(bytesPerGB) {
+                return "0.1 GB"
+            }
+            return gameSizeString(for: 100_000, integerMegabytes: integerMegabytes) // “< 1 MB” / small
+        }
+
+        let hint = capacityHint ?? 0
+        let preferGB = value >= Int64(bytesPerGB) || hint >= Int64(bytesPerGB)
+        guard preferGB else {
+            return gameSizeString(for: value, integerMegabytes: integerMegabytes)
+        }
+
+        let gb = Double(value) / bytesPerGB
+        if integerMegabytes {
+            let whole = Int(gb.rounded())
+            if whole >= 1 {
+                return "\(whole.formatted()) GB"
+            }
+            // Sub-GB: ceil to 0.1 GB so 50 MB → "0.1 GB", not "0 GB".
+            let tenths = max(1, Int((gb * 10).rounded(.up)))
+            let display = Double(tenths) / 10
+            let formatted = display.formatted(
+                .number
+                    .precision(.fractionLength(1))
+            )
+            return "\(formatted) GB"
+        }
+
+        let display = max(0.1, (gb * 10).rounded() / 10)
+        let formatted = display.formatted(
+            .number
+                .precision(.fractionLength(1))
+        )
+        return "\(formatted) GB"
+    }
+
     // MARK: - Throughput / ETA
 
     /// Throughput for status lines, e.g. `43 MB/s` (always MB-scale).

@@ -51,14 +51,15 @@ struct CardMenuRebuildIntegrationTests {
             )
         )
 
-        // Sanity: card-wide 3-digit keys when max ≥ 100.
+        // Sanity: menu key is always `01` (GCM); games use card-wide width when max ≥ 100.
         let track05 = try Data(contentsOf: outDir.appendingPathComponent("track05.iso"))
         let text = String(decoding: track05, as: UTF8.self)
         let sample = FolderNumbering.format(1, maxNumber: maxNumber) + ".name="
+        #expect(sample == "01.name=")
         #expect(text.contains(sample), "expected \(sample) in LIST for max=\(maxNumber)")
         if maxNumber >= 100 {
-            #expect(!text.hasPrefix("01.name="))
-            #expect(!text.contains("\n01.name="))
+            #expect(text.contains("002.name=") || text.contains("\n002."))
+            #expect(!text.contains("001.name="))
         }
 
         // Marker + copy of bake for host shell install (outside the sandbox).

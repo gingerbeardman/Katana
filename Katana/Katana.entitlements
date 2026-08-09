@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<!-- Same as 2UP / Brutify: persisted security-scoped bookmarks for user-selected folders. -->
+	<key>com.apple.security.files.bookmarks.app-scope</key>
+	<true/>
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+	<!--
+	  GDEMU cards live under /Volumes (FAT/exFAT SD). Remounts invalidate security-scoped
+	  bookmarks while the path still exists, which surfaces as permission errors on delete /
+	  empty trash even mid-session. This temporary exception (Developer ID / non–App Store)
+	  keeps card I/O reliable for the actual product path; Open panel + bookmarks still
+	  cover non-/Volumes roots (local test folders).
+	-->
+	<key>com.apple.security.temporary-exception.files.absolute-path.read-write</key>
+	<array>
+		<string>/Volumes/</string>
+	</array>
+	<!-- GitHub Releases version check -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+</dict>
+</plist>

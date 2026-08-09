@@ -149,7 +149,7 @@ nonisolated struct GDromMenuBuilder: Sendable {
         tracks: inout [DiscTrack],
         track03Path: URL
     ) throws {
-        var track3 = DiscTrack(
+        let track3 = DiscTrack(
             fileName: track03Path.lastPathComponent,
             fileSize: Int64(Self.gdEndLBA - Self.gdStartLBA) * Int64(Self.dataSectorSize),
             lba: Self.gdStartLBA,
@@ -354,7 +354,7 @@ nonisolated struct GDromMenuBuilder: Sendable {
                 .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
                 .replacingOccurrences(of: "/", with: "\\")
             if !isoPath.isEmpty {
-                _ = builder.addDirectory(isoPath)
+                builder.addDirectory(isoPath)
             }
         }
 

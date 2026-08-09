@@ -216,6 +216,16 @@ struct InspectorView: View {
                                 .frame(maxWidth: .infinity)
                         }
                         .disabled(state.isBusy)
+                        .help("Soft-delete to card trash")
+
+                        Button(role: .destructive) {
+                            state.deleteSelectedImmediately()
+                        } label: {
+                            Text("Delete \(games.count) Immediately…")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .disabled(state.isBusy)
+                        .help("Erase from the card now; cannot be undone")
                     }
                 }
             }
@@ -523,12 +533,22 @@ struct InspectorView: View {
             }
 
             Button(role: .destructive) {
-                state.delete(id: game.id)
+                state.delete(id: game.id, permanent: false)
             } label: {
                 Text("Delete from Card")
                     .frame(maxWidth: .infinity)
             }
             .disabled(state.isBusy)
+            .help("Soft-delete to card trash")
+
+            Button(role: .destructive) {
+                state.delete(id: game.id, permanent: true)
+            } label: {
+                Text("Delete Immediately…")
+                    .frame(maxWidth: .infinity)
+            }
+            .disabled(state.isBusy)
+            .help("Erase from the card now; cannot be undone")
         }
     }
 
