@@ -68,7 +68,7 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 - **Honest card writes** — copies to the card bypass the macOS write cache (`F_NOCACHE`), so the bar tracks bytes physically on the card: no instant leap on big files, no long wait at a finished file's marker, and measured transfer rates stay true
 - **Formats** — GDI (cue + tracks), CDI, CCD (plus `.img` / `.sub` / `.cue` companions), game folders, or `.zip` archives
 - **Automatic renumbering** — existing folders are widened first when the digit count has to grow (99 → 100); menu slot stays **`01`**
-- **Import naming** — by default, **Automatically rename added games** (Settings) names each new slot from the GameDB via the IP.BIN serial (fallback: IP.BIN product name). Off uses the source file or folder name. **Hold ⌥** while confirming Add Games or while dropping files to keep source names for **that import only**. If several files in one add (or a name already on the card) would collapse to the **same** GameDB title, those keep their source names so test builds stay distinguishable
+- **Import naming** — by default, **Automatically rename added games** (Settings) names each new slot from the GameDB via the IP.BIN serial (fallback: IP.BIN product name). Off uses the source file or folder name. **Build-tag / variant filenames win** even with auto-rename on: names with hyphens or underscores (e.g. `beltrunner-shipplay-f64-dc`, `beltrunner-combat-stats-f32-dc`) keep the source label instead of a short shared product title. **Hold ⌥** while confirming Add Games or while dropping (Option is tracked for the whole drag) to force source names for that import. Names that would collide with the card or the rest of the same multi-add batch also fall back to the source
 - **Hashes on import** — content hashes are computed after add so new games join the duplicate suite; hashing is paused before delete / empty trash so FAT cards can free space cleanly
 - **Soft delete** — ⌫ / Delete moves games to `.katana-trash` (fast, undoable); remaining slots pack down with single-pass renames
 - **Delete Immediately** — ⌥⌫, or hold ⌥ in Game / context menus so **Delete** swaps to **Delete Immediately…** (Finder-style alternate); erases folders from the card now (slow for large GDI sets, with edge progress); confirmation; cannot be undone
@@ -207,7 +207,8 @@ Collapsible sections, each remembering its expanded state:
 | Drag-and-drop manual order | – | Yes |
 | Move up / down on card | Yes | – |
 | Auto-rename from GameDB / IP.BIN / folder / file | Yes | Yes |
-| ⌥ Add keeps source names (skip auto-rename) | Yes | – |
+| Variant/build-tag filenames kept on auto-rename | Yes | – |
+| ⌥ Add / drop keeps source names | Yes | – |
 | Manual case conversion | Yes | – |
 | Inline Finder-style rename | Yes | – |
 | Cover art (0GDTEX.PVR) | Yes | Yes |

@@ -48,6 +48,9 @@ final class GameListDropDestinationView: NSView {
     private var enabled = false
     private var isTargeted: Binding<Bool>?
     private var onDrop: (([URL], Bool) -> Void)?
+    /// Option during Finder drag is not always visible on `NSEvent.modifierFlags` at
+    /// drop time — sample it while the drag is over the list.
+    private var optionHeldDuringDrag = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -87,7 +90,26 @@ final class GameListDropDestinationView: NSView {
         }
     }
 
+    private static var isOptionDown: Bool {
+        let flags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags.contains(.option) { return true }
+        if let current = NSApp.currentEvent?.modifierFlags.intersection(.deviceIndependentFlagsMask),
+           current.contains(.option)
+        {
+            return true
+        }
+        return false
+    }
+
+    private func sampleOptionKey() {
+        if Self.isOptionDown {
+            optionHeldDuringDrag = true
+        }
+    }
+
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        optionHeldDuringDrag = false
+        sampleOptionKey()
         guard canAccept(sender) else {
             setTargeted(false)
             return []
@@ -97,6 +119,7 @@ final class GameListDropDestinationView: NSView {
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        sampleOptionKey()
         guard canAccept(sender) else {
             setTargeted(false)
             return []
@@ -107,14 +130,17 @@ final class GameListDropDestinationView: NSView {
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
         setTargeted(false)
+        optionHeldDuringDrag = false
     }
 
     override func draggingEnded(_ sender: NSDraggingInfo) {
         setTargeted(false)
+        optionHeldDuringDrag = false
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        canAccept(sender)
+        sampleOptionKey()
+        return canAccept(sender)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -122,8 +148,10 @@ final class GameListDropDestinationView: NSView {
         guard enabled else { return false }
         let urls = fileURLs(from: sender)
         guard !urls.isEmpty else { return false }
-        // Option held at drop → keep source file/folder names (skip GameDB auto-rename).
-        let skipAutoRename = NSEvent.modifierFlags.contains(.option)
+        sampleOptionKey()
+        // Option held at any point during the drag → keep source names (skip auto-rename).
+        let skipAutoRename = optionHeldDuringDrag || Self.isOptionDown
+        optionHeldDuringDrag = false
         onDrop?(urls, skipAutoRename)
         return true
     }

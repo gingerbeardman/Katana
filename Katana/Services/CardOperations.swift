@@ -1477,12 +1477,13 @@ enum CardOperations: Sendable {
 
     /// Import naming: source file / folder first (distinguishes variants), then GameDB / IP.BIN.
     /// With `preferDatabaseNames`, that order flips: GameDB title (looked up by the IP.BIN
-    /// serial) → IP.BIN product name → source file / folder.
+    /// serial) → IP.BIN product name → source file / folder — **unless** the source label is a
+    /// distinctive build/variant name (`beltrunner-shipplay-f64-dc`), in which case the source
+    /// wins so test images with unique serials but the same product title stay distinct.
     ///
     /// - Parameter reservedNames: case-insensitive names already on the card or claimed
-    ///   earlier in this import. When auto-rename would reuse one of these (e.g. six
-    ///   beltrunner builds → the same GameDB title), falls back to the source name so
-    ///   variants stay distinguishable.
+    ///   earlier in this import. When auto-rename would reuse one of these, falls back to
+    ///   the source name.
     nonisolated static func importDisplayName(
         source: DiscImportSource,
         ip: IpBinInfo?,
@@ -1491,6 +1492,7 @@ enum CardOperations: Sendable {
     ) -> (name: String, serial: String) {
         let serial = ip?.productNumber.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let reserved = Set(reservedNames.map { $0.lowercased() })
+        let sourceLabel = sourceDisplayLabel(for: source)
 
         if preferDatabaseNames {
             var dbName: String?
@@ -1500,6 +1502,10 @@ enum CardOperations: Sendable {
                 dbName = raw.localizedCapitalized
             }
             if let dbName, !dbName.isEmpty {
+                // Variant filenames (hyphen/underscore builds) beat a short shared product title.
+                if let sourceLabel, prefersSourceLabel(sourceLabel, overDatabaseName: dbName) {
+                    return (sourceLabel, serial)
+                }
                 if !reserved.contains(dbName.lowercased()) {
                     return (dbName, serial)
                 }
@@ -1507,18 +1513,8 @@ enum CardOperations: Sendable {
             }
         }
 
-        // Original image base name (before any rename to disc.*).
-        let fileBase = (source.imageFileName as NSString)
-            .deletingPathExtension
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if !fileBase.isEmpty, fileBase.lowercased() != "disc" {
-            return (fileBase, serial)
-        }
-
-        // Package / selection folder name (e.g. BELTRUNNER-SHIPPLAY-DC).
-        let hint = source.hintName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !hint.isEmpty, FolderNumbering.parse(hint) == nil {
-            return (hint, serial)
+        if let sourceLabel {
+            return (sourceLabel, serial)
         }
 
         // Fallback: GameDB → IP.BIN → leftovers.
@@ -1529,6 +1525,41 @@ enum CardOperations: Sendable {
             imageFileName: source.imageFileName,
             folderName: source.hintName
         )
+    }
+
+    /// File base name, or package folder name when the image is a generic `disc.*`.
+    nonisolated static func sourceDisplayLabel(for source: DiscImportSource) -> String? {
+        let fileBase = (source.imageFileName as NSString)
+            .deletingPathExtension
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !fileBase.isEmpty, fileBase.lowercased() != "disc" {
+            return fileBase
+        }
+        let hint = source.hintName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !hint.isEmpty, FolderNumbering.parse(hint) == nil {
+            return hint
+        }
+        return nil
+    }
+
+    /// True when the source looks like a build/variant id rather than a plain retail title.
+    /// e.g. `beltrunner-shipplay-f64-dc` over generic `Beltrunner`.
+    nonisolated static func prefersSourceLabel(_ source: String, overDatabaseName database: String) -> Bool {
+        let s = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        let d = database.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty, !d.isEmpty else { return false }
+        if s.compare(d, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame {
+            return false
+        }
+        // Hyphen / underscore tokens are almost always build tags (f32/f64, shipplay, busy4…).
+        if s.contains("-") || s.contains("_") {
+            return true
+        }
+        // Substantially longer than the catalog title → extra detail worth keeping.
+        if s.count >= d.count + 4 {
+            return true
+        }
+        return false
     }
 
     // MARK: - Reorder

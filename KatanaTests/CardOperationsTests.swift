@@ -220,11 +220,12 @@ struct CardOperationsTests {
     }
 
     @Test func importDisplayNamePrefersDatabaseWhenAutoRenaming() {
+        // Plain retail-style base name (no build tags) → IP/GameDB product title.
         let source = CardOperations.DiscImportSource(
             packageURL: URL(fileURLWithPath: "/tmp"),
-            fileNames: ["BELTRUNNER-SHIPPLAY-DC.cdi"],
-            imageFileName: "BELTRUNNER-SHIPPLAY-DC.cdi",
-            hintName: "BELTRUNNER-SHIPPLAY-DC"
+            fileNames: ["Beltrunner.cdi"],
+            imageFileName: "Beltrunner.cdi",
+            hintName: "Beltrunner"
         )
         let ip = IpBinInfo(
             name: "BELTRUNNER",
@@ -236,8 +237,6 @@ struct CardOperationsTests {
             releaseDate: "20200101",
             isCodeBreaker: false
         )
-        // Homebrew serial is not in the GameDB → falls back to the IP.BIN product name,
-        // not the source file name.
         let resolved = CardOperations.importDisplayName(
             source: source,
             ip: ip,
@@ -252,11 +251,39 @@ struct CardOperationsTests {
             ip: nil,
             preferDatabaseNames: true
         )
-        #expect(unresolved.name == "BELTRUNNER-SHIPPLAY-DC")
+        #expect(unresolved.name == "Beltrunner")
     }
 
     @Test func importDisplayNameFallsBackToSourceWhenNameReserved() {
-        // Second (and later) beltrunner builds share one product title — keep the file name.
+        // Plain retail-style file name that matches a catalog title — auto-rename may use DB.
+        let retail = CardOperations.DiscImportSource(
+            packageURL: URL(fileURLWithPath: "/tmp"),
+            fileNames: ["SoulCalibur.cdi"],
+            imageFileName: "SoulCalibur.cdi",
+            hintName: "SoulCalibur"
+        )
+        let soulIP = IpBinInfo(
+            name: "SOULCALIBUR",
+            productNumber: "MK-5100",
+            disc: "1/1",
+            region: "JUE",
+            vga: true,
+            version: "V1.000",
+            releaseDate: "19990909",
+            isCodeBreaker: false
+        )
+        // If GameDB has a title and reserved already claims it → source file base.
+        let collision = CardOperations.importDisplayName(
+            source: retail,
+            ip: soulIP,
+            preferDatabaseNames: true,
+            reservedNames: ["Soulcalibur", "SoulCalibur", "Soul Calibur"]
+        )
+        #expect(collision.name == "SoulCalibur")
+    }
+
+    @Test func importDisplayNameKeepsHyphenatedBuildTags() {
+        // Different homebrew serials, same IP product name — source has build tags.
         let source = CardOperations.DiscImportSource(
             packageURL: URL(fileURLWithPath: "/tmp"),
             fileNames: ["beltrunner-shipplay-f64-dc.cdi"],
@@ -265,7 +292,7 @@ struct CardOperationsTests {
         )
         let ip = IpBinInfo(
             name: "BELTRUNNER",
-            productNumber: "IND-743215",
+            productNumber: "IND-891378",
             disc: "1/1",
             region: "JUE",
             vga: true,
@@ -273,22 +300,16 @@ struct CardOperationsTests {
             releaseDate: "20200101",
             isCodeBreaker: false
         )
-        let unique = CardOperations.importDisplayName(
+        let resolved = CardOperations.importDisplayName(
             source: source,
             ip: ip,
             preferDatabaseNames: true,
             reservedNames: []
         )
-        #expect(unique.name == "Beltrunner")
-
-        let collision = CardOperations.importDisplayName(
-            source: source,
-            ip: ip,
-            preferDatabaseNames: true,
-            reservedNames: ["Beltrunner"]
-        )
-        #expect(collision.name == "beltrunner-shipplay-f64-dc")
-        #expect(collision.serial == "IND-743215")
+        #expect(resolved.name == "beltrunner-shipplay-f64-dc")
+        #expect(resolved.serial == "IND-891378")
+        #expect(CardOperations.prefersSourceLabel("beltrunner-busy4-stats-f32-dc", overDatabaseName: "Beltrunner"))
+        #expect(!CardOperations.prefersSourceLabel("Beltrunner", overDatabaseName: "Beltrunner"))
     }
 
     @Test func importDisplayNameUsesFolderWhenImageIsDisc() {
