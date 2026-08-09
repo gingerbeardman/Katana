@@ -189,17 +189,12 @@ enum MenuRebuildService: Sendable {
         }
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-        proc.arguments = ["-qq", "-o", zipURL.path, "-d", root.path]
-        let err = Pipe()
-        proc.standardError = err
-        proc.standardOutput = Pipe()
-        try proc.run()
-        proc.waitUntilExit()
-        guard proc.terminationStatus == 0 else {
-            let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "unzip failed"
-            throw RebuildError.bakeFailed(msg)
+        // In-process extract — App Sandbox blocks `/usr/bin/unzip` via Process, which
+        // silently broke menu rebuild in notarized builds.
+        do {
+            try ZipExtractor.extract(zipURL: zipURL, to: root)
+        } catch {
+            throw RebuildError.bakeFailed(error.localizedDescription)
         }
         guard fm.fileExists(atPath: root.appendingPathComponent("IP.BIN").path) else {
             throw RebuildError.missingAssets
