@@ -301,14 +301,43 @@ enum CardOperations: Sendable {
         var skipped: [(url: URL, reason: String)]
     }
 
+    /// Live import UI events — placeholders appear before the heavy copy finishes.
+    enum ImportEvent: Sendable {
+        /// Existing slots renumbered (digit-width growth); replace the in-memory list prefix.
+        case existingUpdated([GameEntry])
+        /// Slot folder + provisional `name.txt` created; show the row immediately.
+        case slotPrepared(GameEntry)
+        /// Hashing or copying this slot (row spinner).
+        case slotActive(UUID)
+        /// Slot fully written (name/serial/hash/size).
+        case slotFinished(GameEntry)
+        /// Slot failed after prepare — remove the provisional row (folder cleaned up).
+        case slotFailed(UUID)
+        /// Overall 0…1 for the edge progress bar.
+        case fraction(Double)
+        /// Status line / busy caption.
+        case message(String)
+    }
+
     /// Copy disc packages/images into the next free slots. Existing folders are renumbered
     /// first when digit width must grow (e.g. 99 → 100).
+    ///
+    /// When `onEvent` is set, each new slot is prepared (folder + name) before hashing/copy
+    /// so the table can show rows immediately with a per-file spinner.
     nonisolated static func importDiscs(
         sources: [URL],
         games: [GameEntry],
         rootURL: URL,
-        progress: (@Sendable (String) -> Void)? = nil
+        progress: (@Sendable (String) -> Void)? = nil,
+        onEvent: (@Sendable (ImportEvent) -> Void)? = nil
     ) throws -> ImportResult {
+        func emit(_ event: ImportEvent) {
+            onEvent?(event)
+            if case .message(let text) = event {
+                progress?(text)
+            }
+        }
+
         guard !sources.isEmpty else {
             return ImportResult(games: games, added: [], skipped: [])
         }
@@ -346,6 +375,7 @@ enum CardOperations: Sendable {
 
         let fm = FileManager.default
         let existing = games.sorted { $0.number < $1.number }
+        let totalSlots = resolved.count
 
         // Next slot must respect **on-disk** numbered folders, not only the in-memory list.
         // A stale/empty `games` array (or snapshot desync) used to pick "001" while the menu
@@ -357,6 +387,9 @@ enum CardOperations: Sendable {
         let endNumber = startNumber + resolved.count - 1
         let newTotal = max(endNumber, memoryMax, diskMax, existing.count + resolved.count)
 
+        emit(.message("Preparing \(totalSlots) slot\(totalSlots == 1 ? "" : "s")…"))
+        emit(.fraction(0))
+
         // Widen folder names if we cross 99 / 999 boundaries.
         var pathByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0.folderPath) })
         let desiredExisting = existing.enumerated().map { ($0.element.id, $0.offset + 1) }
@@ -367,10 +400,10 @@ enum CardOperations: Sendable {
             rootURL: rootURL,
             preferCompactPack: false,
             maxNumber: newTotal,
-            progress: progress
+            progress: { progress?($0); onEvent?(.message($0)) }
         )
 
-        var updatedExisting: [GameEntry] = existing.enumerated().map { index, game in
+        let updatedExisting: [GameEntry] = existing.enumerated().map { index, game in
             var copy = game
             let number = index + 1
             copy.number = number
@@ -388,6 +421,7 @@ enum CardOperations: Sendable {
             copy.isMenu = number == 1 || GameEntry.isMenuName(copy.name)
             return copy
         }
+        emit(.existingUpdated(updatedExisting))
 
         var added: [GameEntry] = []
         added.reserveCapacity(resolved.count)
@@ -412,96 +446,128 @@ enum CardOperations: Sendable {
                 imageName = preferred
             }
 
-            // Hash payload on the **source** volume (usually much faster than re-reading the SD).
-            // Digest uses canonical on-card names so it matches a post-copy hash of dest.
-            var precomputedHash: ContentHashSidecar.ComputeResult?
-            if let sources = try? payloadSourcesForImport(source: source, destImageName: imageName),
-               !sources.isEmpty
-            {
-                progress?("Hashing \(offset + 1)/\(resolved.count)… \(source.hintName)")
-                precomputedHash = try? ContentHashSidecar.compute(sources: sources)
-            }
-
-            progress?("Copying \(offset + 1)/\(resolved.count)… \(source.hintName)")
-
+            let format = discFormat(for: imageName)
+            // Provisional title from source path — refined after IP.BIN is available.
+            let provisionalName = importDisplayName(source: source, ip: nil).name
+            let entryID = UUID()
             let dest = rootURL.appendingPathComponent(folderName, isDirectory: true)
             if fm.fileExists(atPath: dest.path) {
-                // Extremely unlikely after occupied check; keep a clear error.
                 throw OperationError.destinationExists(folderName)
             }
+
+            // Create folder + name immediately so the table can show the row mid-copy.
             try fm.createDirectory(at: dest, withIntermediateDirectories: true)
             occupied.insert(number)
-
-            do {
-                try copyPackage(source: source, to: dest)
-            } catch {
-                try? fm.removeItem(at: dest)
-                throw error
-            }
-
-            // Prefer disc.* names when we copied a single image file.
-            if willRenameSingle {
-                let from = dest.appendingPathComponent(source.imageFileName)
-                let to = dest.appendingPathComponent(preferred)
-                if fm.fileExists(atPath: from.path), !fm.fileExists(atPath: to.path) {
-                    try? fm.moveItem(at: from, to: to)
-                    imageName = preferred
-                }
-            }
-
-            // Write sidecars from the precomputed digest (tiny write; no SD re-read of the disc).
-            var contentHash: String?
-            var payloadSize: Int64 = 0
-            if let computed = precomputedHash {
-                do {
-                    try ContentHashSidecar.write(computed, to: dest)
-                    contentHash = computed.sha256
-                    payloadSize = computed.payloadSize
-                } catch {
-                    // Fall back to post-import hashing in the UI if sidecar write fails.
-                    contentHash = nil
-                }
-            }
-
-            let format = discFormat(for: imageName)
-            let ip = IpBinReader.read(
-                folderURL: dest,
-                imageFileName: imageName,
-                format: format
-            )
-            // Like GDMENU Card Manager: default title from source file/folder name so
-            // homebrew variants (same IP.BIN) stay distinct. GameDB/IP are fallbacks only.
-            let resolvedName = importDisplayName(source: source, ip: ip)
-
-            try resolvedName.name.write(
+            try provisionalName.write(
                 to: dest.appendingPathComponent(nameFile),
                 atomically: true,
                 encoding: .utf8
             )
-            if !resolvedName.serial.isEmpty {
-                try resolvedName.serial.write(
-                    to: dest.appendingPathComponent(serialFile),
-                    atomically: true,
-                    encoding: .utf8
-                )
-            }
 
-            let details = try? CardScanner.loadFolderDetails(folderURL: dest)
-            let entry = GameEntry(
-                id: UUID(),
+            var provisional = GameEntry(
+                id: entryID,
                 number: number,
-                name: resolvedName.name,
-                serial: resolvedName.serial,
+                name: provisionalName,
+                serial: "",
                 format: format,
                 imageFileName: imageName,
                 folderPath: dest.path,
-                byteSize: details?.byteSize ?? payloadSize,
-                payloadByteSize: payloadSize > 0 ? payloadSize : (details?.payloadByteSize ?? 0),
-                contentSHA256: contentHash ?? details?.contentSHA256,
+                byteSize: 0,
+                payloadByteSize: 0,
+                contentSHA256: nil,
                 isMenu: false,
-                detailsLoaded: details != nil || contentHash != nil
+                detailsLoaded: false
             )
-            added.append(entry)
+            emit(.slotPrepared(provisional))
+            emit(.slotActive(entryID))
+            // Fraction starts this slot (completed slots / total).
+            emit(.fraction(Double(offset) / Double(totalSlots)))
+
+            do {
+                // Hash payload on the **source** volume (usually much faster than re-reading the SD).
+                // Digest uses canonical on-card names so it matches a post-copy hash of dest.
+                var precomputedHash: ContentHashSidecar.ComputeResult?
+                if let sources = try? payloadSourcesForImport(source: source, destImageName: imageName),
+                   !sources.isEmpty
+                {
+                    emit(.message("Hashing \(offset + 1)/\(totalSlots)… \(source.hintName)"))
+                    precomputedHash = try? ContentHashSidecar.compute(sources: sources)
+                }
+
+                emit(.message("Copying \(offset + 1)/\(totalSlots)… \(source.hintName)"))
+                try copyPackage(source: source, to: dest)
+
+                // Prefer disc.* names when we copied a single image file.
+                if willRenameSingle {
+                    let from = dest.appendingPathComponent(source.imageFileName)
+                    let to = dest.appendingPathComponent(preferred)
+                    if fm.fileExists(atPath: from.path), !fm.fileExists(atPath: to.path) {
+                        try? fm.moveItem(at: from, to: to)
+                        imageName = preferred
+                        provisional.imageFileName = imageName
+                    }
+                }
+
+                // Write sidecars from the precomputed digest (tiny write; no SD re-read of the disc).
+                var contentHash: String?
+                var payloadSize: Int64 = 0
+                if let computed = precomputedHash {
+                    do {
+                        try ContentHashSidecar.write(computed, to: dest)
+                        contentHash = computed.sha256
+                        payloadSize = computed.payloadSize
+                    } catch {
+                        // Fall back to post-import hashing in the UI if sidecar write fails.
+                        contentHash = nil
+                    }
+                }
+
+                let ip = IpBinReader.read(
+                    folderURL: dest,
+                    imageFileName: imageName,
+                    format: format
+                )
+                // Like GDMENU Card Manager: default title from source file/folder name so
+                // homebrew variants (same IP.BIN) stay distinct. GameDB/IP are fallbacks only.
+                let resolvedName = importDisplayName(source: source, ip: ip)
+
+                try resolvedName.name.write(
+                    to: dest.appendingPathComponent(nameFile),
+                    atomically: true,
+                    encoding: .utf8
+                )
+                if !resolvedName.serial.isEmpty {
+                    try resolvedName.serial.write(
+                        to: dest.appendingPathComponent(serialFile),
+                        atomically: true,
+                        encoding: .utf8
+                    )
+                }
+
+                let details = try? CardScanner.loadFolderDetails(folderURL: dest)
+                let entry = GameEntry(
+                    id: entryID,
+                    number: number,
+                    name: resolvedName.name,
+                    serial: resolvedName.serial,
+                    format: format,
+                    imageFileName: imageName,
+                    folderPath: dest.path,
+                    byteSize: details?.byteSize ?? payloadSize,
+                    payloadByteSize: payloadSize > 0 ? payloadSize : (details?.payloadByteSize ?? 0),
+                    contentSHA256: contentHash ?? details?.contentSHA256,
+                    isMenu: false,
+                    detailsLoaded: details != nil || contentHash != nil
+                )
+                added.append(entry)
+                emit(.slotFinished(entry))
+                emit(.fraction(Double(offset + 1) / Double(totalSlots)))
+            } catch {
+                try? fm.removeItem(at: dest)
+                occupied.remove(number)
+                emit(.slotFailed(entryID))
+                throw error
+            }
         }
 
         return ImportResult(

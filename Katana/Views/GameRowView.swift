@@ -68,7 +68,11 @@ struct NumberColumnCell: View {
             Text(FolderNumbering.format(game.number, maxNumber: maxNumber))
                 .font(.body.monospacedDigit())
                 .foregroundStyle(.secondary)
-            if state.isHashingGame(game) {
+            if state.isImportingGame(game) {
+                ProgressView()
+                    .controlSize(.small)
+                    .help("Adding game to card…")
+            } else if state.isHashingGame(game) {
                 ProgressView()
                     .controlSize(.small)
                     .help("Computing content hash…")

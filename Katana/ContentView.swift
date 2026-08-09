@@ -171,7 +171,7 @@ struct ContentView: View {
             .animation(.snappy, value: state.flashMessage)
         }
         .overlay(alignment: .top) {
-            ZStack {
+            VStack(spacing: 8) {
                 if let err = state.lastError {
                     HStack {
                         Image(systemName: "exclamationmark.triangle.fill")
@@ -185,11 +185,37 @@ struct ContentView: View {
                     .font(.callout)
                     .padding(10)
                     .background(.yellow.opacity(0.9), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .padding()
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+
+                if let update = state.availableUpdate {
+                    HStack(spacing: 10) {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .foregroundStyle(.tint)
+                        Text("Katana \(update.version) is available")
+                            .font(.callout.weight(.medium))
+                        Text("(you have \(UpdateChecker.currentVersion))")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 8)
+                        Button("View Release") {
+                            state.openAvailableUpdate()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        Button("Dismiss") {
+                            state.dismissAvailableUpdate()
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    .padding(10)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
+            .padding()
             .animation(.snappy, value: state.lastError)
+            .animation(.snappy, value: state.availableUpdate)
         }
     }
 

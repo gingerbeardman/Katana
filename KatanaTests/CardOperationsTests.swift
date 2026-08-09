@@ -144,6 +144,54 @@ struct CardOperationsTests {
         #expect(result.added[0].name == "CrazyTaxi")
     }
 
+    @Test func importEmitsPreparedSlotBeforeCopyFinishes() throws {
+        let root = try makeFixture(names: ["GDMENU"])
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let fm = FileManager.default
+        let sourceDir = fm.temporaryDirectory
+            .appendingPathComponent("katana-import-ev-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: sourceDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: sourceDir) }
+        let cdi = sourceDir.appendingPathComponent("SoulCalibur.cdi")
+        try Data(repeating: 0x11, count: 128).write(to: cdi)
+
+        var sawPrepared = false
+        var preparedName: String?
+        var sawFinished = false
+        var lastFraction: Double = -1
+
+        let games = try loadEntries(root: root)
+        let result = try CardOperations.importDiscs(
+            sources: [cdi],
+            games: games,
+            rootURL: root,
+            onEvent: { event in
+                switch event {
+                case .slotPrepared(let entry):
+                    sawPrepared = true
+                    preparedName = entry.name
+                    // Folder + name exist before the disc payload is fully written.
+                    #expect(fm.fileExists(atPath: entry.folderPath))
+                    #expect(fm.fileExists(atPath: (entry.folderPath as NSString).appendingPathComponent("name.txt")))
+                case .slotFinished:
+                    sawFinished = true
+                case .fraction(let f):
+                    lastFraction = f
+                default:
+                    break
+                }
+            }
+        )
+
+        #expect(sawPrepared)
+        #expect(preparedName == "SoulCalibur")
+        #expect(sawFinished)
+        #expect(lastFraction == 1)
+        #expect(result.added.count == 1)
+        #expect(result.added[0].name == "SoulCalibur")
+    }
+
     @Test func importDisplayNamePrefersSourceFileOverIP() {
         let source = CardOperations.DiscImportSource(
             packageURL: URL(fileURLWithPath: "/tmp"),

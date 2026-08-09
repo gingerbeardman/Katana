@@ -13,6 +13,8 @@ struct GameListView: View {
     /// SwiftUI Table often keeps stale NSTableView sort indicators when `sortOrder` is
     /// set programmatically (cold open of a new/renamed volume was the worst case).
     @State private var tableRemountToken: UInt64 = 0
+    /// Finder drag highlight (AppKit drop destination, same idea as 2UP pane drops).
+    @State private var isDropTargeted = false
 
     private var maxNumber: Int {
         state.maxGameNumber
@@ -38,19 +40,32 @@ struct GameListView: View {
                 menuRebuildBar
             }
 
-            Table(displayedGames, selection: $state.selection, sortOrder: $sortOrder) {
+            // Column widths, visibility, and reorder use SwiftUI’s native
+            // `columnCustomization` (same pattern as 2UP): Control-click a header
+            // to show/hide columns. Persisted via `AppState.tableColumnCustomizationData`.
+            Table(
+                displayedGames,
+                selection: $state.selection,
+                sortOrder: $sortOrder,
+                columnCustomization: columnCustomizationBinding
+            ) {
                 TableColumn("#", value: \.number) { game in
                     // Slot + trailing chips (MENU / duplicate). Observes AppState for pending badges.
                     NumberColumnCell(game: game, maxNumber: maxNumber, state: state)
                 }
                 .width(min: 110, ideal: 110, max: 110)
+                .customizationID("number")
+                .disabledCustomizationBehavior(.visibility)
 
                 TableColumn("Title", value: \.name) { game in
                     // Observe rename state inside the cell (Table caches closures).
                     RenameAwareTitleCell(game: game, state: state)
                         .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
                 }
+                // No max — absorbs leftover width (2UP Name column).
                 .width(min: 160, ideal: 280)
+                .customizationID("title")
+                .disabledCustomizationBehavior(.visibility)
 
                 TableColumn("Serial", value: \.serial) { game in
                     Text(game.serial.isEmpty ? "—" : game.serial)
@@ -60,12 +75,14 @@ struct GameListView: View {
                         .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
                 }
                 .width(min: 72, ideal: 100, max: 140)
+                .customizationID("serial")
 
                 TableColumn("Format", value: \.formatSortKey) { game in
                     FormatBadge(format: game.format)
                         .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
                 }
                 .width(min: 52, ideal: 64, max: 80)
+                .customizationID("format")
 
                 TableColumn("Size", value: \.byteSize) { game in
                     Text(state.formatGameSize(game))
@@ -75,13 +92,16 @@ struct GameListView: View {
                         .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
                 }
                 .width(min: 72, ideal: 88, max: 110)
+                .customizationID("size")
             }
-            // Keep rows visible while scanning/rebuilding — block interaction only.
+            // Keep rows visible while scanning / rebuilding / mutating — block interaction only.
+            // Imports paint placeholders with row spinners; no center blocking card.
             // No card: empty chrome only (open from sidebar); don’t allow sort/select.
             .disabled(state.volume == nil || state.isScanning || state.isRebuildingMenu || state.isBusy)
             .opacity(
                 state.volume == nil
                     ? 0.55
+                    // Light dim only for full-card scan/rebuild; mutations stay fully opaque.
                     : (state.isScanning || state.isRebuildingMenu) ? 0.72 : 1
             )
             // Remount when volume or programmed sort changes so header chevrons match data order.
@@ -111,7 +131,8 @@ struct GameListView: View {
                 return .handled
             }
             .overlay(alignment: .top) {
-                // Edge progress — scan (accent) or menu rebuild (warning orange).
+                // Edge progress — scan (accent), rebuild (orange), mutations (accent).
+                // No center busy card: status lives in the window subtitle + this bar.
                 if state.isScanning, let progress = state.scanProgress, progress.total > 0 {
                     edgeProgressBar(
                         fraction: min(1, max(0, Double(progress.completed) / Double(progress.total))),
@@ -122,14 +143,22 @@ struct GameListView: View {
                         fraction: state.rebuildProgress ?? 0,
                         color: .orange
                     )
+                } else if state.isMutating {
+                    if let fraction = state.mutationProgress {
+                        edgeProgressBar(fraction: fraction, color: .accentColor)
+                    } else {
+                        indeterminateEdgeProgressBar(color: .accentColor)
+                    }
                 }
             }
             .overlay {
-                // Center busy card only for non-scan / non-rebuild ops (import, delete, …).
-                // No-card empty state lives in the sidebar (Open / Reopen) — no overlay on the table.
-                if let busy = state.busyMessage, !state.isScanning, !state.isRebuildingMenu {
-                    busyOverlay(busy)
-                } else if state.volume != nil, state.filteredGames.isEmpty, !state.isScanning {
+                // Empty search only — mutations use the edge bar, not a center card.
+                // No-card empty state lives in the sidebar (Open / Reopen).
+                if state.volume != nil,
+                   state.filteredGames.isEmpty,
+                   !state.isScanning,
+                   !state.isMutating
+                {
                     ContentUnavailableView.search(text: state.searchText)
                 }
             }
@@ -184,6 +213,19 @@ struct GameListView: View {
         .onAppear {
             applySortFromState(remount: false)
         }
+        // Finder → Add Games (2UP-style AppKit pasteboard drop, not SwiftUI `.onDrop`).
+        .overlay {
+            // Thin accent ring while targeted — same chrome language as 2UP panes.
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .strokeBorder(Color.accentColor, lineWidth: isDropTargeted && state.canAddGames ? 2 : 0)
+                .allowsHitTesting(false)
+        }
+        .gameListFileDrop(
+            enabled: state.canAddGames,
+            isTargeted: $isDropTargeted
+        ) { urls in
+            state.handleDroppedURLs(urls)
+        }
     }
 
     /// Identity that forces a fresh `NSTableView` when volume opens or sort is applied
@@ -192,6 +234,14 @@ struct GameListView: View {
     private var tableIdentity: String {
         let vol = state.volume?.volumeUUID ?? "none"
         return "\(vol)|\(tableRemountToken)"
+    }
+
+    /// Persist widths / visibility / order through AppState (UserDefaults), 2UP-style.
+    private var columnCustomizationBinding: Binding<TableColumnCustomization<GameEntry>> {
+        Binding(
+            get: { state.tableColumnCustomization },
+            set: { state.setTableColumnCustomization($0) }
+        )
     }
 
     private func applySortFromState(remount: Bool) {
@@ -382,13 +432,7 @@ struct GameListView: View {
         return up ? first > 0 : last < state.games.count - 1
     }
 
-    private func busyOverlay(_ message: String) -> some View {
-        ProgressView(message)
-            .padding(24)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    /// 2pt edge progress (scan accent / rebuild orange).
+    /// 2pt edge progress (scan accent / rebuild orange / mutation accent).
     private func edgeProgressBar(fraction: Double, color: Color) -> some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
@@ -396,8 +440,32 @@ struct GameListView: View {
                     .fill(Color.primary.opacity(0.08))
                 Rectangle()
                     .fill(color)
-                    .frame(width: geo.size.width * fraction)
+                    .frame(width: geo.size.width * max(0, min(1, fraction)))
                     .animation(.linear(duration: 0.2), value: fraction)
+            }
+        }
+        .frame(height: 2)
+        .allowsHitTesting(false)
+    }
+
+    /// 2pt indeterminate sweep when a mutation has no reliable fraction (delete, renumber, eject).
+    private func indeterminateEdgeProgressBar(color: Color) -> some View {
+        TimelineView(.animation(minimumInterval: 1 / 30, paused: false)) { context in
+            GeometryReader { geo in
+                let width = geo.size.width
+                let phase = context.date.timeIntervalSinceReferenceDate
+                    .truncatingRemainder(dividingBy: 1.2) / 1.2
+                let barWidth = max(48, width * 0.28)
+                let x = (width + barWidth) * phase - barWidth
+                ZStack(alignment: .leading) {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.08))
+                    Rectangle()
+                        .fill(color.opacity(0.9))
+                        .frame(width: barWidth)
+                        .offset(x: x)
+                }
+                .clipped()
             }
         }
         .frame(height: 2)

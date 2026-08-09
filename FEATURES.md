@@ -31,6 +31,7 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 ## Game List
 
 - **Multi-select table** — Title, Serial, Format, Size, and slot number columns
+- **Toggleable columns** — Control-click a column header to show or hide Serial, Format, or Size (same native SwiftUI table customization as 2UP). # and Title stay visible; widths and visibility persist across launches
 - **Display-only sorting** — click a column header to sort the view. Slot numbers on the card are never touched. A status strip spells this out whenever a non-slot sort is active, with one-click **Newest First** / **Slot Order**
 - **Sort remembered per card** — each volume keeps its own display sort across sessions
 - **Apply A–Z to Disc** — the deliberate, separate action that actually renumbers folders on the SD card
@@ -53,7 +54,8 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 
 ## Adding & Removing Games
 
-- **Add Games** (`⇧``⌘``N`) — drop discs into the next free slots
+- **Add Games** (`⇧``⌘``N`) — pick discs into the next free slots, or **drag and drop** images/folders from Finder onto the game list
+- **Transparent copy** — each new slot’s folder and title appear in the list immediately; a top edge bar tracks overall progress and a per-row spinner marks the active file
 - **Formats** — GDI (whole track set), CDI, CCD (plus `.img` / `.sub` / `.cue` companions), or a folder already laid out as a GDEMU game
 - **Automatic renumbering** — existing folders are widened first when the digit count has to grow (99 → 100)
 - **Import naming** — source file or folder name first (so variants stay distinguishable), then GameDB / IP.BIN
@@ -148,6 +150,8 @@ Collapsible sections, each remembering its expanded state:
 - **Settings** — General (duplicates, list, units) and SD Card (menu type, multipass, cache, eject)
 - **Unit preference** — whole megabytes or adaptive KB/MB, with GB for card capacity
 - **Non-blocking status** — flash messages, an inline error banner you can dismiss, and progress in the window subtitle
+- **Edge progress** — scan, menu rebuild, and disk mutations (add / delete / renumber / eject) use a 2pt top bar instead of a center blocking card; imports also spin the active row
+- **Update check** — Help → Check for Updates… queries the GitHub Releases feed; a quiet launch check offers a banner when a newer version is out
 
 ## Distribution
 
@@ -155,6 +159,7 @@ Collapsible sections, each remembering its expanded state:
 - **Notarized** Developer ID build, stapled and `spctl`-verified
 - **macOS 14 Sonoma** or later
 - **No dependencies** — no .NET, no helper processes, no bundled third-party runtimes
+- **GitHub Releases** — version checks against `gingerbeardman/Katana`
 
 ---
 

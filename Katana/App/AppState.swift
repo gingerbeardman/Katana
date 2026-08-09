@@ -51,6 +51,8 @@ final class AppState {
                     showDuplicatesOnly = false
                     // Leave markers preference alone; UI ignores them while feature is off.
                 }
+                // InspectorSnapshot caches `duplicatesEnabled` + duplicate sections — refresh now.
+                rebuildInspectorSnapshot()
             }
         }
     }
@@ -111,7 +113,12 @@ final class AppState {
     /// Observed inside `RenameAwareTitleCell` so SwiftUI Table cell caching still updates.
     var renamingGameID: GameEntry.ID?
     /// Non-nil while a disk mutation runs (renumber, copy, delete).
+    /// Drives the edge progress bar + window subtitle — not a center blocking card.
     var busyMessage: String?
+    /// 0…1 for mutation edge bar (`nil` while busy = indeterminate).
+    var mutationProgress: Double?
+    /// Rows currently hashing/copying during Add Games (per-row spinner).
+    private(set) var activeImportGameIDs: Set<UUID> = []
     /// Live scan progress for the status line / table chrome (`nil` when idle).
     var scanProgress: (completed: Int, total: Int)?
     var statusText: String = "Open a GDEMU SD card to begin"
@@ -120,6 +127,8 @@ final class AppState {
     /// Transient status toast — auto-clears; never a modal.
     var flashMessage: String?
     var lastError: String?
+    /// Non-nil when a newer GitHub release is available (banner until dismissed).
+    var availableUpdate: UpdateChecker.AvailableUpdate?
     var lastScanStats: String?
     /// Recently opened cards (sidebar).
     var recentVolumes: [RememberedVolume] = []
@@ -176,6 +185,41 @@ final class AppState {
     private static let sizesAsIntegerMBKey = "sizesAsIntegerMB"
     private static let isInspectorPresentedKey = "isInspectorPresented"
     private static let inspectorSectionsKey = "inspectorSectionExpanded"
+    /// SwiftUI `TableColumnCustomization` JSON (widths, visibility, order) — same approach as 2UP.
+    private static let tableColumnCustomizationKey = "tableColumnCustomization"
+
+    // MARK: - Table column customization (2UP-style)
+
+    /// Encoded column widths / visibility / order. Native Table header menu toggles columns.
+    var tableColumnCustomizationData: Data = AppState.loadTableColumnCustomization() {
+        didSet {
+            guard tableColumnCustomizationData != oldValue else { return }
+            UserDefaults.standard.set(tableColumnCustomizationData, forKey: AppState.tableColumnCustomizationKey)
+            tableColumnCustomizationCache = nil
+        }
+    }
+    private var tableColumnCustomizationCache: (data: Data, value: TableColumnCustomization<GameEntry>)?
+
+    /// Decoded view for the game table binding (cached — body evaluates often).
+    var tableColumnCustomization: TableColumnCustomization<GameEntry> {
+        if let cache = tableColumnCustomizationCache, cache.data == tableColumnCustomizationData {
+            return cache.value
+        }
+        let value = (try? JSONDecoder().decode(
+            TableColumnCustomization<GameEntry>.self,
+            from: tableColumnCustomizationData
+        )) ?? TableColumnCustomization<GameEntry>()
+        tableColumnCustomizationCache = (tableColumnCustomizationData, value)
+        return value
+    }
+
+    func setTableColumnCustomization(_ value: TableColumnCustomization<GameEntry>) {
+        tableColumnCustomizationData = (try? JSONEncoder().encode(value)) ?? Data()
+    }
+
+    private static func loadTableColumnCustomization() -> Data {
+        UserDefaults.standard.data(forKey: tableColumnCustomizationKey) ?? Data()
+    }
 
     /// Default on when the key has never been written (first launch).
     private static func loadInspectorPresented() -> Bool {
@@ -395,6 +439,16 @@ final class AppState {
     func isHashingGame(_ game: GameEntry) -> Bool {
         guard let hashingFolderPath else { return false }
         return game.folderPath == hashingFolderPath
+    }
+
+    /// Row spinner during Add Games (hash/copy of that slot).
+    func isImportingGame(_ game: GameEntry) -> Bool {
+        activeImportGameIDs.contains(game.id)
+    }
+
+    /// True while any disk mutation shows the edge progress chrome.
+    var isMutating: Bool {
+        busyMessage != nil && !isScanning && !isRebuildingMenu
     }
 
     var filteredGames: [GameEntry] {
@@ -1838,8 +1892,8 @@ final class AppState {
             }
             guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-            busyMessage = "Emptying trash…"
-            defer { busyMessage = nil }
+            beginMutation("Emptying trash…")
+            defer { endMutation() }
             do {
                 let result = try await Task.detached(priority: .userInitiated) {
                     try CardOperations.emptyTrash(rootURL: root, progress: progress)
@@ -1866,8 +1920,8 @@ final class AppState {
 
     func eject() async {
         guard let volume, !isBusy else { return }
-        busyMessage = "Ejecting \(volume.volumeName)…"
-        defer { busyMessage = nil }
+        beginMutation("Ejecting \(volume.volumeName)…")
+        defer { endMutation() }
 
         let root = volume.rootURL
         let name = volume.volumeName
@@ -1928,14 +1982,35 @@ final class AppState {
         Task { await importDiscURLs(panel.urls) }
     }
 
+    /// Drag-and-drop entry point (Finder → game list). URLs come from the AppKit drag
+    /// pasteboard (2UP-style), not async `NSItemProvider` loads.
+    func handleDroppedURLs(_ urls: [URL]) {
+        guard canAddGames, !urls.isEmpty else { return }
+        Task { await importDiscURLs(urls) }
+    }
+
     func importDiscURLs(_ urls: [URL]) async {
         guard canAddGames, let volume else { return }
         let root = volume.rootURL
         let snapshot = games
-        let progress = makeProgressHandler()
+        let eventHandler = makeImportEventHandler()
 
-        busyMessage = "Adding \(urls.count) disc\(urls.count == 1 ? "" : "s")…"
-        defer { busyMessage = nil }
+        // Sandbox: keep security scope for open-panel / Finder-drop sources until copy finishes.
+        var scopedURLs: [URL] = []
+        scopedURLs.reserveCapacity(urls.count)
+        for url in urls {
+            if url.startAccessingSecurityScopedResource() {
+                scopedURLs.append(url)
+            }
+        }
+        defer {
+            for url in scopedURLs {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        beginMutation("Adding \(urls.count) disc\(urls.count == 1 ? "" : "s")…", progress: 0)
+        defer { endMutation() }
 
         do {
             let result = try await Task.detached(priority: .userInitiated) {
@@ -1943,10 +2018,11 @@ final class AppState {
                     sources: urls,
                     games: snapshot,
                     rootURL: root,
-                    progress: progress
+                    onEvent: eventHandler
                 )
             }.value
 
+            // Events already painted the list; reconcile with the authoritative result.
             games = result.games
             if let last = result.added.last {
                 selection = [last.id]
@@ -1956,7 +2032,6 @@ final class AppState {
             }
             scheduleDuplicateRecompute()
             markMenuNeedsRebuild()
-            refreshStatus()
             invalidateCacheAsync()
             // Free space may have changed after large copies.
             let preferred = self.volume?.volumeUUID
@@ -1985,6 +2060,10 @@ final class AppState {
             }
         } catch {
             lastError = error.localizedDescription
+            // Clear mutation lock before rescan (`rescan` guards on `!isBusy`).
+            endMutation()
+            // Full rescan is safest after a partial import failure.
+            await rescan()
         }
     }
 
@@ -2139,8 +2218,8 @@ final class AppState {
         let progress = makeProgressHandler()
 
         Task {
-            busyMessage = "Removing \(label)…"
-            defer { busyMessage = nil }
+            beginMutation("Removing \(label)…")
+            defer { endMutation() }
             do {
                 let result = try await Task.detached {
                     try CardOperations.delete(
@@ -2181,8 +2260,8 @@ final class AppState {
         let progress = makeProgressHandler()
 
         Task {
-            busyMessage = "Restoring \(label)…"
-            defer { busyMessage = nil }
+            beginMutation("Restoring \(label)…")
+            defer { endMutation() }
             do {
                 let updated = try await Task.detached {
                     try CardOperations.undelete(
@@ -2274,8 +2353,8 @@ final class AppState {
         let progress = makeProgressHandler()
 
         Task {
-            busyMessage = "Updating folder numbers…"
-            defer { busyMessage = nil }
+            beginMutation("Updating folder numbers…")
+            defer { endMutation() }
             do {
                 let updated = try await Task.detached {
                     try CardOperations.applyOrder(
@@ -2490,12 +2569,12 @@ final class AppState {
     /// Rebuild (optional) → optional eject → allow app termination.
     private func finishQuit(rebuild: Bool) async {
         let shouldEject = ejectOnQuit && volume != nil
-        // Rebuild uses the edge progress bar (isRebuildingMenu), not the center overlay.
+        // Rebuild uses the edge progress bar (isRebuildingMenu), not a center card.
         if !rebuild, shouldEject {
-            busyMessage = "Ejecting…"
+            beginMutation("Ejecting…")
         }
         defer {
-            busyMessage = nil
+            endMutation()
             isHandlingQuit = false
         }
 
@@ -2526,7 +2605,7 @@ final class AppState {
             stopAccess()
             return
         }
-        busyMessage = "Ejecting \(volume.volumeName)…"
+        beginMutation("Ejecting \(volume.volumeName)…")
         let root = volume.rootURL
         do {
             stopAccess()
@@ -2571,32 +2650,166 @@ final class AppState {
         Self.directoryByteSize(path: path)
     }
 
-    /// Progress updates from background file ops → UI busy text.
+    /// Start a non-scan / non-rebuild disk mutation (edge bar + subtitle).
+    private func beginMutation(_ message: String, progress: Double? = nil) {
+        busyMessage = message
+        mutationProgress = progress
+        statusText = message
+    }
+
+    /// Clear mutation chrome. Call from `defer` after every `beginMutation`.
+    private func endMutation() {
+        busyMessage = nil
+        mutationProgress = nil
+        activeImportGameIDs = []
+        if volume != nil {
+            refreshStatus()
+        }
+    }
+
+    /// Progress updates from background file ops → edge bar caption + subtitle.
     private func makeProgressHandler() -> @Sendable (String) -> Void {
         { [weak self] message in
             Task { @MainActor in
-                self?.busyMessage = message
+                guard let self, self.busyMessage != nil else { return }
+                self.busyMessage = message
+                self.statusText = message
             }
         }
+    }
+
+    /// Live import events → table rows + edge progress (MainActor hop).
+    private func makeImportEventHandler() -> @Sendable (CardOperations.ImportEvent) -> Void {
+        { [weak self] event in
+            Task { @MainActor in
+                self?.applyImportEvent(event)
+            }
+        }
+    }
+
+    private func applyImportEvent(_ event: CardOperations.ImportEvent) {
+        switch event {
+        case .existingUpdated(let existing):
+            // Keep any placeholders already appended; replace the renumbered prefix.
+            let placeholders = games.filter { activeImportGameIDs.contains($0.id) }
+            games = existing + placeholders
+
+        case .slotPrepared(let entry):
+            activeImportGameIDs.insert(entry.id)
+            if let idx = games.firstIndex(where: { $0.id == entry.id }) {
+                games[idx] = entry
+            } else {
+                games.append(entry)
+            }
+            if scrollToNewRows {
+                scrollTargetGameID = entry.id
+            }
+            selection = [entry.id]
+
+        case .slotActive(let id):
+            activeImportGameIDs.insert(id)
+
+        case .slotFinished(let entry):
+            activeImportGameIDs.remove(entry.id)
+            if let idx = games.firstIndex(where: { $0.id == entry.id }) {
+                games[idx] = entry
+            } else {
+                games.append(entry)
+            }
+
+        case .slotFailed(let id):
+            activeImportGameIDs.remove(id)
+            games.removeAll { $0.id == id }
+            if selection.contains(id) {
+                selection.remove(id)
+            }
+
+        case .fraction(let value):
+            mutationProgress = min(1, max(0, value))
+
+        case .message(let text):
+            busyMessage = text
+            statusText = text
+        }
+    }
+
+    // MARK: - Updates (GitHub Releases)
+
+    /// Manual Help → Check for Updates… (always reports result).
+    func checkForUpdates(userInitiated: Bool = true) {
+        Task {
+            await performUpdateCheck(userInitiated: userInitiated)
+        }
+    }
+
+    /// Launch-time check (quiet unless a newer release exists).
+    func checkForUpdatesInBackground() {
+        Task {
+            // Don’t block first paint; wait until the window is up.
+            try? await Task.sleep(for: .seconds(2))
+            await performUpdateCheck(userInitiated: false)
+        }
+    }
+
+    private func performUpdateCheck(userInitiated: Bool) async {
+        do {
+            let result = try await UpdateChecker.check()
+            if result.isNewer {
+                availableUpdate = result.update
+                if userInitiated {
+                    flash("Katana \(result.update.version) is available")
+                }
+            } else if userInitiated {
+                availableUpdate = nil
+                flash("You’re up to date (\(UpdateChecker.currentVersion))")
+            }
+        } catch {
+            if userInitiated {
+                lastError = "Couldn’t check for updates: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func dismissAvailableUpdate() {
+        availableUpdate = nil
+    }
+
+    func openAvailableUpdate() {
+        guard let availableUpdate else { return }
+        NSWorkspace.shared.open(availableUpdate.htmlURL)
     }
 
     private func refreshStatus() {
         guard let volume else { return }
         // Subtitle under the volume name (nav title) — not the name again.
-        // games · used (game folders) · free (volume) · menu · [Read-only]
-        let capacity = volume.totalBytes
+        // games · % used · menu · [Read-only]
+        // (Absolute GB used/free stay in the sidebar capacity meter.)
         var parts: [String] = [
             "\(games.count) games",
-            formatSize(totalBytes, capacityHint: capacity),
         ]
-        if let free = volume.freeBytes {
-            parts.append("\(formatSize(free, capacityHint: capacity)) free")
+        if let usedPercent = volumeUsedPercent(for: volume) {
+            parts.append("\(usedPercent)% used")
         }
         parts.append(menuKind.displayName)
         if volume.isReadOnly {
             parts.append("Read-only")
         }
         statusText = parts.joined(separator: " · ")
+    }
+
+    /// Volume occupancy for the title-bar subtitle (0…100). Prefers free/total; falls back to game bytes / capacity.
+    private func volumeUsedPercent(for volume: CardVolume) -> Int? {
+        guard let capacity = volume.totalBytes, capacity > 0 else { return nil }
+        let used: Int64
+        if let free = volume.freeBytes {
+            used = max(0, capacity - free)
+        } else if totalBytes > 0 {
+            used = totalBytes
+        } else {
+            return nil
+        }
+        let pct = Double(used) / Double(capacity) * 100
+        return min(100, max(0, Int(pct.rounded())))
     }
 
     /// Re-read `.katana-trash` item count and size for the open card (off main actor).

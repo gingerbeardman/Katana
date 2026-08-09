@@ -12,7 +12,8 @@ struct KatanaApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView(state: state)
-                .frame(minWidth: 900, minHeight: 520)
+                // Narrow enough for sidebar + #/Title (optional columns can be hidden).
+                .frame(minWidth: 720, minHeight: 480)
                 .task {
                     LaunchTrace.mark("ContentView.task begin")
                     appDelegate.appState = state
@@ -30,6 +31,7 @@ struct KatanaApp: App {
                     WelcomeWindowController.shared.showIfFirstLaunch()
                     LaunchTrace.mark("ContentView.task → restoreSessionIfNeeded")
                     await state.restoreSessionIfNeeded()
+                    state.checkForUpdatesInBackground()
                     LaunchTrace.mark("ContentView.task end")
                 }
                 .onAppear {
@@ -276,6 +278,10 @@ struct KatanaApp: App {
             CommandGroup(after: .help) {
                 Button("Welcome to Katana") {
                     WelcomeWindowController.shared.show()
+                }
+
+                Button("Check for Updates…") {
+                    state.checkForUpdates(userInitiated: true)
                 }
             }
         }
