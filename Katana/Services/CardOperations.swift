@@ -760,6 +760,46 @@ enum CardOperations: Sendable {
         var hashedBytes: Int64 = 0
         var hashSeconds = 0.0
 
+        // Names already on the card (case-insensitive). Auto-rename will not reuse them —
+        // keeps beltrunner/shipplay/combat variants distinct when they share one IP product.
+        var claimedDisplayNames = Set(
+            updatedExisting.map { $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+        )
+
+        // Batch-aware: if several packages in this import would auto-rename to the *same*
+        // GameDB / IP title (typical for test builds of one product), force source names
+        // for every member of that collision set — not only the 2nd+ after sequential claim.
+        var forceSourceNameIDs = Set<UUID>()
+        if preferDatabaseNames, prepared.count > 1 {
+            var preferredByID: [UUID: String] = [:]
+            preferredByID.reserveCapacity(prepared.count)
+            for slot in prepared {
+                let ip = IpBinReader.read(
+                    folderURL: slot.source.packageURL,
+                    imageFileName: slot.source.imageFileName,
+                    format: slot.format
+                )
+                let preferred = importDisplayName(
+                    source: slot.source,
+                    ip: ip,
+                    preferDatabaseNames: true,
+                    reservedNames: []
+                ).name
+                preferredByID[slot.entryID] = preferred
+            }
+            var counts: [String: Int] = [:]
+            for name in preferredByID.values {
+                counts[name.lowercased(), default: 0] += 1
+            }
+            for (id, name) in preferredByID {
+                let key = name.lowercased()
+                if counts[key, default: 0] > 1 || claimedDisplayNames.contains(key) {
+                    forceSourceNameIDs.insert(id)
+                }
+            }
+        }
+
         // Copy first (markers + mid-file fill). Hash on source after each package’s files land
         // so we never re-walk multi‑GB tracks on the card (`loadFolderDetails`).
         for (offset, slot) in prepared.enumerated() {
@@ -839,11 +879,14 @@ enum CardOperations: Sendable {
                     imageFileName: imageName,
                     format: slot.format
                 )
+                let useDatabaseName = preferDatabaseNames && !forceSourceNameIDs.contains(slot.entryID)
                 let resolvedName = importDisplayName(
                     source: slot.source,
                     ip: ip,
-                    preferDatabaseNames: preferDatabaseNames
+                    preferDatabaseNames: useDatabaseName,
+                    reservedNames: claimedDisplayNames
                 )
+                claimedDisplayNames.insert(resolvedName.name.lowercased())
 
                 try resolvedName.name.write(
                     to: slot.dest.appendingPathComponent(nameFile),
@@ -1435,19 +1478,32 @@ enum CardOperations: Sendable {
     /// Import naming: source file / folder first (distinguishes variants), then GameDB / IP.BIN.
     /// With `preferDatabaseNames`, that order flips: GameDB title (looked up by the IP.BIN
     /// serial) → IP.BIN product name → source file / folder.
+    ///
+    /// - Parameter reservedNames: case-insensitive names already on the card or claimed
+    ///   earlier in this import. When auto-rename would reuse one of these (e.g. six
+    ///   beltrunner builds → the same GameDB title), falls back to the source name so
+    ///   variants stay distinguishable.
     nonisolated static func importDisplayName(
         source: DiscImportSource,
         ip: IpBinInfo?,
-        preferDatabaseNames: Bool = false
+        preferDatabaseNames: Bool = false,
+        reservedNames: Set<String> = []
     ) -> (name: String, serial: String) {
         let serial = ip?.productNumber.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let reserved = Set(reservedNames.map { $0.lowercased() })
 
         if preferDatabaseNames {
+            var dbName: String?
             if let title = GameDatabase.title(for: serial) {
-                return (title, serial)
+                dbName = title
+            } else if let raw = ip?.name.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+                dbName = raw.localizedCapitalized
             }
-            if let raw = ip?.name.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
-                return (raw.localizedCapitalized, serial)
+            if let dbName, !dbName.isEmpty {
+                if !reserved.contains(dbName.lowercased()) {
+                    return (dbName, serial)
+                }
+                // Collision — keep going for source-based name.
             }
         }
 

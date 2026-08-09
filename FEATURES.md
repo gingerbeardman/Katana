@@ -68,7 +68,7 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 - **Honest card writes** — copies to the card bypass the macOS write cache (`F_NOCACHE`), so the bar tracks bytes physically on the card: no instant leap on big files, no long wait at a finished file's marker, and measured transfer rates stay true
 - **Formats** — GDI (cue + tracks), CDI, CCD (plus `.img` / `.sub` / `.cue` companions), game folders, or `.zip` archives
 - **Automatic renumbering** — existing folders are widened first when the digit count has to grow (99 → 100); menu slot stays **`01`**
-- **Import naming** — by default, **Automatically rename added games** (Settings) names each new slot from the GameDB via the IP.BIN serial (fallback: IP.BIN product name). Off uses the source file or folder name. **Hold ⌥** while confirming Add Games or while dropping files to keep source names for **that import only**
+- **Import naming** — by default, **Automatically rename added games** (Settings) names each new slot from the GameDB via the IP.BIN serial (fallback: IP.BIN product name). Off uses the source file or folder name. **Hold ⌥** while confirming Add Games or while dropping files to keep source names for **that import only**. If several files in one add (or a name already on the card) would collapse to the **same** GameDB title, those keep their source names so test builds stay distinguishable
 - **Hashes on import** — content hashes are computed after add so new games join the duplicate suite; hashing is paused before delete / empty trash so FAT cards can free space cleanly
 - **Soft delete** — ⌫ / Delete moves games to `.katana-trash` (fast, undoable); remaining slots pack down with single-pass renames
 - **Delete Immediately** — ⌥⌫, or hold ⌥ in Game / context menus so **Delete** swaps to **Delete Immediately…** (Finder-style alternate); erases folders from the card now (slow for large GDI sets, with edge progress); confirmation; cannot be undone
@@ -166,7 +166,7 @@ Collapsible sections, each remembering its expanded state:
 - **Unit preference** — whole megabytes or adaptive KB/MB for games; GB for card capacity and trash (trash floor **0.1 GB** when non-empty)
 - **Non-blocking status** — flash messages, an inline error banner you can dismiss, and progress in the window subtitle
 - **Edge progress** — scan, menu rebuild, and disk mutations (add / delete / renumber / eject) share one chunked top bar (markers + fill) instead of a center blocking card; active import rows spin
-- **Update check** — Help → Check for Updates… queries the GitHub Releases API; a quiet launch check offers a banner when a newer version is out (requires sandboxed outbound network)
+- **Check for Updates** — Help → Check for Updates… queries the public GitHub Releases API for this app; a quiet check also runs at launch and shows a banner when a newer version is available (sandboxed outbound network for updates only)
 
 ## Distribution
 
@@ -175,7 +175,7 @@ Collapsible sections, each remembering its expanded state:
 - **macOS 14 Sonoma** or later
 - **No dependencies** — no .NET, no helper processes, no bundled third-party runtimes
 - **MIT licence** — see `LICENSE`
-- **GitHub Releases** — distribution and version checks against `gingerbeardman/Katana`
+- **GitHub Releases** — DMG downloads and in-app **Check for Updates** against `gingerbeardman/Katana`
 
 ---
 

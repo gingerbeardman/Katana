@@ -255,6 +255,42 @@ struct CardOperationsTests {
         #expect(unresolved.name == "BELTRUNNER-SHIPPLAY-DC")
     }
 
+    @Test func importDisplayNameFallsBackToSourceWhenNameReserved() {
+        // Second (and later) beltrunner builds share one product title — keep the file name.
+        let source = CardOperations.DiscImportSource(
+            packageURL: URL(fileURLWithPath: "/tmp"),
+            fileNames: ["beltrunner-shipplay-f64-dc.cdi"],
+            imageFileName: "beltrunner-shipplay-f64-dc.cdi",
+            hintName: "beltrunner-shipplay-f64-dc"
+        )
+        let ip = IpBinInfo(
+            name: "BELTRUNNER",
+            productNumber: "IND-743215",
+            disc: "1/1",
+            region: "JUE",
+            vga: true,
+            version: "V1.000",
+            releaseDate: "20200101",
+            isCodeBreaker: false
+        )
+        let unique = CardOperations.importDisplayName(
+            source: source,
+            ip: ip,
+            preferDatabaseNames: true,
+            reservedNames: []
+        )
+        #expect(unique.name == "Beltrunner")
+
+        let collision = CardOperations.importDisplayName(
+            source: source,
+            ip: ip,
+            preferDatabaseNames: true,
+            reservedNames: ["Beltrunner"]
+        )
+        #expect(collision.name == "beltrunner-shipplay-f64-dc")
+        #expect(collision.serial == "IND-743215")
+    }
+
     @Test func importDisplayNameUsesFolderWhenImageIsDisc() {
         let source = CardOperations.DiscImportSource(
             packageURL: URL(fileURLWithPath: "/tmp/BELTRUNNER-COMBAT-STATS-DC"),
