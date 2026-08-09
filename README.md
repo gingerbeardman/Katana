@@ -126,7 +126,11 @@ As also credited by GDMENUCardManager:
 - License: **GPL-3.0** (see upstream)  
 - Bundled: `Katana/Resources/GameDB/dreamcast-titles.json`
 
-## License notes
+## License
+
+Katana itself is **[MIT](LICENSE)** © 2026 Matt Sephton.
+
+### Third-party notes
 
 - Menu GDI bake is a **Swift port** of the DiscUtils / GDromBuilder multi-track path (no Joliet, LBA 45000, truncated high-density tracks with CDDA).
 - **DiscUtils** lineage is **MIT** (Kenneth Bell); license text in `Tools/licenses/DiscUtils-LICENSE.txt`.

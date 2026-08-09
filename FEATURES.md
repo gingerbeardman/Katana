@@ -196,6 +196,6 @@ Collapsible sections, each remembering its expanded state:
 | Multi-card recents | Yes | – |
 | Read-only card detection | Yes | – |
 | Eject on quit | Yes | – |
-| Licence | Proprietary | GPL v3 |
+| Licence | MIT | GPL v3 |
 
 For Windows or Linux, archive import, MDS support, or GDI shrinking, use GDMENU Card Manager.
