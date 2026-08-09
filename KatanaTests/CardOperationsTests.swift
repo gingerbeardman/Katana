@@ -219,6 +219,42 @@ struct CardOperationsTests {
         #expect(resolved.serial == "IND-743215")
     }
 
+    @Test func importDisplayNamePrefersDatabaseWhenAutoRenaming() {
+        let source = CardOperations.DiscImportSource(
+            packageURL: URL(fileURLWithPath: "/tmp"),
+            fileNames: ["BELTRUNNER-SHIPPLAY-DC.cdi"],
+            imageFileName: "BELTRUNNER-SHIPPLAY-DC.cdi",
+            hintName: "BELTRUNNER-SHIPPLAY-DC"
+        )
+        let ip = IpBinInfo(
+            name: "BELTRUNNER",
+            productNumber: "IND-743215",
+            disc: "1/1",
+            region: "JUE",
+            vga: true,
+            version: "V1.000",
+            releaseDate: "20200101",
+            isCodeBreaker: false
+        )
+        // Homebrew serial is not in the GameDB → falls back to the IP.BIN product name,
+        // not the source file name.
+        let resolved = CardOperations.importDisplayName(
+            source: source,
+            ip: ip,
+            preferDatabaseNames: true
+        )
+        #expect(resolved.name == "Beltrunner")
+        #expect(resolved.serial == "IND-743215")
+
+        // No IP.BIN at all → keep the source-derived name.
+        let unresolved = CardOperations.importDisplayName(
+            source: source,
+            ip: nil,
+            preferDatabaseNames: true
+        )
+        #expect(unresolved.name == "BELTRUNNER-SHIPPLAY-DC")
+    }
+
     @Test func importDisplayNameUsesFolderWhenImageIsDisc() {
         let source = CardOperations.DiscImportSource(
             packageURL: URL(fileURLWithPath: "/tmp/BELTRUNNER-COMBAT-STATS-DC"),
@@ -328,7 +364,8 @@ struct CardOperationsTests {
     }
 
     @Test func copyProgressSegmentsAreByteWeighted() throws {
-        // Two tracks + cue → size-weighted notches; fill jumps only after each file completes.
+        // Cue + two tracks → chunk widths follow file sizes; fill never crosses the active
+        // file's notch before it completes; hold under 1 during finalize.
         let fm = FileManager.default
         let root = try makeFixture(names: ["GDMENU"])
         defer { try? fm.removeItem(at: root) }
@@ -342,42 +379,64 @@ struct CardOperationsTests {
         2 45000 4 2048 large.bin 0
         """
         try gdi.write(to: src.appendingPathComponent("game.gdi"), atomically: true, encoding: .utf8)
-        try Data(repeating: 1, count: 100).write(to: src.appendingPathComponent("small.bin"))
+        // small.bin is far below the 2% visibility floor; large.bin dominates by bytes.
+        try Data(repeating: 1, count: 5).write(to: src.appendingPathComponent("small.bin"))
         try Data(repeating: 2, count: 900).write(to: src.appendingPathComponent("large.bin"))
+
+        let gdiSize = Double((try Data(contentsOf: src.appendingPathComponent("game.gdi"))).count)
+        // Mirror the import weighting: copy time per file (size ÷ write rate) plus one
+        // trailing hash unit per slot (payload ÷ hash rate), with a 2% visibility floor
+        // on file chunks. Explicit rates keep the math deterministic.
+        let rates = CardOperations.TransferRateEstimates(
+            writeBytesPerSecond: 100,
+            hashBytesPerSecond: 1000
+        )
+        let sizes: [Double] = [gdiSize, 5, 900]
+        let rawFileWeights = sizes.map { $0 / 100 }
+        let hashWeight = sizes.reduce(0, +) / 1000
+        let rawTotal = rawFileWeights.reduce(0, +) + hashWeight
+        let floorWeight = 0.02 * rawTotal
+        let fileWeights = rawFileWeights.map { max($0, floorWeight) }
+        let totalWeight = fileWeights.reduce(0, +) + hashWeight
+        let expectedEnds = [
+            fileWeights[0] / totalWeight,
+            (fileWeights[0] + fileWeights[1]) / totalWeight,
+            (fileWeights[0] + fileWeights[1] + fileWeights[2]) / totalWeight,
+        ]
 
         var lastEnds: [Double] = []
         var maxFraction: Double = 0
-        var midFractions: [Double] = []
+        var sawSubFullHold = false
+        var monotonic = true
+        var previousFraction = -1.0
         let games = try loadEntries(root: root)
         _ = try CardOperations.importDiscs(
             sources: [src.appendingPathComponent("game.gdi")],
             games: games,
             rootURL: root,
+            rates: rates,
             onEvent: { event in
                 if case .copyProgress(let f, let ends) = event {
                     maxFraction = max(maxFraction, f)
+                    if f < previousFraction { monotonic = false }
+                    previousFraction = f
                     if ends.count >= 2 { lastEnds = ends }
-                    // Before the final 1.0 emit, bar must stay under full (finalize hold).
-                    if f < 1 { midFractions.append(f) }
+                    if abs(f - 0.99) < 0.001 { sawSubFullHold = true }
                 }
             }
         )
         #expect(maxFraction == 1)
-        #expect(lastEnds.count == 3) // gdi + small + large
-        // Largest segment should be the last track (900 bytes of ~1000+ payload).
-        guard lastEnds.count >= 2 else { return }
-        let starts = [0.0] + lastEnds.dropLast()
-        let widths = zip(starts, lastEnds).map { $1 - $0 }
-        #expect(widths.max()! >= 0.7) // large.bin dominates
-        // Discrete notches: every pre-final fraction is a segment end (or 0), never mid-file crawl.
-        let notchSet = Set(lastEnds.map { ($0 * 1000).rounded() / 1000 })
-        for f in midFractions where f > 0 {
-            let rounded = (f * 1000).rounded() / 1000
-            // Cap after last file is 0.99, not a free-running byte fraction.
-            #expect(notchSet.contains(rounded) || abs(f - 0.99) < 0.001)
-        }
-        #expect(midFractions.contains(where: { abs($0 - 0.99) < 0.001 })
-                || midFractions.allSatisfy { $0 < 1 })
+        #expect(monotonic)
+        #expect(lastEnds.count == 3) // one marker per file (hash stretch has no marker)
+        // Time-weighted with floor: large.bin dominates, small files keep ≥2% chunks,
+        // and the last marker sits short of 1 — the hash stretch fills the tail.
+        guard lastEnds.count == 3 else { return }
+        #expect(abs(lastEnds[0] - expectedEnds[0]) < 0.001)
+        #expect(abs(lastEnds[1] - expectedEnds[1]) < 0.001)
+        #expect(abs(lastEnds[2] - expectedEnds[2]) < 0.001)
+        #expect(lastEnds[1] - lastEnds[0] >= 0.019) // floor keeps tiny files' notches visible
+        #expect(lastEnds[2] < 0.999) // hash tail reserved after the last file
+        #expect(sawSubFullHold) // cap before finalize / final 1.0
     }
 
     @Test func resolveGDIPackageCopiesOnlyCueTracks() throws {

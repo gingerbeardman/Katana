@@ -25,6 +25,18 @@ private struct GeneralSettingsPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            SettingsSection(title: "Adding:") {
+                SettingsToggle(
+                    "Automatically rename added games",
+                    isOn: $state.autoRenameAddedGames
+                )
+                SettingsDescription(
+                    "Name each new game from the GameDB, looked up by the serial in its IP.BIN (falls back to the IP.BIN name). Off keeps the source file or folder name. On by default."
+                )
+            }
+
+            SettingsSeparator()
+
             SettingsSection(title: "Duplicates:") {
                 SettingsToggle(
                     "Enable duplicate tools",
@@ -51,18 +63,6 @@ private struct GeneralSettingsPanel: View {
                         "Highlight duplicates and dim the rest. All rows stay in place."
                     )
                 }
-            }
-
-            SettingsSeparator()
-
-            SettingsSection(title: "List:") {
-                SettingsToggle(
-                    "Scroll to new rows while scanning",
-                    isOn: $state.scrollToNewRows
-                )
-                SettingsDescription(
-                    "Follow each game as the table fills (and after Add).\nOff by default."
-                )
             }
 
             SettingsSeparator()

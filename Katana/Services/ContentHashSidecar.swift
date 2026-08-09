@@ -92,13 +92,18 @@ enum ContentHashSidecar: Sendable {
 
     /// Hash payload bytes from arbitrary paths using **canonical names** in the digest.
     /// Does not write sidecars — use `write(_:to:)` after files exist at the destination.
-    nonisolated static func compute(sources: [PayloadSource]) throws -> ComputeResult {
+    /// `onBytes` reports cumulative hashed bytes (per ~1 MB chunk) for progress bars.
+    nonisolated static func compute(
+        sources: [PayloadSource],
+        onBytes: (_ hashedBytes: Int64) -> Void = { _ in }
+    ) throws -> ComputeResult {
         let ordered = sources.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         guard !ordered.isEmpty else { throw HashError.noPayload }
 
         var hasher = SHA256()
         var perFileSHA256: [(name: String, hex: String)] = []
         var totalSize: Int64 = 0
+        var hashedBytes: Int64 = 0
 
         for item in ordered {
             hasher.update(data: Data(item.name.utf8))
@@ -114,6 +119,8 @@ enum ContentHashSidecar: Sendable {
                 if chunk.isEmpty { break }
                 hasher.update(data: chunk)
                 fileHasher.update(data: chunk)
+                hashedBytes += Int64(chunk.count)
+                onBytes(hashedBytes)
             }
             let fileHex = fileHasher.finalize().map { String(format: "%02x", $0) }.joined()
             perFileSHA256.append((item.name, fileHex))

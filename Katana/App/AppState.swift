@@ -37,8 +37,6 @@ final class AppState {
             rebuildInspectorSnapshot()
         }
     }
-    /// Bumped while the table is filling so the list can scroll to the newest row.
-    var scrollTargetGameID: GameEntry.ID?
     var searchText: String = ""
     /// Master switch for the duplicates suite (sidebar, markers, commands). Default **off**.
     var duplicatesEnabled: Bool = AppState.loadDuplicatesEnabled() {
@@ -77,10 +75,11 @@ final class AppState {
             UserDefaults.standard.set(manageMultipleCards, forKey: AppState.manageMultipleCardsKey)
         }
     }
-    /// When true, follow newly scanned/imported rows in the table. Default off.
-    var scrollToNewRows: Bool = UserDefaults.standard.bool(forKey: AppState.scrollToNewRowsKey) {
+    /// When true, added games are named from the GameDB (looked up by the IP.BIN serial),
+    /// falling back to the IP.BIN product name. Default on.
+    var autoRenameAddedGames: Bool = AppState.loadAutoRenameAddedGames() {
         didSet {
-            UserDefaults.standard.set(scrollToNewRows, forKey: AppState.scrollToNewRowsKey)
+            UserDefaults.standard.set(autoRenameAddedGames, forKey: AppState.autoRenameAddedGamesKey)
         }
     }
     /// When true, game/list sizes are whole MB (`1,188 MB`). When false, adaptive KB/MB.
@@ -146,6 +145,9 @@ final class AppState {
     private(set) var bakedMenuKind: MenuKind = .gdMenu
     /// Names / order / slots changed since the last bake (independent of menu-type picker).
     private(set) var menuContentDirty: Bool = false
+    /// Fingerprint of list-relevant game state after last bake (or card open).
+    /// Add then delete (or rename then undo) can match this again → clear dirty.
+    private var bakedMenuFingerprint: String = ""
     /// Rebuild needed when the list changed **or** the chosen type ≠ what’s on the card.
     var menuNeedsRebuild: Bool {
         guard volume != nil, !games.isEmpty else { return false }
@@ -183,7 +185,7 @@ final class AppState {
     private static let showDuplicateMarkersKey = "showDuplicateMarkers"
     private static let ejectOnQuitKey = "ejectOnQuit"
     private static let manageMultipleCardsKey = "manageMultipleCards"
-    private static let scrollToNewRowsKey = "scrollToNewRows"
+    private static let autoRenameAddedGamesKey = "autoRenameAddedGames"
     private static let sizesAsIntegerMBKey = "sizesAsIntegerMB"
     private static let isInspectorPresentedKey = "isInspectorPresented"
     private static let inspectorSectionsKey = "inspectorSectionExpanded"
@@ -253,6 +255,14 @@ final class AppState {
             return true
         }
         return UserDefaults.standard.bool(forKey: sizesAsIntegerMBKey)
+    }
+
+    /// Default on (GameDB names for added games) when the key has never been written.
+    private static func loadAutoRenameAddedGames() -> Bool {
+        if UserDefaults.standard.object(forKey: autoRenameAddedGamesKey) == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: autoRenameAddedGamesKey)
     }
 
     /// Game sizes: Size column, inspector, selection totals — **MB only** (never GB).
@@ -1098,6 +1108,7 @@ final class AppState {
         notDuplicateKeys = []
         games = []
         menuContentDirty = false
+        bakedMenuFingerprint = ""
         // Drop previous card’s sort immediately so the Table does not keep stale header
         // chevrons / order while the new volume resolves (cold open was the worst case).
         displaySort = .mostRecentFirst
@@ -1205,6 +1216,10 @@ final class AppState {
             } else {
                 lastScanStats = "\(result.cacheHits) cached · \(result.cacheMisses) scanned · \(result.durationMilliseconds) ms"
             }
+
+            // Assume on-card menu matches the scanned list until the user edits it.
+            captureBakedMenuFingerprint()
+            menuContentDirty = false
 
             // List is interactive as soon as rows are assigned — do not block on menu
             // detection (IP.BIN), trash summary, or bookmark refresh.
@@ -1471,10 +1486,6 @@ final class AppState {
             for entry in incoming {
                 insertScannedEntry(entry)
             }
-        }
-        if isScanning, scrollToNewRows, let last = incoming.last {
-            selection = [last.id]
-            scrollTargetGameID = last.id
         }
         let ms = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         if ms >= 8 || incoming.count >= 50 {
@@ -1998,6 +2009,7 @@ final class AppState {
             trashSummary = .empty
             lastScanStats = nil
             menuContentDirty = false
+            bakedMenuFingerprint = ""
             bakedMenuKind = .gdMenu
             menuKind = .gdMenu
             displaySort = .mostRecentFirst
@@ -2065,6 +2077,8 @@ final class AppState {
         let root = accessURL ?? volume.rootURL
         let snapshot = games
         let eventHandler = makeImportEventHandler()
+        let preferDatabaseNames = autoRenameAddedGames
+        let rates = TransferRateStore.estimates(volumeUUID: volume.volumeUUID)
 
         // Sandbox: keep security scope for open-panel / Finder-drop sources until copy finishes.
         var scopedURLs: [URL] = []
@@ -2089,17 +2103,24 @@ final class AppState {
                     sources: urls,
                     games: snapshot,
                     rootURL: root,
+                    preferDatabaseNames: preferDatabaseNames,
+                    rates: rates,
                     onEvent: eventHandler
                 )
             }.value
+
+            // Fold measured transfer samples into remembered rates for future bars.
+            TransferRateStore.recordCardWrite(
+                bytes: result.copiedBytes,
+                seconds: result.copySeconds,
+                volumeUUID: self.volume?.volumeUUID
+            )
+            TransferRateStore.recordImportHash(bytes: result.hashedBytes, seconds: result.hashSeconds)
 
             // Events already painted the list; reconcile with the authoritative result.
             games = result.games
             if let last = result.added.last {
                 selection = [last.id]
-                if scrollToNewRows {
-                    scrollTargetGameID = last.id
-                }
             }
             scheduleDuplicateRecompute()
             markMenuNeedsRebuild()
@@ -2381,13 +2402,20 @@ final class AppState {
                 self.mutationProgress = min(1, max(0, fraction))
             }
         }
+        // Chunk markers: size-weighted when we know payload sizes, else equal per game.
+        let deleteSegments: [Double] = {
+            let sizes = victims.map { max($0.byteSize, 1) }
+            let weighted = EdgeProgressBar.byteWeightedEnds(sizes: sizes)
+            return weighted.count > 1 ? weighted : EdgeProgressBar.equalEnds(count: victims.count)
+        }()
 
         Task {
             // Post-drop auto-hash may still have these folders open — FAT then fails later deletes.
             await cancelBackgroundCardReaders()
             beginMutation(
                 permanent ? "Deleting \(label)…" : "Removing \(label)…",
-                progress: 0
+                progress: 0,
+                segments: deleteSegments
             )
             defer { endMutation() }
             do {
@@ -2442,9 +2470,15 @@ final class AppState {
         let root = accessURL ?? volume.rootURL
         let label = trashed.count == 1 ? trashed[0].game.name : "\(trashed.count) games"
         let progress = makeProgressHandler()
+        let fractionHandler: @Sendable (Double) -> Void = { [weak self] fraction in
+            Task { @MainActor [weak self] in
+                guard let self, self.busyMessage != nil else { return }
+                self.mutationProgress = min(1, max(0, fraction))
+            }
+        }
 
         Task {
-            beginMutation("Restoring \(label)…")
+            beginMutation("Restoring \(label)…", progress: 0)
             defer { endMutation() }
             do {
                 let updated = try await Task.detached {
@@ -2452,7 +2486,8 @@ final class AppState {
                         trashed: trashed,
                         currentGames: snapshot,
                         rootURL: root,
-                        progress: progress
+                        progress: progress,
+                        fractionProgress: fractionHandler
                     )
                 }.value
 
@@ -2580,13 +2615,17 @@ final class AppState {
         volume != nil && !games.isEmpty && !isBusy && !isHashing
     }
 
+    /// Recompute whether the live list still matches the last bake / open snapshot.
+    /// Add→delete (or rename→undo) that restores the same slots/names clears the prompt.
     func markMenuNeedsRebuild() {
+        let dirty = menuListFingerprint(for: games) != bakedMenuFingerprint
+        guard menuContentDirty != dirty else { return }
         // Avoid implicit layout animation when the rebuild strip appears — that was
         // sliding the whole window contents up under the titlebar after rename.
         var transaction = Transaction()
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            menuContentDirty = true
+            menuContentDirty = dirty
         }
     }
 
@@ -2594,6 +2633,21 @@ final class AppState {
     func clearMenuNeedsRebuild() {
         menuContentDirty = false
         bakedMenuKind = menuKind
+        captureBakedMenuFingerprint()
+    }
+
+    /// Snapshot list-relevant fields (slot, name, serial, menu flag) for dirty tracking.
+    private func menuListFingerprint(for games: [GameEntry]) -> String {
+        games
+            .sorted { $0.number < $1.number }
+            .map { g in
+                "\(g.number)\u{1e}\(g.name)\u{1e}\(g.serial)\u{1e}\(g.isMenu ? 1 : 0)"
+            }
+            .joined(separator: "\u{1f}")
+    }
+
+    private func captureBakedMenuFingerprint() {
+        bakedMenuFingerprint = menuListFingerprint(for: games)
     }
 
     /// Rebuild the on-console GDmenu / openMenu image so the list matches current slots/names.
@@ -2645,46 +2699,58 @@ final class AppState {
             // a defer that cleared the flag used to drop the final 1.0 hop, so the bar stopped
             // short of full width when the rebuild finished.
             let progressRelay = RebuildProgressRelay(self)
+            // Quit-time rebuild: skip per-tick MainActor status thrash (keeps the card free).
+            let quitting = isHandlingQuit
+            let progress: @Sendable (String, Double) -> Void
+            if quitting {
+                progress = { _, _ in }
+            } else {
+                progress = { message, fraction in
+                    progressRelay.update(message: message, fraction: fraction)
+                }
+            }
             let result = try await Task.detached(priority: .userInitiated) {
                 try MenuRebuildService.rebuild(
                     games: snapshot,
                     rootURL: root,
                     menuKind: kind,
-                    progress: { message, fraction in
-                        progressRelay.update(message: message, fraction: fraction)
-                    }
+                    progress: progress
                 )
             }.value
 
-            // Ensure the bar paints full before we hide it.
             rebuildProgress = 1
             statusText = "Installed \(result.menuKind.displayName)"
-            try? await Task.sleep(for: .milliseconds(200))
+            // Hold full bar only for interactive rebuilds — quit path should not wait.
+            if !quitting {
+                try? await Task.sleep(for: .milliseconds(200))
+            }
 
-            // Light refresh of the menu row size / name; full rescan is unnecessary.
+            // Light refresh of the menu row. Never walk the menu tree on quit —
+            // `directorySize` of a multi-track menu GDI on FAT can stall for seconds.
             if let idx = games.firstIndex(where: { $0.number == 1 }) {
                 games[idx].name = result.menuKind.menuFolderName
                 games[idx].isMenu = true
                 games[idx].format = .gdi
                 games[idx].imageFileName = "disc.gdi"
                 games[idx].folderPath = result.menuFolderPath
-                if let size = directorySize(at: result.menuFolderPath) {
+                games[idx].contentSHA256 = nil
+                if !quitting, let size = directorySize(at: result.menuFolderPath) {
                     games[idx].byteSize = size
                     games[idx].payloadByteSize = size
                 }
-                games[idx].contentSHA256 = nil
             }
             menuKind = result.menuKind
-            bakedMenuKind = result.menuKind
-            menuContentDirty = false
-            if let uuid = volume?.volumeUUID {
+            clearMenuNeedsRebuild()
+            if !quitting, let uuid = volume?.volumeUUID {
                 try? await VolumeStore.shared.setMenuKind(result.menuKind, for: uuid)
             }
 
-            refreshStatus()
-            invalidateCacheAsync()
-            flash("Rebuilt \(result.menuKind.displayName) · \(result.itemCount) items")
-            statusText = "\(result.menuKind.displayName) rebuilt · \(result.itemCount) items · \(formatSize(Int64(result.listByteCount))) list"
+            if !quitting {
+                refreshStatus()
+                invalidateCacheAsync()
+                flash("Rebuilt \(result.menuKind.displayName) · \(result.itemCount) items")
+                statusText = "\(result.menuKind.displayName) rebuilt · \(result.itemCount) items · \(formatSize(Int64(result.listByteCount))) list"
+            }
             isRebuildingMenu = false
             rebuildProgress = nil
             return true
@@ -2692,7 +2758,9 @@ final class AppState {
             isRebuildingMenu = false
             rebuildProgress = nil
             lastError = cardWriteErrorMessage(error)
-            refreshStatus()
+            if !isHandlingQuit {
+                refreshStatus()
+            }
             return false
         }
     }
@@ -2772,6 +2840,9 @@ final class AppState {
     /// Rebuild (optional) → optional eject → allow app termination.
     private func finishQuit(rebuild: Bool) async {
         let shouldEject = ejectOnQuit && volume != nil
+        // Stop lazy readers so rebuild/eject isn’t fighting enrichment for the SD bus.
+        // (Hashing already blocks quit via the terminate alert.)
+        cancelLazyDetailEnrichment()
         // Rebuild uses the edge progress bar (isRebuildingMenu), not a center card.
         if !rebuild, shouldEject {
             beginMutation("Ejecting…")
@@ -2782,6 +2853,7 @@ final class AppState {
         }
 
         if rebuild {
+            statusText = "Rebuilding menu before quit…"
             let ok = await rebuildMenuListAsync()
             if !ok {
                 // Stay open so the user can fix the error.
@@ -2817,6 +2889,7 @@ final class AppState {
             selection = []
             trashSummary = .empty
             menuContentDirty = false
+            bakedMenuFingerprint = ""
             bakedMenuKind = .gdMenu
             menuKind = .gdMenu
             displaySort = .mostRecentFirst
@@ -2854,10 +2927,15 @@ final class AppState {
     }
 
     /// Start a non-scan / non-rebuild disk mutation (edge bar + subtitle).
-    private func beginMutation(_ message: String, progress: Double? = nil) {
+    /// - Parameter segments: cumulative chunk ends (0…1) for the shared edge markers.
+    private func beginMutation(
+        _ message: String,
+        progress: Double? = nil,
+        segments: [Double]? = nil
+    ) {
         busyMessage = message
         mutationProgress = progress
-        mutationProgressSegments = nil
+        mutationProgressSegments = segments.flatMap { $0.count > 1 ? $0 : nil }
         statusText = message
     }
 
@@ -2906,9 +2984,6 @@ final class AppState {
             } else {
                 games.append(entry)
             }
-            if scrollToNewRows {
-                scrollTargetGameID = entry.id
-            }
             selection = [entry.id]
 
         case .slotActive(let id):
@@ -2930,14 +3005,20 @@ final class AppState {
             }
 
         case .fraction(let value):
+            guard busyMessage != nil else { return }
             mutationProgress = min(1, max(0, value))
 
         case .copyProgress(let fraction, let segmentEnds):
+            guard busyMessage != nil else { return }
             mutationProgress = min(1, max(0, fraction))
             // Only show dividers when there are multiple real segments.
             mutationProgressSegments = segmentEnds.count > 1 ? segmentEnds : nil
 
         case .message(let text):
+            // Trailing events can hop to MainActor after `endMutation()` (e.g. the final
+            // “Added N games”) — never resurrect the busy chrome, or `isBusy` sticks true
+            // and disables Empty Trash / Card actions until the next mutation.
+            guard busyMessage != nil else { return }
             busyMessage = text
             statusText = text
         }

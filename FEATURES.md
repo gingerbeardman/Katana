@@ -29,7 +29,7 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 - **Batched progress** — entries arrive in batches of 24 so the table fills smoothly; live progress in the window subtitle and as a 2pt edge bar
 - **Tuned concurrency** — 8 concurrent folder workers, deliberately moderate because FAT/exFAT on SD hates high fan-out
 - **Off the main actor** — all card I/O is detached, so the UI never beachballs
-- **Rescan** and **Clear Cache and Rescan** for when you've changed the card behind Katana's back
+- **Rescan** and **Clear Cache and Rescan** (`⌘``R`) for when you've changed the card behind Katana's back
 - **Last Scan** readout — entries scanned, cache hits, and wall-clock duration
 
 ## Game List
@@ -50,7 +50,7 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 - **Inspector rename** — edit the title field and press Return
 - **Manual case conversion** — Sentence Case, Title Case, Uppercase, Lowercase, applied in bulk to any selection
 - **Automatic rename** from three sources, applied in bulk:
-  - **IP.BIN info** — GameDB title for the game serial, falling back to the product name in the IP.BIN header
+  - **GameDB lookup** — GameDB title looked up by the serial from IP.BIN, falling back to the product name in the IP.BIN header
   - **Folder name** — the on-card folder name (skipped when it's just a slot number)
   - **File name** — the image file base name (e.g. `.gdi` / `.cdi`), tidied (underscores and dots become spaces)
 - **Writes `name.txt` immediately** — compatible with other GDEMU managers; non-atomic FAT-friendly writes under the App Sandbox
@@ -58,15 +58,15 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 
 ## Adding & Removing Games
 
-- **Add Games** (`⇧``⌘``N`) — pick disc images or game folders into the next free slots, or **drag and drop** from Finder onto the game list
+- **Add Games** (`⌘``I`) — pick disc images or game folders into the next free slots, or **drag and drop** from Finder onto the game list
 - **Finder drop target** — AppKit pasteboard destination (2UP-style), not SwiftUI `.onDrop`, so multi-select Finder drops work reliably; accent ring while hovering
 - **Multi-file sets** — multi-select a `.gdi` with its tracks (or `.ccd` + companions); Katana groups them into one game. GDI imports copy **only** the cue + referenced tracks (not the whole parent folder). Redump-style **quoted track names** (spaces) are supported for copy and IP.BIN
 - **ZIP import** — drop or pick a `.zip` of game folders / disc-image sets; extracted in-process (sandbox-safe), then imported like loose packages
 - **Transparent copy** — each new slot’s folder and title appear in the list immediately; a top edge bar tracks overall progress and a per-row spinner marks the active file
-- **Byte-weighted import progress** — multi-file copies use size-weighted **segment notches**; the fill jumps one notch only when each file finishes (no mid-file crawl, no full-bar wait during finalize/hash)
+- **Chunked edge progress** — one bar for scan, rebuild, import, and delete: **time-weighted per-file chunks** on import using remembered transfer rates (one marker per valid file — a 1 GB track gets a wide chunk, every file keeps a ~2% floor so its marker stays visible — plus a hash stretch after each game's files, so finalize **crawls instead of stalling at 99%**), the fill advances by real bytes and **reaches a notch exactly when that file finishes** (never before); notches are gaps punched clean through the fill (visible on any fill colour, light or dark) and solid ticks on the unfilled track; import holds short of full until finalize
 - **Formats** — GDI (cue + tracks), CDI, CCD (plus `.img` / `.sub` / `.cue` companions), game folders, or `.zip` archives
 - **Automatic renumbering** — existing folders are widened first when the digit count has to grow (99 → 100); menu slot stays **`01`**
-- **Import naming** — source file or folder name first (so variants stay distinguishable), then GameDB / IP.BIN serial when readable
+- **Import naming** — source file or folder name first (so variants stay distinguishable), then GameDB / IP.BIN serial when readable; a Settings toggle (on by default) **automatically renames added games** via GameDB lookup (IP.BIN serial) instead
 - **Hashes on import** — content hashes are computed after add so new games join the duplicate suite; hashing is paused before delete / empty trash so FAT cards can free space cleanly
 - **Soft delete** — ⌫ / Delete moves games to `.katana-trash` (fast, undoable); remaining slots pack down with single-pass renames
 - **Delete Immediately** — ⌥⌫, or hold ⌥ in Game / context menus so **Delete** swaps to **Delete Immediately…** (Finder-style alternate); erases folders from the card now (slow for large GDI sets, with edge progress); confirmation; cannot be undone
@@ -129,7 +129,7 @@ Collapsible sections, each remembering its expanded state:
 - **No helper binaries** — no .NET runtime, no nested executables, no brotli dylibs in the app bundle; menu asset zips unpack **in-process** (sandbox-safe; no `/usr/bin/unzip`)
 - **List keys match folders** — menu stays in **`01`** (same as GDMENU Card Manager); game slots use card-wide width (`002`… on a 100+ game card) so GDmenu can resolve titles
 - **Menu type picker** — switch between GDmenu and openMenu from Settings or the Card menu
-- **Out-of-date banner** — a warning strip appears above the list when names or order no longer match the baked menu
+- **Out-of-date banner** — a warning strip appears above the list when names or order no longer match the baked menu; cleared again if you reverse the change (e.g. add a game then delete it, or undo a rename)
 - **Prompt on quit** — you're asked before leaving with a stale menu image
 - **Progress** — headers, bake stages (assets, tracks, disc.gdi), and install on the edge bar; bar reaches full width on completion
 - **Bundled stock assets** — GDmenu and openMenu packs ship inside the app as zip resources
@@ -155,14 +155,14 @@ Collapsible sections, each remembering its expanded state:
 
 - **SwiftUI** with a NavigationSplitView: sidebar, table, and trailing inspector
 - **Customisable toolbar** — the default set is Open · Add · Delete · Rebuild · A–Z · Eject · Inspector, with Move Up, Move Down, and Duplicates available in the palette
-- **Full keyboard support** — `⌘``O` open, `⇧``⌘``N` add, `⌘``S` rebuild, `⇧``⌘``E` eject, `⌫` soft-delete, `⌥``⌫` delete immediately, Return to rename, `⌥``⌘``I` inspector, `⌥``⌘``D` duplicate markers, `⌘``Z` undo
+- **Full keyboard support** — `⌘``O` open, `⌘``I` add, `⌘``S` rebuild, `⌘``R` clear cache and rescan, `⇧``⌘``E` eject, `⌫` soft-delete, `⌥``⌫` delete immediately, Return to rename, `⌥``⌘``I` inspector, `⌘``D` duplicate tools, `⌥``⌘``D` duplicate markers, `⌘``Z` undo
 - **Context menus** throughout the game list
 - **Dark Mode**, full screen, and window state restoration
 - **Welcome window** on first launch, reopenable from the Help menu
-- **Settings** — General (duplicates, list, units) and SD Card (menu type, multipass, cache, eject)
+- **Settings** — General (adding, duplicates, units) and SD Card (menu type, multipass, cache, eject)
 - **Unit preference** — whole megabytes or adaptive KB/MB for games; GB for card capacity and trash (trash floor **0.1 GB** when non-empty)
 - **Non-blocking status** — flash messages, an inline error banner you can dismiss, and progress in the window subtitle
-- **Edge progress** — scan, menu rebuild, and disk mutations (add / delete / renumber / eject) use a 2pt top bar instead of a center blocking card; multi-file imports use size-weighted segments; active import rows spin
+- **Edge progress** — scan, menu rebuild, and disk mutations (add / delete / renumber / eject) share one chunked top bar (markers + fill) instead of a center blocking card; active import rows spin
 - **Update check** — Help → Check for Updates… queries the GitHub Releases API; a quiet launch check offers a banner when a newer version is out (requires sandboxed outbound network)
 
 ## Distribution

@@ -42,14 +42,15 @@ enum MenuRebuildService: Sendable {
         let ordered = games.sorted { $0.number < $1.number }
         let kind = menuKind ?? detectMenuKind(games: ordered) ?? .gdMenu
 
-        // Weight by real cost: headers are quick; bake dominates; install is I/O on the card.
-        // Headers 0…0.18 · bake 0.18…0.88 · install 0.88…1.0
+        // Weight by real cost: headers dominate (per-game IP.BIN reads off the FAT card,
+        // ~80% of wall time on large cards); bake runs on local temp; install is one
+        // image copy. Headers 0…0.80 · bake 0.80…0.96 · install 0.96…1.0
         progress?("Reading game headers…", 0.02)
         let items = MenuListGenerator.items(for: ordered, menuKind: kind) { done, total in
             let t = max(total, 1)
             // Report often enough for a smooth bar without flooding the UI.
             if done == 0 || done == total || done % 10 == 0 || t < 40 {
-                let frac = 0.02 + 0.16 * (Double(done) / Double(t))
+                let frac = 0.02 + 0.78 * (Double(done) / Double(t))
                 progress?("Reading game headers… \(done)/\(total)", frac)
             }
         }
@@ -57,7 +58,7 @@ enum MenuRebuildService: Sendable {
         // Keys must match on-disk folders: menu `01`, games `002`… when max ≥ 100 (GCM).
         let maxNumber = ordered.map(\.number).max() ?? ordered.count
         let listText = MenuListGenerator.makeList(kind: kind, items: items, maxNumber: maxNumber)
-        progress?("Building \(kind.displayName) image…", 0.18)
+        progress?("Building \(kind.displayName) image…", 0.80)
 
         let assets = try assetsURL(for: kind)
 
@@ -79,8 +80,8 @@ enum MenuRebuildService: Sendable {
                     outDir: outDir,
                     truncate: true,
                     progress: { message, bakeFraction in
-                        // Map bake 0…1 → overall 0.18…0.88
-                        let overall = 0.18 + 0.70 * min(1, max(0, bakeFraction))
+                        // Map bake 0…1 → overall 0.80…0.96
+                        let overall = 0.80 + 0.16 * min(1, max(0, bakeFraction))
                         progress?(message, overall)
                     }
                 )
@@ -89,7 +90,7 @@ enum MenuRebuildService: Sendable {
             throw RebuildError.bakeFailed(error.localizedDescription)
         }
 
-        progress?("Installing menu into slot 01…", 0.90)
+        progress?("Installing menu into slot 01…", 0.96)
         let menuFolder = try installMenu(
             builtGDI: outDir,
             games: ordered,

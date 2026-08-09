@@ -70,7 +70,7 @@ struct KatanaApp: App {
                 Button("Add Games…") {
                     state.addGames()
                 }
-                .keyboardShortcut("n", modifiers: [.command, .shift])
+                .keyboardShortcut("i", modifiers: .command)
                 .disabled(!state.canAddGames)
 
                 Button("Apply A–Z Order to Card") {
@@ -148,6 +148,7 @@ struct KatanaApp: App {
                 Button("Clear Cache and Rescan") {
                     Task { await state.clearCacheAndRescan() }
                 }
+                .keyboardShortcut("r", modifiers: .command)
                 .disabled(state.volume == nil || state.isBusy)
                 .help("Delete this card’s scan cache, then re-read every game folder from disk")
             }
@@ -267,6 +268,7 @@ struct KatanaApp: App {
                     get: { state.duplicatesEnabled },
                     set: { state.duplicatesEnabled = $0 }
                 ))
+                .keyboardShortcut("d", modifiers: .command)
 
                 if state.duplicatesEnabled {
                     Toggle("Show Duplicate Markers", isOn: Binding(

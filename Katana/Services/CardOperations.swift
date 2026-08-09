@@ -169,11 +169,13 @@ enum CardOperations: Sendable {
         trashed: [TrashedGame],
         currentGames: [GameEntry],
         rootURL: URL,
-        progress: (@Sendable (String) -> Void)? = nil
+        progress: (@Sendable (String) -> Void)? = nil,
+        fractionProgress: (@Sendable (Double) -> Void)? = nil
     ) throws -> [GameEntry] {
         guard !trashed.isEmpty else { return currentGames }
 
         progress?("Restoring \(trashed.count) game\(trashed.count == 1 ? "" : "s")…")
+        fractionProgress?(0)
 
         let tmp = try ensureDir(rootURL.appendingPathComponent(tmpFolderName, isDirectory: true))
         var pathByID = Dictionary(uniqueKeysWithValues: currentGames.map { ($0.id, $0.folderPath) })
@@ -184,7 +186,7 @@ enum CardOperations: Sendable {
 
         let trashRoot = rootURL.appendingPathComponent(trashFolderName, isDirectory: true)
         let sorted = trashed.sorted { $0.originalIndex > $1.originalIndex }
-        for item in sorted {
+        for (index, item) in sorted.enumerated() {
             let staged = tmp.appendingPathComponent(item.game.id.uuidString, isDirectory: true)
             if FileManager.default.fileExists(atPath: staged.path) {
                 try FileManager.default.removeItem(at: staged)
@@ -199,6 +201,8 @@ enum CardOperations: Sendable {
             restoredByID[item.game.id] = item.game
             let insertIndex = min(max(0, item.originalIndex), order.count)
             order.insert(item.game.id, at: insertIndex)
+            // Un-trash staging is ~10% of the bar; renumbering the card is the long part.
+            fractionProgress?(0.1 * Double(index + 1) / Double(sorted.count))
         }
 
         let desired = order.enumerated().map { ($0.element, $0.offset + 1) }
@@ -207,8 +211,12 @@ enum CardOperations: Sendable {
             desiredNumbers: desired,
             rootURL: rootURL,
             preferCompactPack: false,
-            progress: progress
+            progress: progress,
+            fractionProgress: fractionProgress.map { report in
+                { f in report(0.1 + 0.9 * f) }
+            }
         )
+        fractionProgress?(1)
 
         return order.enumerated().map { index, id in
             var game = restoredByID[id]!
@@ -437,6 +445,25 @@ enum CardOperations: Sendable {
         var games: [GameEntry]
         var added: [GameEntry]
         var skipped: [(url: URL, reason: String)]
+        /// Measured transfer samples for rate learning (0 when nothing was copied/hashed).
+        var copiedBytes: Int64 = 0
+        var copySeconds: Double = 0
+        var hashedBytes: Int64 = 0
+        var hashSeconds: Double = 0
+    }
+
+    /// Remembered transfer rates used to time-weight the import progress bar.
+    struct TransferRateEstimates: Sendable {
+        /// Bytes/sec writing game files to the card.
+        var writeBytesPerSecond: Double
+        /// Bytes/sec reading payload while hashing (source volume).
+        var hashBytesPerSecond: Double
+
+        /// Conservative fallbacks before any operation has been measured.
+        static let defaults = TransferRateEstimates(
+            writeBytesPerSecond: 15_000_000,
+            hashBytesPerSecond: 120_000_000
+        )
     }
 
     /// Live import UI events — placeholders appear before the heavy copy finishes.
@@ -453,8 +480,7 @@ enum CardOperations: Sendable {
         case slotFailed(UUID)
         /// Overall 0…1 for the edge progress bar (legacy; prefer `copyProgress`).
         case fraction(Double)
-        /// Per-file copy progress: fraction jumps to a segment end only after that file
-        /// finishes (size-weighted notches). `segmentEnds` are cumulative 0…1 dividers.
+        /// Copy progress: one equal chunk per file; fill steps to a notch when its file lands.
         case copyProgress(fraction: Double, segmentEnds: [Double])
         /// Status line / busy caption.
         case message(String)
@@ -470,6 +496,8 @@ enum CardOperations: Sendable {
         sources: [URL],
         games: [GameEntry],
         rootURL: URL,
+        preferDatabaseNames: Bool = false,
+        rates: TransferRateEstimates = .defaults,
         progress: (@Sendable (String) -> Void)? = nil,
         onEvent: (@Sendable (ImportEvent) -> Void)? = nil
     ) throws -> ImportResult {
@@ -652,45 +680,77 @@ enum CardOperations: Sendable {
             emit(.slotPrepared(provisional))
         }
 
-        // Global byte plan → segment ends proportional to each file’s size (thick track = wide
-        // segment). Fill jumps one notch only when that file fully finishes — no mid-file crawl —
-        // so a long track holds at the previous marker, then snaps forward when done.
-        let allFiles = prepared.flatMap(\.files)
-        let totalCopyBytes = max(1, allFiles.reduce(Int64(0)) { $0 + $1.size })
-        let totalFileCount = allFiles.count
-        var segmentEnds: [Double] = []
-        segmentEnds.reserveCapacity(totalFileCount)
-        var cumulative: Int64 = 0
-        for file in allFiles {
-            cumulative += max(file.size, 1)
-            segmentEnds.append(min(1, Double(cumulative) / Double(totalCopyBytes)))
+        // Time-weighted progress from remembered transfer rates: each file is one chunk
+        // weighted by its estimated copy time (size ÷ card write rate), and each slot gets
+        // a trailing hash unit (payload ÷ hash rate) so finalize crawls instead of stalling
+        // at 99%. Markers sit at file completions only; every file keeps a ~2% floor so a
+        // GDI's cue and small tracks stay visible next to a multi-GB track. The fill
+        // advances in the same weighted space and reaches a notch exactly when its file
+        // has fully landed — never before. Held ≤0.99 until the final full-width emit.
+        struct ProgressUnit {
+            var weight: Double
+            /// File units end at a visible marker; hash units fill toward the next one.
+            var isFile: Bool
         }
-        if let last = segmentEnds.indices.last {
-            segmentEnds[last] = 1
+        let writeRate = max(rates.writeBytesPerSecond, 1)
+        let hashRate = max(rates.hashBytesPerSecond, 1)
+        var rawUnits: [ProgressUnit] = []
+        for slot in prepared {
+            for file in slot.files {
+                rawUnits.append(.init(weight: Double(max(file.size, 1)) / writeRate, isFile: true))
+            }
+            let slotBytes = slot.files.reduce(Int64(0)) { $0 + max($1.size, 1) }
+            rawUnits.append(.init(weight: Double(slotBytes) / hashRate, isFile: false))
+        }
+        let rawTotal = max(rawUnits.reduce(0) { $0 + $1.weight }, .ulpOfOne)
+        let minMarkerWeight = rawTotal * 0.02
+        let units = rawUnits.map {
+            ProgressUnit(weight: $0.isFile ? max($0.weight, minMarkerWeight) : $0.weight, isFile: $0.isFile)
+        }
+        let totalWeight = max(units.reduce(0) { $0 + $1.weight }, .ulpOfOne)
+        var cumulativeWeight = 0.0
+        var segmentEnds: [Double] = []
+        for unit in units {
+            cumulativeWeight += unit.weight
+            if unit.isFile {
+                segmentEnds.append(min(1, cumulativeWeight / totalWeight))
+            }
         }
         emit(.copyProgress(fraction: 0, segmentEnds: segmentEnds))
 
-        var filesCompleted = 0
+        var weightCompleted = 0.0
+        var unitIndex = 0
+        var lastEmittedFraction = -1.0
 
-        /// Advance the bar to the notch for the just-finished file. Stays below 1.0 until the
-        /// whole import (including post-copy finalize/hash) completes — no full-bar dead wait.
-        func emitFileCompletedProgress() {
-            filesCompleted += 1
-            guard totalFileCount > 0, filesCompleted > 0 else {
-                emit(.copyProgress(fraction: 0, segmentEnds: segmentEnds))
-                return
+        /// Whole units done plus capped partial progress inside the active unit — the fill
+        /// never crosses the active file’s notch before it completes.
+        func emitCopyProgress(partialRatio: Double = 0, force: Bool = false) {
+            let weight = unitIndex < units.count ? units[unitIndex].weight : 0
+            let partial = min(max(partialRatio, 0), 1) * weight
+            let fraction = min(0.99, (weightCompleted + partial) / totalWeight)
+            if force || fraction - lastEmittedFraction >= 0.004 {
+                lastEmittedFraction = fraction
+                emit(.copyProgress(fraction: fraction, segmentEnds: segmentEnds))
             }
-            let idx = min(filesCompleted, segmentEnds.count) - 1
-            var fraction = segmentEnds[idx]
-            if filesCompleted >= totalFileCount {
-                // Last file is on the card; finalize (hash / IP.BIN / name) may still run.
-                fraction = min(fraction, 0.99)
-            }
-            emit(.copyProgress(fraction: fraction, segmentEnds: segmentEnds))
         }
 
-        // Copy first (sized notches). Hash on source after each package’s files land so we
-        // never re-walk multi‑GB tracks on the card (`loadFolderDetails`).
+        /// Advance the fill past the active unit (a finished file or a finished hash).
+        func finishCurrentUnit() {
+            if unitIndex < units.count {
+                weightCompleted += units[unitIndex].weight
+            }
+            unitIndex += 1
+            emitCopyProgress(force: true)
+        }
+
+        // Transfer samples for rate learning (returned in ImportResult).
+        var copiedBytes: Int64 = 0
+        var copySeconds = 0.0
+        var hashedBytes: Int64 = 0
+        var hashSeconds = 0.0
+
+        // Copy first (markers + mid-file fill). Hash on source after each package’s files land
+        // so we never re-walk multi‑GB tracks on the card (`loadFolderDetails`).
         for (offset, slot) in prepared.enumerated() {
             emit(.slotActive(slot.entryID))
             var imageName = slot.imageName
@@ -703,22 +763,24 @@ enum CardOperations: Sendable {
                         : "Copying \(offset + 1)/\(totalSlots)… \(slot.source.hintName)"
                     emit(.message(label))
 
+                    let size = max(file.size, 1)
+                    let copyStart = Date()
                     var isDir: ObjCBool = false
                     if fm.fileExists(atPath: file.from.path, isDirectory: &isDir), isDir.boolValue {
                         try fm.copyItem(at: file.from, to: file.to)
-                        emitFileCompletedProgress()
+                        copySeconds += Date().timeIntervalSince(copyStart)
+                        copiedBytes += size
+                        finishCurrentUnit()
                         continue
                     }
 
-                    // Stream large tracks (opaque FileManager.copyItem hides I/O errors on FAT);
-                    // progress only updates after the whole file lands.
-                    try copyFileWithProgress(
-                        from: file.from,
-                        to: file.to,
-                        expectedSize: file.size,
-                        onProgress: { _ in }
-                    )
-                    emitFileCompletedProgress()
+                    // Stream large tracks so the fill crawls inside this file's chunk.
+                    try copyFile(from: file.from, to: file.to) { writtenInFile in
+                        emitCopyProgress(partialRatio: Double(writtenInFile) / Double(size))
+                    }
+                    copySeconds += Date().timeIntervalSince(copyStart)
+                    copiedBytes += size
+                    finishCurrentUnit()
                 }
 
                 if slot.willRenameSingle {
@@ -730,8 +792,7 @@ enum CardOperations: Sendable {
                     }
                 }
 
-                // Bar holds at the last completed-file notch (≤0.99 after the final track)
-                // while we write hash / name / serial — not a second full re-read of tracks.
+                // Hold at ≤0.99 (after last track) while hash / name / serial run.
                 emit(.message("Finalizing \(offset + 1)/\(totalSlots)… \(slot.source.hintName)"))
 
                 var contentHash: String?
@@ -741,19 +802,31 @@ enum CardOperations: Sendable {
                     destImageName: imageName
                 ), !sources.isEmpty {
                     // Still hash on the *source* volume (usually faster than the SD card).
-                    if let computed = try? ContentHashSidecar.compute(sources: sources) {
+                    let expectedHashBytes = max(payloadSize, 1)
+                    let hashStart = Date()
+                    if let computed = try? ContentHashSidecar.compute(sources: sources, onBytes: { hashed in
+                        emitCopyProgress(partialRatio: Double(hashed) / Double(expectedHashBytes))
+                    }) {
+                        hashSeconds += Date().timeIntervalSince(hashStart)
+                        hashedBytes += computed.payloadSize
                         try? ContentHashSidecar.write(computed, to: slot.dest)
                         contentHash = computed.sha256
                         payloadSize = computed.payloadSize
                     }
                 }
+                // The slot's hash unit is done (or skipped) — step to the next unit either way.
+                finishCurrentUnit()
 
                 let ip = IpBinReader.read(
                     folderURL: slot.dest,
                     imageFileName: imageName,
                     format: slot.format
                 )
-                let resolvedName = importDisplayName(source: slot.source, ip: ip)
+                let resolvedName = importDisplayName(
+                    source: slot.source,
+                    ip: ip,
+                    preferDatabaseNames: preferDatabaseNames
+                )
 
                 try resolvedName.name.write(
                     to: slot.dest.appendingPathComponent(nameFile),
@@ -798,7 +871,11 @@ enum CardOperations: Sendable {
         return ImportResult(
             games: updatedExisting + added,
             added: added,
-            skipped: skipped
+            skipped: skipped,
+            copiedBytes: copiedBytes,
+            copySeconds: copySeconds,
+            hashedBytes: hashedBytes,
+            hashSeconds: hashSeconds
         )
     }
 
@@ -1256,12 +1333,11 @@ enum CardOperations: Sendable {
         return (try? fm.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? 0
     }
 
-    /// Stream a file copy so large GDI tracks report progress (`FileManager.copyItem` is opaque).
-    nonisolated private static func copyFileWithProgress(
+    /// Stream a file copy in chunks, reporting written bytes (`FileManager.copyItem` is opaque).
+    nonisolated private static func copyFile(
         from source: URL,
         to dest: URL,
-        expectedSize: Int64,
-        onProgress: (_ bytesWrittenInFile: Int64) -> Void
+        onProgress: (_ bytesWrittenInFile: Int64) -> Void = { _ in }
     ) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -1276,12 +1352,8 @@ enum CardOperations: Sendable {
             try? writer.close()
         }
 
-        let chunkSize = 512 * 1024 // 512 KB — smoother bar on mid-size tracks
+        let chunkSize = 512 * 1024
         var written: Int64 = 0
-        var lastReport: Int64 = 0
-        // Report often enough that a 640 MB track moves many notches, not one.
-        let reportEvery = max(Int64(256 * 1024), expectedSize / 100) // ≥ every 1% of this file
-
         while true {
             let data: Data
             do {
@@ -1297,12 +1369,8 @@ enum CardOperations: Sendable {
                 throw OperationError.importUnreadable(dest.lastPathComponent)
             }
             written += Int64(data.count)
-            if written - lastReport >= reportEvery {
-                lastReport = written
-                onProgress(written)
-            }
+            onProgress(written)
         }
-        onProgress(written)
     }
 
     nonisolated private static func detectImageName(in names: [String]) -> String? {
@@ -1338,11 +1406,23 @@ enum CardOperations: Sendable {
     }
 
     /// Import naming: source file / folder first (distinguishes variants), then GameDB / IP.BIN.
+    /// With `preferDatabaseNames`, that order flips: GameDB title (looked up by the IP.BIN
+    /// serial) → IP.BIN product name → source file / folder.
     nonisolated static func importDisplayName(
         source: DiscImportSource,
-        ip: IpBinInfo?
+        ip: IpBinInfo?,
+        preferDatabaseNames: Bool = false
     ) -> (name: String, serial: String) {
         let serial = ip?.productNumber.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        if preferDatabaseNames {
+            if let title = GameDatabase.title(for: serial) {
+                return (title, serial)
+            }
+            if let raw = ip?.name.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+                return (raw.localizedCapitalized, serial)
+            }
+        }
 
         // Original image base name (before any rename to disc.*).
         let fileBase = (source.imageFileName as NSString)
@@ -1451,7 +1531,8 @@ enum CardOperations: Sendable {
         rootURL: URL,
         preferCompactPack: Bool,
         maxNumber maxNumberOverride: Int? = nil,
-        progress: (@Sendable (String) -> Void)? = nil
+        progress: (@Sendable (String) -> Void)? = nil,
+        fractionProgress: (@Sendable (Double) -> Void)? = nil
     ) throws -> [UUID: FolderLocation] {
         let maxNumber = maxNumberOverride ?? desiredNumbers.map(\.1).max() ?? 1
 
@@ -1508,6 +1589,7 @@ enum CardOperations: Sendable {
                 }
                 try fm.moveItem(at: move.from, to: dest)
                 pathByID[move.id] = dest.path
+                fractionProgress?(Double(index + 1) / Double(ordered.count))
                 if index % 10 == 0 || index == ordered.count - 1 {
                     progress?("Renumbering \(index + 1)/\(ordered.count)…")
                 }
@@ -1552,6 +1634,7 @@ enum CardOperations: Sendable {
                     try fm.removeItem(at: m.phaseA)
                 }
                 try fm.moveItem(at: m.from, to: m.phaseA)
+                fractionProgress?(0.5 * Double(index + 1) / Double(max(phaseMoves.count, 1)))
                 if index % 10 == 0 {
                     progress?("Parking \(index + 1)/\(phaseMoves.count)…")
                 }
@@ -1564,6 +1647,7 @@ enum CardOperations: Sendable {
                 }
                 try fm.moveItem(at: m.phaseA, to: dest)
                 pathByID[m.id] = dest.path
+                fractionProgress?(0.5 + 0.5 * Double(index + 1) / Double(max(phaseMoves.count, 1)))
                 if index % 10 == 0 || index == phaseMoves.count - 1 {
                     progress?("Placing \(index + 1)/\(phaseMoves.count)…")
                 }

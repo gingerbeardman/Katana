@@ -106,11 +106,6 @@ struct GameListView: View {
             )
             // Remount when volume or programmed sort changes so header chevrons match data order.
             .id(tableIdentity)
-            .background {
-                if state.scrollToNewRows {
-                    TableSelectionScroller(trigger: state.scrollTargetGameID)
-                }
-            }
             .contextMenu(forSelectionType: GameEntry.ID.self) { selectedIDs in
                 selectionContextMenu(selectedIDs)
             } primaryAction: { selectedIDs in
@@ -131,27 +126,28 @@ struct GameListView: View {
                 return .handled
             }
             .overlay(alignment: .top) {
-                // Edge progress — scan (accent), rebuild (orange), mutations (accent).
-                // No center busy card: status lives in the window subtitle + this bar.
+                // Shared chunked edge bar — scan / rebuild / mutations all use the same chrome.
                 if state.isScanning, let progress = state.scanProgress, progress.total > 0 {
-                    edgeProgressBar(
+                    EdgeProgressBar(
                         fraction: min(1, max(0, Double(progress.completed) / Double(progress.total))),
-                        color: .accentColor
+                        color: .accentColor,
+                        segmentEnds: EdgeProgressBar.equalEnds(count: progress.total)
                     )
                 } else if state.isRebuildingMenu {
-                    edgeProgressBar(
+                    EdgeProgressBar(
                         fraction: state.rebuildProgress ?? 0,
-                        color: .orange
+                        color: .orange,
+                        segmentEnds: EdgeProgressBar.rebuildStageEnds
                     )
                 } else if state.isMutating {
                     if let fraction = state.mutationProgress {
-                        edgeProgressBar(
+                        EdgeProgressBar(
                             fraction: fraction,
                             color: .accentColor,
                             segmentEnds: state.mutationProgressSegments ?? []
                         )
                     } else {
-                        indeterminateEdgeProgressBar(color: .accentColor)
+                        IndeterminateEdgeProgressBar(color: .accentColor)
                     }
                 }
             }
@@ -444,117 +440,5 @@ struct GameListView: View {
         return up ? first > 0 : last < state.games.count - 1
     }
 
-    /// Edge progress (scan accent / rebuild orange / mutation accent).
-    /// - Parameter segmentEnds: cumulative ends 0…1 for multi-file import dividers
-    ///   (segment width ∝ file size — a 640 MB track is a wide band, a 2 MB track a thin one).
-    private func edgeProgressBar(
-        fraction: Double,
-        color: Color,
-        segmentEnds: [Double] = []
-    ) -> some View {
-        // Internal file boundaries only (skip 0 and 1). Dual-tone ticks — not blendMode —
-        // so they read on both the accent fill and the empty track (difference blended
-        // against the table underneath and disappeared).
-        let boundaries = segmentEnds.filter { $0 > 0.002 && $0 < 0.998 }
-        let barHeight: CGFloat = boundaries.isEmpty ? 2 : 5
-        let clamped = max(0, min(1, fraction))
-        return GeometryReader { geo in
-            let w = max(geo.size.width, 1)
-            ZStack(alignment: .leading) {
-                Rectangle()
-                    .fill(Color.primary.opacity(0.10))
-                Rectangle()
-                    .fill(color)
-                    .frame(width: w * clamped)
-                    .animation(.linear(duration: 0.12), value: clamped)
-
-                ForEach(Array(boundaries.enumerated()), id: \.offset) { _, end in
-                    // White halo + dark core: visible on blue fill and pale track.
-                    ZStack {
-                        Rectangle()
-                            .fill(Color.white.opacity(0.95))
-                            .frame(width: 3, height: barHeight)
-                        Rectangle()
-                            .fill(Color.black.opacity(0.72))
-                            .frame(width: 1.5, height: barHeight)
-                    }
-                    .frame(width: 3, height: barHeight)
-                    .position(x: w * end, y: barHeight / 2)
-                }
-            }
-        }
-        .frame(height: barHeight)
-        .allowsHitTesting(false)
-    }
-
-    /// 2pt indeterminate sweep when a mutation has no reliable fraction (delete, renumber, eject).
-    private func indeterminateEdgeProgressBar(color: Color) -> some View {
-        TimelineView(.animation(minimumInterval: 1 / 30, paused: false)) { context in
-            GeometryReader { geo in
-                let width = geo.size.width
-                let phase = context.date.timeIntervalSinceReferenceDate
-                    .truncatingRemainder(dividingBy: 1.2) / 1.2
-                let barWidth = max(48, width * 0.28)
-                let x = (width + barWidth) * phase - barWidth
-                ZStack(alignment: .leading) {
-                    Rectangle()
-                        .fill(Color.primary.opacity(0.08))
-                    Rectangle()
-                        .fill(color.opacity(0.9))
-                        .frame(width: barWidth)
-                        .offset(x: x)
-                }
-                .clipped()
-            }
-        }
-        .frame(height: 2)
-        .allowsHitTesting(false)
-    }
 }
 
-// MARK: - Scroll selected row into view (SwiftUI Table → AppKit NSTableView)
-
-/// When `trigger` changes, finds the hosting `NSTableView` and scrolls its selection into view.
-private struct TableSelectionScroller: NSViewRepresentable {
-    var trigger: GameEntry.ID?
-
-    func makeNSView(context: Context) -> NSView {
-        NSView()
-    }
-
-    func updateNSView(_ view: NSView, context: Context) {
-        guard trigger != nil else { return }
-        // Wait a beat so SwiftUI applies the new selection / row before we scroll.
-        DispatchQueue.main.async {
-            guard let root = view.window?.contentView ?? NSApp.keyWindow?.contentView else { return }
-            guard let table = Self.findTableView(in: root) else { return }
-            let rows = table.selectedRowIndexes
-            guard let row = rows.first, row >= 0, row < table.numberOfRows else { return }
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.15
-                ctx.allowsImplicitAnimation = true
-                table.animator().scrollRowToVisible(row)
-            }
-        }
-    }
-
-    private static func findTableView(in view: NSView) -> NSTableView? {
-        if let table = view as? NSTableView, table.numberOfColumns > 1 {
-            return table
-        }
-        var best: NSTableView?
-        for sub in view.subviews {
-            if let found = findTableView(in: sub) {
-                // Prefer the widest multi-column table (game list, not tiny side widgets).
-                if let current = best {
-                    if found.bounds.width > current.bounds.width {
-                        best = found
-                    }
-                } else {
-                    best = found
-                }
-            }
-        }
-        return best
-    }
-}
