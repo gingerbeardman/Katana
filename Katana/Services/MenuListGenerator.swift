@@ -93,10 +93,11 @@ enum MenuListGenerator: Sendable {
 
     /// Build items for every game in card slot order (slot numbers as-is).
     /// Prefers `GameEntry.ipHeader`; only hits the card when the cache is cold.
+    /// Progress reports `(done, total, readFromCard)` so callers can show the source split.
     nonisolated static func items(
         for games: [GameEntry],
         menuKind: MenuKind,
-        progress: (@Sendable (Int, Int) -> Void)? = nil
+        progress: (@Sendable (Int, Int, Int) -> Void)? = nil
     ) -> [Item] {
         itemsWithHeaderFills(for: games, menuKind: menuKind, progress: progress).items
     }
@@ -105,7 +106,7 @@ enum MenuListGenerator: Sendable {
     nonisolated static func itemsWithHeaderFills(
         for games: [GameEntry],
         menuKind: MenuKind,
-        progress: (@Sendable (Int, Int) -> Void)? = nil
+        progress: (@Sendable (Int, Int, Int) -> Void)? = nil
     ) -> (items: [Item], filledHeaders: [HeaderFill]) {
         let total = games.count
         var result: [Item] = []
@@ -114,7 +115,7 @@ enum MenuListGenerator: Sendable {
         fills.reserveCapacity(min(total, 8))
 
         for (index, game) in games.enumerated() {
-            progress?(index, total)
+            progress?(index, total, fills.count)
 
             let ip: IpBinInfo
             if game.isMenu || game.number == 1 {
@@ -160,7 +161,10 @@ enum MenuListGenerator: Sendable {
                 )
             )
         }
-        progress?(total, total)
+        progress?(total, total, fills.count)
+        LaunchTrace.mark(
+            "menu headers: \(total - fills.count)/\(total) cached, \(fills.count) read from card"
+        )
         return (result, fills)
     }
 }

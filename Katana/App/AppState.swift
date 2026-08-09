@@ -854,8 +854,8 @@ final class AppState {
             self.games[idx].contentSHA256 = sha
             self.games[idx].payloadByteSize = payloadSize
             // Debounce: hashing fires per-file; avoid blanking markers / thrashing the table.
+            // Cache save waits for onFinished — one write, not one per hashed game.
             self.scheduleDuplicateRecompute(showPendingMarkers: false, debounce: .milliseconds(400))
-            self.invalidateCacheAsync()
         }
         ContentHashService.shared.onProgress = { [weak self] progress in
             self?.hashingProgress = progress
@@ -876,6 +876,8 @@ final class AppState {
             self.isHashingActive = false
             self.hashingFolderPath = nil
             self.hashingProgress = nil
+            // Persist hashes/sizes gathered this run (sidecar files changed folder fingerprints).
+            self.persistCacheAfterMutation()
             if let measured {
                 self.cachedHashBytesPerSecond = measured
                 if let uuid {
@@ -1437,33 +1439,45 @@ final class AppState {
     }
 
     /// Write current entries back into the volume cache so the next open is fully warm.
+    /// Called after enrichment completes and after every card mutation (via
+    /// `persistCacheAfterMutation`) — the saved entries carry IP headers, sizes, and hashes,
+    /// each validated on the next scan by its folder fingerprint (image size + mod time).
     private func persistEnrichedCache(volumeUUID: String) {
         guard let volume, volume.volumeUUID == volumeUUID else { return }
         let entries = games
         Task.detached(priority: .utility) {
-            // Rebuild fingerprints cheaply from current entry fields (name listing again is fine here).
+            // Merge against the stored cache instead of walking all folders on the card:
+            // renames/renumbers don't change folder contents, so the stored on-disk
+            // fingerprint stays valid with only its folderName updated — zero card I/O.
+            // Probe the card only where contents actually changed (new imports, changed
+            // hashes, the menu slot after a rebuild). Fingerprints MUST come from the
+            // on-disk probe or the stored copy of one (single source of truth with the
+            // scanner) — display-field fingerprints (game.name / game.serial) never match
+            // a real rescan, which used to discard every cached IP header.
+            let stored = try? await CardCacheStore.shared.load(volumeUUID: volumeUUID)
+            var storedByID: [GameEntry.ID: CachedEntry] = [:]
+            for prior in stored?.entries ?? [] {
+                storedByID[prior.entry.id] = prior
+            }
+
             var cached: [CachedEntry] = []
             cached.reserveCapacity(entries.count)
+            var probed = 0
             for game in entries {
-                let folderURL = game.folderURL
-                let names = (try? FileManager.default.contentsOfDirectory(atPath: folderURL.path)
-                    .filter { !$0.hasPrefix(".") }) ?? []
-                let imageURL = folderURL.appendingPathComponent(game.imageFileName)
-                let imageValues = try? imageURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-                let fp = FolderFingerprint(
-                    folderName: folderURL.lastPathComponent,
-                    imageFileName: game.imageFileName,
-                    imageSize: Int64(imageValues?.fileSize ?? Int(game.byteSize)),
-                    imageModTimeSeconds: FolderFingerprint.modTimeSeconds(
-                        imageValues?.contentModificationDate ?? .distantPast
-                    ),
-                    nameTxt: game.name,
-                    serialTxt: game.serial.isEmpty ? nil : game.serial,
-                    fileCount: names.count
-                )
-                var entry = game
-                entry.detailsLoaded = true
-                cached.append(CachedEntry(fingerprint: fp, entry: entry))
+                // Entry carries its live detailsLoaded flag — mutation-time saves can include
+                // entries whose enrichment hasn't finished; forcing true would freeze
+                // provisional sizes.
+                if let prior = storedByID[game.id],
+                   prior.entry.contentSHA256 == game.contentSHA256,
+                   !game.isMenu, game.number != 1
+                {
+                    var fp = prior.fingerprint
+                    fp.folderName = game.folderURL.lastPathComponent
+                    cached.append(CachedEntry(fingerprint: fp, entry: game))
+                } else if let fp = try? CardScanner.onDiskFingerprint(for: game.folderURL) {
+                    probed += 1
+                    cached.append(CachedEntry(fingerprint: fp, entry: game))
+                }
             }
             let cache = CardCache(
                 volumeUUID: volumeUUID,
@@ -1473,6 +1487,10 @@ final class AppState {
                 entries: cached.sorted { $0.entry.number < $1.entry.number }
             )
             try? await CardCacheStore.shared.save(cache)
+            let withHeaders = cache.entries.filter { $0.entry.ipHeader != nil }.count
+            LaunchTrace.mark(
+                "cache save: \(cache.entries.count) entries, \(withHeaders) with IP headers, \(probed) probed on card"
+            )
         }
     }
 
@@ -2147,7 +2165,7 @@ final class AppState {
             }
             scheduleDuplicateRecompute()
             markMenuNeedsRebuild()
-            invalidateCacheAsync()
+            persistCacheAfterMutation()
             // Free space may have changed after large copies.
             let preferred = self.volume?.volumeUUID
             if let resolved = try? VolumeIdentity.resolve(rootURL: root, preferredUUID: preferred) {
@@ -2461,7 +2479,7 @@ final class AppState {
                 refreshStatus()
                 refreshTrashSummary()
                 scheduleDuplicateRecompute()
-                invalidateCacheAsync()
+                persistCacheAfterMutation()
                 flash(permanent ? "Deleted \(label)" : "Removed \(label)")
 
                 if !permanent, !result.trashed.isEmpty {
@@ -2520,7 +2538,7 @@ final class AppState {
                 refreshStatus()
                 refreshTrashSummary()
                 scheduleDuplicateRecompute()
-                invalidateCacheAsync()
+                persistCacheAfterMutation()
                 flash("Restored \(label)")
             } catch {
                 if isPermissionError(error) {
@@ -2616,7 +2634,7 @@ final class AppState {
                 markMenuNeedsRebuild()
                 refreshStatus()
                 scheduleDuplicateRecompute()
-                invalidateCacheAsync()
+                persistCacheAfterMutation()
 
                 undoManager.registerUndo(withTarget: self) { target in
                     target.applyOrder(previous, actionName: actionName, preserveSelection: keepSelection)
@@ -2677,6 +2695,7 @@ final class AppState {
     func applyIpHeader(_ ip: IpBinInfo, forGameID id: UUID) {
         guard let idx = games.firstIndex(where: { $0.id == id }) else { return }
         games[idx].ipHeader = ip
+        persistIpHeaders([games[idx].folderURL.lastPathComponent: ip])
     }
 
     private func applyIpHeaderFills(_ fills: [MenuListGenerator.HeaderFill]) {
@@ -2687,15 +2706,38 @@ final class AppState {
             indexByID[g.id] = i
         }
         var next = games
-        var any = false
+        var headersByFolder: [String: IpBinInfo] = [:]
         for fill in fills {
             guard let idx = indexByID[fill.gameID] else { continue }
             next[idx].ipHeader = fill.ip
-            any = true
+            headersByFolder[next[idx].folderURL.lastPathComponent] = fill.ip
         }
-        if any {
-            games = next
+        guard !headersByFolder.isEmpty else { return }
+        games = next
+        // Also patch the SSD cache — quit-path rebuilds never reach the full cache save,
+        // and the menu slot's header only ever comes from these fills.
+        persistIpHeaders(headersByFolder)
+    }
+
+    /// Patch freshly card-read headers into the on-disk scan cache (fingerprints untouched).
+    private func persistIpHeaders(_ headersByFolder: [String: IpBinInfo]) {
+        guard !headersByFolder.isEmpty, let uuid = volume?.volumeUUID else { return }
+        Task {
+            try? await CardCacheStore.shared.applyIpHeaders(
+                volumeUUID: uuid,
+                headersByFolder: headersByFolder
+            )
         }
+    }
+
+    /// Save current entries to the scan cache after a card mutation.
+    ///
+    /// Replaces the old delete-the-cache invalidation: the in-memory list is authoritative
+    /// after import/delete/undelete/reorder/rebuild, so writing it back keeps IP headers and
+    /// enriched details valid on SSD across launches instead of forcing a card re-read.
+    private func persistCacheAfterMutation() {
+        guard let uuid = volume?.volumeUUID else { return }
+        persistEnrichedCache(volumeUUID: uuid)
     }
 
     /// Rebuild the on-console GDmenu / openMenu image so the list matches current slots/names.
@@ -2800,7 +2842,7 @@ final class AppState {
 
             if !quitting {
                 refreshStatus()
-                invalidateCacheAsync()
+                persistCacheAfterMutation()
                 flash("Rebuilt \(result.menuKind.displayName) · \(result.itemCount) items")
                 statusText = "\(result.menuKind.displayName) rebuilt · \(result.itemCount) items · \(formatSize(Int64(result.listByteCount))) list"
             }
@@ -3173,13 +3215,6 @@ final class AppState {
                 guard self.volume?.volumeUUID == uuid else { return }
                 self.trashSummary = summary
             }
-        }
-    }
-
-    private func invalidateCacheAsync() {
-        guard let volume else { return }
-        Task {
-            try? await CardCacheStore.shared.clear(volumeUUID: volume.volumeUUID)
         }
     }
 

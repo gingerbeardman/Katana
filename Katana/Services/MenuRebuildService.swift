@@ -44,16 +44,23 @@ enum MenuRebuildService: Sendable {
         let ordered = games.sorted { $0.number < $1.number }
         let kind = menuKind ?? detectMenuKind(games: ordered) ?? .gdMenu
 
-        // Weight by real cost: headers dominate (per-game IP.BIN reads off the FAT card,
-        // ~80% of wall time on large cards); bake runs on local temp; install is one
-        // image copy. Headers 0…0.80 · bake 0.80…0.96 · install 0.96…1.0
+        // Fixed spans: the per-item header pass owns the bulk of the bar (a warm cache
+        // simply sweeps it fast), bake and install stay short tails.
+        // Headers 0.02…0.80 · bake 0.80…0.96 · install 0.96…1.0
+        let headerSpan = 0.78
+        let headerEnd = 0.02 + headerSpan
+        let bakeEnd = 0.96
+
         progress?("Reading game headers…", 0.02)
-        let built = MenuListGenerator.itemsWithHeaderFills(for: ordered, menuKind: kind) { done, total in
+        let built = MenuListGenerator.itemsWithHeaderFills(for: ordered, menuKind: kind) { done, total, fromCard in
             let t = max(total, 1)
             // Report often enough for a smooth bar without flooding the UI.
             if done == 0 || done == total || done % 10 == 0 || t < 40 {
-                let frac = 0.02 + 0.78 * (Double(done) / Double(t))
-                progress?("Reading game headers… \(done)/\(total)", frac)
+                let frac = 0.02 + headerSpan * (Double(done) / Double(t))
+                let source = fromCard == 0
+                    ? "all cached"
+                    : "\(done - fromCard) cached · \(fromCard) from card"
+                progress?("Reading game headers… \(done)/\(total) (\(source))", frac)
             }
         }
         let items = built.items
@@ -61,7 +68,7 @@ enum MenuRebuildService: Sendable {
         // Keys must match on-disk folders: menu `01`, games `002`… when max ≥ 100 (GCM).
         let maxNumber = ordered.map(\.number).max() ?? ordered.count
         let listText = MenuListGenerator.makeList(kind: kind, items: items, maxNumber: maxNumber)
-        progress?("Building \(kind.displayName) image…", 0.80)
+        progress?("Building \(kind.displayName) image…", headerEnd)
 
         let assets = try assetsURL(for: kind)
 
@@ -83,8 +90,7 @@ enum MenuRebuildService: Sendable {
                     outDir: outDir,
                     truncate: true,
                     progress: { message, bakeFraction in
-                        // Map bake 0…1 → overall 0.80…0.96
-                        let overall = 0.80 + 0.16 * min(1, max(0, bakeFraction))
+                        let overall = headerEnd + (bakeEnd - headerEnd) * min(1, max(0, bakeFraction))
                         progress?(message, overall)
                     }
                 )
@@ -93,12 +99,16 @@ enum MenuRebuildService: Sendable {
             throw RebuildError.bakeFailed(error.localizedDescription)
         }
 
-        progress?("Installing menu into slot 01…", 0.96)
+        progress?("Installing menu into slot 01…", bakeEnd)
         let menuFolder = try installMenu(
             builtGDI: outDir,
             games: ordered,
             rootURL: rootURL,
-            kind: kind
+            kind: kind,
+            progress: { installFraction in
+                let overall = bakeEnd + (0.98 - bakeEnd) * min(1, max(0, installFraction))
+                progress?("Installing menu into slot 01…", overall)
+            }
         )
         progress?("Installed \(kind.displayName)", 1.0)
 
@@ -282,7 +292,8 @@ enum MenuRebuildService: Sendable {
         builtGDI: URL,
         games: [GameEntry],
         rootURL: URL,
-        kind: MenuKind
+        kind: MenuKind,
+        progress: (@Sendable (Double) -> Void)? = nil
     ) throws -> URL {
         let fm = FileManager.default
 
@@ -318,8 +329,22 @@ enum MenuRebuildService: Sendable {
         try fm.createDirectory(at: stageRoot, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: stageRoot.deletingLastPathComponent()) }
 
-        for src in built {
-            try fm.copyItem(at: src, to: stageRoot.appendingPathComponent(src.lastPathComponent))
+        // Uncached card writes (CardOperations.copyFile): buffered copyItem here made the
+        // install "finish" into the page cache, then the post-install directorySize walk
+        // stalled behind the drain. Byte-weighted progress keeps the bar honest meanwhile.
+        let sizes = built.map {
+            Int64((try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        let totalBytes = max(sizes.reduce(0, +), 1)
+        var doneBytes: Int64 = 0
+        for (src, size) in zip(built, sizes) {
+            try CardOperations.copyFile(
+                from: src,
+                to: stageRoot.appendingPathComponent(src.lastPathComponent)
+            ) { written in
+                progress?(Double(doneBytes + written) / Double(totalBytes))
+            }
+            doneBytes += size
         }
 
         let keepNames: Set<String> = [

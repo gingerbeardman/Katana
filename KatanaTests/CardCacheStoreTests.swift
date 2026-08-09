@@ -53,6 +53,55 @@ struct CardCacheStoreTests {
         try await CardCacheStore.shared.clear(volumeUUID: uuid)
     }
 
+    @Test func applyIpHeadersPatchesEntryWithoutTouchingFingerprint() async throws {
+        let uuid = "test-cache-\(UUID().uuidString)"
+
+        let entry = GameEntry(
+            id: UUID(),
+            number: 2,
+            name: "Crazy Taxi",
+            serial: "MK-51035",
+            format: .gdi,
+            imageFileName: "disc.gdi",
+            folderPath: "/Volumes/Card/02",
+            byteSize: 1_000,
+            payloadByteSize: 900,
+            contentSHA256: nil,
+            isMenu: false,
+            detailsLoaded: true
+        )
+        let fingerprint = FolderFingerprint(
+            folderName: "02",
+            imageFileName: "disc.gdi",
+            imageSize: 900,
+            imageModTimeSeconds: 1_700_000_000,
+            nameTxt: "Crazy Taxi",
+            serialTxt: "MK-51035",
+            fileCount: 4
+        )
+        let cache = CardCache(
+            volumeUUID: uuid,
+            volumeName: "TestCard",
+            rootPath: "/Volumes/Card",
+            scannedAt: Date(),
+            entries: [CachedEntry(fingerprint: fingerprint, entry: entry)]
+        )
+        try await CardCacheStore.shared.save(cache)
+
+        let ip = IpBinInfo.fallback(name: "Crazy Taxi", serial: "MK-51035")
+        try await CardCacheStore.shared.applyIpHeaders(
+            volumeUUID: uuid,
+            headersByFolder: ["02": ip]
+        )
+
+        let loaded = try await CardCacheStore.shared.load(volumeUUID: uuid)
+        #expect(loaded?.entries.count == 1)
+        #expect(loaded?.entries.first?.entry.ipHeader == ip)
+        #expect(loaded?.entries.first?.fingerprint == fingerprint)
+
+        try await CardCacheStore.shared.clear(volumeUUID: uuid)
+    }
+
     @Test func snapshotStillValidAfterNameUpdate() async throws {
         let fm = FileManager.default
         let root = fm.temporaryDirectory

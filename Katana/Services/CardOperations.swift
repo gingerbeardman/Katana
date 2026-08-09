@@ -504,6 +504,7 @@ enum CardOperations: Sendable {
         func emit(_ event: ImportEvent) {
             onEvent?(event)
             if case .message(let text) = event {
+                LaunchTrace.mark("import msg: \(text)")
                 progress?(text)
             }
         }
@@ -730,6 +731,10 @@ enum CardOperations: Sendable {
             let fraction = min(0.99, (weightCompleted + partial) / totalWeight)
             if force || fraction - lastEmittedFraction >= 0.004 {
                 lastEmittedFraction = fraction
+                LaunchTrace.mark(String(
+                    format: "import progress %.1f%% unit=%d partial=%.3f",
+                    fraction * 100, unitIndex, partialRatio
+                ))
                 emit(.copyProgress(fraction: fraction, segmentEnds: segmentEnds))
             }
         }
@@ -738,6 +743,12 @@ enum CardOperations: Sendable {
         func finishCurrentUnit() {
             if unitIndex < units.count {
                 weightCompleted += units[unitIndex].weight
+                LaunchTrace.mark(String(
+                    format: "import marker %@ unit=%d reached at %.1f%%",
+                    units[unitIndex].isFile ? "file" : "hash",
+                    unitIndex,
+                    min(1, weightCompleted / totalWeight) * 100
+                ))
             }
             unitIndex += 1
             emitCopyProgress(force: true)
@@ -778,7 +789,13 @@ enum CardOperations: Sendable {
                     try copyFile(from: file.from, to: file.to) { writtenInFile in
                         emitCopyProgress(partialRatio: Double(writtenInFile) / Double(size))
                     }
-                    copySeconds += Date().timeIntervalSince(copyStart)
+                    let copyElapsed = Date().timeIntervalSince(copyStart)
+                    LaunchTrace.mark(String(
+                        format: "import copy done %@ %lldB in %.2fs (%.1f MB/s)",
+                        file.name, size, copyElapsed,
+                        Double(size) / max(copyElapsed, 0.001) / 1_000_000
+                    ))
+                    copySeconds += copyElapsed
                     copiedBytes += size
                     finishCurrentUnit()
                 }
@@ -1336,7 +1353,9 @@ enum CardOperations: Sendable {
     }
 
     /// Stream a file copy in chunks, reporting written bytes (`FileManager.copyItem` is opaque).
-    nonisolated private static func copyFile(
+    /// Stream one file onto the card with uncached writes (honest progress, no close-drain).
+    /// Shared with menu install — any bulk write to the card should come through here.
+    nonisolated static func copyFile(
         from source: URL,
         to dest: URL,
         onProgress: (_ bytesWrittenInFile: Int64) -> Void = { _ in }
@@ -1349,6 +1368,12 @@ enum CardOperations: Sendable {
         fm.createFile(atPath: dest.path, contents: nil)
         let reader = try FileHandle(forReadingFrom: source)
         let writer = try FileHandle(forWritingTo: dest)
+        // Bypass the page cache on the card side: without this, macOS absorbs ~500 MB of a
+        // large track at RAM speed (progress races ahead), then close() blocks for the whole
+        // drain (bar pinned at the file's marker). Uncached, write() runs at true card speed
+        // so byte counts — and the learned write rate — track physical progress.
+        // (Reader stays cached: the hash pass re-reads the same source bytes right after.)
+        _ = fcntl(writer.fileDescriptor, F_NOCACHE, 1)
         defer {
             try? reader.close()
             try? writer.close()

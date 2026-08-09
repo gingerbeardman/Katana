@@ -26,6 +26,8 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 - **Fast lazy scan** — lists file names, finds the disc image, reads `name.txt` / `serial.txt`, and stats the image. No IP.BIN parsing on the fast path
 - **Background enrichment** — folder and payload sizes plus stored hash sidecars fill in afterwards
 - **Snapshot cache** — if the saved snapshot matches the live slot folders exactly, the card opens with no per-folder I/O
+- **Cache survives edits** — adding, deleting, reordering, rebuilding, and hashing update the saved cache in place (fingerprints are carried forward for untouched folders; only changed ones are re-probed), so the next open stays instant
+- **On-disk fingerprints** — cache validation compares folder name, image size + mtime, sidecar contents, and file count against what's actually on the card; a rescan keeps everything that still matches
 - **Batched progress** — entries arrive in batches of 24 so the table fills smoothly; live progress in the window subtitle and as a 2pt edge bar
 - **Tuned concurrency** — 8 concurrent folder workers, deliberately moderate because FAT/exFAT on SD hates high fan-out
 - **Off the main actor** — all card I/O is detached, so the UI never beachballs
@@ -64,6 +66,7 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 - **ZIP import** — drop or pick a `.zip` of game folders / disc-image sets; extracted in-process (sandbox-safe), then imported like loose packages
 - **Transparent copy** — each new slot’s folder and title appear in the list immediately; a top edge bar tracks overall progress and a per-row spinner marks the active file
 - **Chunked edge progress** — one bar for scan, rebuild, import, and delete: **time-weighted per-file chunks** on import using remembered transfer rates (one marker per valid file — a 1 GB track gets a wide chunk, every file keeps a ~2% floor so its marker stays visible — plus a hash stretch after each game's files, so finalize **crawls instead of stalling at 99%**), the fill advances by real bytes and **reaches a notch exactly when that file finishes** (never before); notches are gaps punched clean through the fill (visible on any fill colour, light or dark) and solid ticks on the unfilled track; import holds short of full until finalize
+- **Honest card writes** — copies to the card bypass the macOS write cache (`F_NOCACHE`), so the bar tracks bytes physically on the card: no instant leap on big files, no long wait at a finished file's marker, and measured transfer rates stay true
 - **Formats** — GDI (cue + tracks), CDI, CCD (plus `.img` / `.sub` / `.cue` companions), game folders, or `.zip` archives
 - **Automatic renumbering** — existing folders are widened first when the digit count has to grow (99 → 100); menu slot stays **`01`**
 - **Import naming** — source file or folder name first (so variants stay distinguishable), then GameDB / IP.BIN serial when readable; a Settings toggle (on by default) **automatically renames added games** via GameDB lookup (IP.BIN serial) instead
@@ -131,8 +134,8 @@ Collapsible sections, each remembering its expanded state:
 - **Menu type picker** — switch between GDmenu and openMenu from Settings or the Card menu
 - **Out-of-date banner** — a warning strip appears above the list when names or order no longer match the baked menu; cleared again if you reverse the change (e.g. add a game then delete it, or undo a rename)
 - **Prompt on quit** — you're asked before leaving with a stale menu image
-- **Progress** — headers, bake stages (assets, tracks, disc.gdi), and install on the edge bar; bar reaches full width on completion
-- **Cached IP headers** — import, enrichment, and inspector store IP.BIN fields on each game so rebuilds skip re-reading every GDI; cleared when the disc content hash changes
+- **Progress** — headers (2–80%), bake stages (assets, tracks, disc.gdi), and byte-tracked install on the edge bar; bar reaches full width on completion; the status line shows where headers come from (**“270 cached · 12 from card”**)
+- **Cached IP headers** — import, enrichment, rebuilds, and the inspector store IP.BIN fields on each game **and in the on-disk card cache**, so rebuilds skip re-reading every GDI across launches; cleared when the disc content hash changes (homebrew images without a readable IP.BIN are re-read each time)
 - **Bundled stock assets** — GDmenu and openMenu packs ship inside the app as zip resources
 
 ## Game Database

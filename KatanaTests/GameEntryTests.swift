@@ -6,7 +6,8 @@ struct GameEntryTests {
     private func entry(
         format: DiscFormat = .gdi,
         byteSize: Int64,
-        detailsLoaded: Bool
+        detailsLoaded: Bool,
+        ipHeader: IpBinInfo? = nil
     ) -> GameEntry {
         GameEntry(
             id: UUID(),
@@ -20,7 +21,8 @@ struct GameEntryTests {
             payloadByteSize: byteSize,
             contentSHA256: nil,
             isMenu: false,
-            detailsLoaded: detailsLoaded
+            detailsLoaded: detailsLoaded,
+            ipHeader: ipHeader
         )
     }
 
@@ -35,7 +37,13 @@ struct GameEntryTests {
     }
 
     @Test func fullyLoadedGDIDoesNotNeedEnrichment() {
-        #expect(!entry(format: .gdi, byteSize: 1_188_000_000, detailsLoaded: true).needsDetailEnrichment)
+        let ip = IpBinInfo.fallback(name: "Test", serial: "MK-1")
+        #expect(!entry(format: .gdi, byteSize: 1_188_000_000, detailsLoaded: true, ipHeader: ip).needsDetailEnrichment)
+    }
+
+    @Test func loadedEntryWithoutIpHeaderStillEnriches() {
+        // Warm menu rebuilds: enrichment must backfill missing IP.BIN headers.
+        #expect(entry(format: .gdi, byteSize: 1_188_000_000, detailsLoaded: true).needsDetailEnrichment)
     }
 
     @Test func largeProvisionalCDIStillEnrichesUntilFlagSet() {
@@ -44,6 +52,7 @@ struct GameEntryTests {
     }
 
     @Test func loadedCDIDoesNotNeedEnrichment() {
-        #expect(!entry(format: .cdi, byteSize: 800_000_000, detailsLoaded: true).needsDetailEnrichment)
+        let ip = IpBinInfo.fallback(name: "Test", serial: "MK-1")
+        #expect(!entry(format: .cdi, byteSize: 800_000_000, detailsLoaded: true, ipHeader: ip).needsDetailEnrichment)
     }
 }

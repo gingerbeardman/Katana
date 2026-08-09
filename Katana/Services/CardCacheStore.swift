@@ -81,6 +81,32 @@ actor CardCacheStore {
         try save(cache)
     }
 
+    /// Patch IP.BIN headers into cached entries without touching fingerprints.
+    ///
+    /// Headers live inside the disc image the fingerprint already validates
+    /// (size + mod time), so a header read from the card is valid for as long
+    /// as the fingerprint matches. Lets menu rebuilds stay on SSD across launches.
+    func applyIpHeaders(
+        volumeUUID: String,
+        headersByFolder: [String: IpBinInfo]
+    ) throws {
+        guard !headersByFolder.isEmpty else { return }
+        guard var cache = try load(volumeUUID: volumeUUID), !cache.entries.isEmpty else { return }
+
+        var patched = 0
+        for i in cache.entries.indices {
+            let folder = cache.entries[i].fingerprint.folderName
+            guard let ip = headersByFolder[folder] else { continue }
+            if cache.entries[i].entry.ipHeader != ip {
+                cache.entries[i].entry.ipHeader = ip
+                patched += 1
+            }
+        }
+        LaunchTrace.mark("cache patch: \(patched)/\(headersByFolder.count) headers into \(cache.entries.count) entries")
+        guard patched > 0 else { return }
+        try save(cache)
+    }
+
     // MARK: - Duplicate analysis cache
 
     private func duplicateCacheURL(for volumeUUID: String) -> URL {

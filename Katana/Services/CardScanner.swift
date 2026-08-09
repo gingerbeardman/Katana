@@ -386,19 +386,16 @@ enum CardScanner: Sendable {
         var cacheHit: Bool
     }
 
-    /// Name listing + image stat + name/serial only. No full size walk, no IP.BIN, no hash validation.
-    private nonisolated static func scanFolderFast(
-        number: Int,
-        folderURL: URL,
-        cached: CachedEntry?
-    ) throws -> FolderScan {
-        let folderName = folderURL.lastPathComponent
-        let fm = FileManager.default
-
+    /// One folder's on-disk fingerprint — the single source of truth for cache validation.
+    ///
+    /// Anything that WRITES cache entries must build fingerprints here too: a fingerprint
+    /// derived from display fields (GameDB serials, prettified names) never matches a real
+    /// scan (`serial.txt` usually doesn't exist on disk), so every saved entry would
+    /// silently miss on the next rescan and all cached headers would be discarded.
+    nonisolated static func onDiskFingerprint(for folderURL: URL) throws -> FolderFingerprint {
         // Cheap: names only (no per-file size/mtime on the whole directory).
-        let names = try fm.contentsOfDirectory(atPath: folderURL.path)
+        let names = try FileManager.default.contentsOfDirectory(atPath: folderURL.path)
             .filter { !$0.hasPrefix(".") }
-        let fileCount = names.count
 
         guard let imageName = detectImageName(in: names) else {
             throw ScanError.noDiscImage(folderURL)
@@ -410,8 +407,6 @@ enum CardScanner: Sendable {
         guard imageValues.isRegularFile == true else {
             throw ScanError.noDiscImage(folderURL)
         }
-        let imageSize = Int64(imageValues.fileSize ?? 0)
-        let imageMod = imageValues.contentModificationDate ?? .distantPast
 
         // Prefer path existence from the name listing — avoids an extra stat per sidecar.
         let nameOnDisk = names.contains(where: { $0.caseInsensitiveCompare(nameFile) == .orderedSame })
@@ -421,15 +416,31 @@ enum CardScanner: Sendable {
             ? readSidecar(named: serialFile, in: folderURL)
             : nil
 
-        let fingerprint = FolderFingerprint(
-            folderName: folderName,
+        return FolderFingerprint(
+            folderName: folderURL.lastPathComponent,
             imageFileName: imageName,
-            imageSize: imageSize,
-            imageModTimeSeconds: FolderFingerprint.modTimeSeconds(imageMod),
+            imageSize: Int64(imageValues.fileSize ?? 0),
+            imageModTimeSeconds: FolderFingerprint.modTimeSeconds(
+                imageValues.contentModificationDate ?? .distantPast
+            ),
             nameTxt: nameOnDisk,
             serialTxt: serialOnDisk,
-            fileCount: fileCount
+            fileCount: names.count
         )
+    }
+
+    /// Name listing + image stat + name/serial only. No full size walk, no IP.BIN, no hash validation.
+    private nonisolated static func scanFolderFast(
+        number: Int,
+        folderURL: URL,
+        cached: CachedEntry?
+    ) throws -> FolderScan {
+        let folderName = folderURL.lastPathComponent
+        let fingerprint = try onDiskFingerprint(for: folderURL)
+        let imageName = fingerprint.imageFileName
+        let imageSize = fingerprint.imageSize
+        let nameOnDisk = fingerprint.nameTxt
+        let serialOnDisk = fingerprint.serialTxt
 
         // Cache hit: reuse entry fields; only trust sizes when details were fully enriched.
         if let cached, cached.fingerprint == fingerprint {

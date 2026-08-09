@@ -52,7 +52,9 @@ struct CardScannerIntegrationTests {
         try makeGameFolder(at: root.appendingPathComponent("03"), name: "Crazy Taxi", serial: "MK-51035", image: "disc.gdi")
 
         let result = try await CardScanner.scan(rootURL: root)
-        #expect(result.entries.count == 3)
+        // #require: cache keyed by volume UUID can cross-pollinate from parallel tests on the
+        // same volume — fail cleanly instead of crashing the host on out-of-bounds indexing.
+        try #require(result.entries.count == 3)
         #expect(result.entries[0].name == "GDMENU")
         #expect(result.entries[0].isMenu)
         #expect(result.entries[1].format == .cdi)
