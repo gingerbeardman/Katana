@@ -52,7 +52,9 @@ enum MenuRebuildService: Sendable {
             }
         }
 
-        let listText = MenuListGenerator.makeList(kind: kind, items: items)
+        // Keys must match on-disk folder names (001… not 01… when max ≥ 100).
+        let maxNumber = ordered.map(\.number).max() ?? ordered.count
+        let listText = MenuListGenerator.makeList(kind: kind, items: items, maxNumber: maxNumber)
         progress?("Building \(kind.displayName) image…", 0.58)
 
         let assets = try assetsURL(for: kind)

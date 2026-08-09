@@ -10,43 +10,56 @@ enum MenuListGenerator: Sendable {
         var ip: IpBinInfo
     }
 
-    /// Format folder number the same way GDMENUCardManager does (width by magnitude).
+    /// Format a list key to match **on-disk** folder names for this card.
+    ///
+    /// Width follows the card’s max slot (same as `FolderNumbering`), not each
+    /// entry’s own magnitude. Otherwise a 100+ game card keeps folders `001`…
+    /// while LIST.INI said `01`…`99` and GDmenu could not open most titles.
+    nonisolated static func formatFolderNumber(_ number: Int, maxNumber: Int) -> String {
+        FolderNumbering.format(number, maxNumber: maxNumber)
+    }
+
+    /// Legacy single-number width (tests / call sites without a card max).
     nonisolated static func formatFolderNumber(_ number: Int) -> String {
-        if number < 100 { return String(format: "%02d", number) }
-        if number < 1000 { return String(format: "%03d", number) }
-        if number < 10000 { return String(format: "%04d", number) }
-        return String(number)
+        FolderNumbering.format(number)
     }
 
     /// Generate LIST.INI body for GDmenu.
-    nonisolated static func makeGDMenuList(items: [Item]) -> String {
+    nonisolated static func makeGDMenuList(items: [Item], maxNumber: Int? = nil) -> String {
+        let widthMax = maxNumber ?? items.map(\.number).max() ?? 1
         var sb = "[GDMENU]\n"
         for item in items {
-            appendEntry(to: &sb, item: item, openMenu: false)
+            appendEntry(to: &sb, item: item, openMenu: false, maxNumber: widthMax)
         }
         return sb
     }
 
     /// Generate OPENMENU.INI body for openMenu.
-    nonisolated static func makeOpenMenuList(items: [Item]) -> String {
+    nonisolated static func makeOpenMenuList(items: [Item], maxNumber: Int? = nil) -> String {
+        let widthMax = maxNumber ?? items.map(\.number).max() ?? 1
         var sb = "[OPENMENU]\n"
         sb += "num_items=\(items.count)\n\n"
         sb += "[ITEMS]\n"
         for item in items {
-            appendEntry(to: &sb, item: item, openMenu: true)
+            appendEntry(to: &sb, item: item, openMenu: true, maxNumber: widthMax)
         }
         return sb
     }
 
-    nonisolated static func makeList(kind: MenuKind, items: [Item]) -> String {
+    nonisolated static func makeList(kind: MenuKind, items: [Item], maxNumber: Int? = nil) -> String {
         switch kind {
-        case .gdMenu: return makeGDMenuList(items: items)
-        case .openMenu: return makeOpenMenuList(items: items)
+        case .gdMenu: return makeGDMenuList(items: items, maxNumber: maxNumber)
+        case .openMenu: return makeOpenMenuList(items: items, maxNumber: maxNumber)
         }
     }
 
-    nonisolated private static func appendEntry(to sb: inout String, item: Item, openMenu: Bool) {
-        let n = formatFolderNumber(item.number)
+    nonisolated private static func appendEntry(
+        to sb: inout String,
+        item: Item,
+        openMenu: Bool,
+        maxNumber: Int
+    ) {
+        let n = formatFolderNumber(item.number, maxNumber: maxNumber)
         let name = item.name.trimmingCharacters(in: .whitespacesAndNewlines)
         let ip = item.ip
 
