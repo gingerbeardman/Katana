@@ -1076,7 +1076,7 @@ final class AppState {
         // Explicit Rescan / Clear Cache still passes forceRescan: true.
         if !forceRescan, !isScanning, isSameOpenVolume(as: url) {
             // Re-bind write access — remounts keep the same path but kill the old scope.
-            _ = ensureCardWriteAccess()
+            await ensureCardWriteAccessAsync()
             await refreshOpenVolumeChrome(for: url, persistRecents: true)
             LaunchTrace.mark("open early-return same volume")
             return
@@ -1092,9 +1092,12 @@ final class AppState {
             bookmarkData = preexistingBookmark
         }
         // Bind before scan/mutations so every I/O uses a live scoped root.
-        let existingAccessOK = accessURL.map { probeCardWritable($0) } ?? false
+        var existingAccessOK = false
+        if let access = accessURL {
+            existingAccessOK = await probeCardWritableAsync(access)
+        }
         if !existingAccessOK {
-            _ = bindCardAccess(url, replaceBookmarkIfStale: false, existingBookmark: preexistingBookmark ?? bookmarkData)
+            await bindCardAccessAsync(url, replaceBookmarkIfStale: false, existingBookmark: preexistingBookmark ?? bookmarkData)
         }
 
         lastError = nil
@@ -1804,7 +1807,7 @@ final class AppState {
                 accessURL = next
             } else {
                 // Fall back to bookmark rebind (may refresh a stale scope).
-                _ = ensureCardWriteAccess()
+                await ensureCardWriteAccessAsync()
             }
         }
         await loadCachedHashRate(for: resolved.volumeUUID)
@@ -1888,7 +1891,7 @@ final class AppState {
             Task { @MainActor in
                 // Remount / other apps often drop sandbox write access while we're backgrounded.
                 if self.volume != nil {
-                    _ = self.ensureCardWriteAccess()
+                    await self.ensureCardWriteAccessAsync()
                 }
                 // Cheap when name/path unchanged; fixes renames that happened while we were in the background.
                 await self.refreshOpenVolumeIdentity()
@@ -3328,7 +3331,12 @@ final class AppState {
     }
 
     /// True when the sandbox can create and delete a tiny file on the card root.
+    /// Blocks on card I/O — user-initiated paths only; housekeeping uses the async twin.
     private func probeCardWritable(_ root: URL) -> Bool {
+        Self.probeCardWritableIO(root, accessPath: accessURL?.path)
+    }
+
+    private nonisolated static func probeCardWritableIO(_ root: URL, accessPath: String?) -> Bool {
         let probe = root.appendingPathComponent(
             ".katana-write-probe-\(UUID().uuidString)",
             isDirectory: false
@@ -3342,10 +3350,81 @@ final class AppState {
             try? FileManager.default.removeItem(at: probe)
             let ns = error as NSError
             LaunchTrace.mark(
-                "probeCardWritable FAIL path=\(root.path) accessURL=\(accessURL?.path ?? "nil") \(ns.domain) \(ns.code): \(ns.localizedDescription)"
+                "probeCardWritable FAIL path=\(root.path) accessURL=\(accessPath ?? "nil") \(ns.domain) \(ns.code): \(ns.localizedDescription)"
             )
             return false
         }
+    }
+
+    /// Probe with the card I/O off the main actor — a busy or slow card must not stall UI.
+    private func probeCardWritableAsync(_ root: URL) async -> Bool {
+        let accessPath = accessURL?.path
+        return await Task.detached(priority: .userInitiated) {
+            Self.probeCardWritableIO(root, accessPath: accessPath)
+        }.value
+    }
+
+    /// Async twin of `ensureCardWriteAccess` for housekeeping paths (card open,
+    /// app activation, volume rename). Sampled: the sync probe on the main actor
+    /// froze the UI whenever background scans saturated the card.
+    @discardableResult
+    private func ensureCardWriteAccessAsync() async -> Bool {
+        guard let volume else { return false }
+
+        if let access = accessURL {
+            if await probeCardWritableAsync(access) {
+                return true
+            }
+            if access.startAccessingSecurityScopedResource(), await probeCardWritableAsync(access) {
+                return true
+            }
+        }
+
+        if let data = bookmarkData {
+            var isStale = false
+            if let url = try? URL(
+                resolvingBookmarkData: data,
+                options: [.withSecurityScope, .withoutUI],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            ), FileManager.default.fileExists(atPath: url.path) {
+                if await bindCardAccessAsync(url, replaceBookmarkIfStale: isStale, existingBookmark: data) {
+                    return true
+                }
+            }
+        }
+
+        return await bindCardAccessAsync(
+            volume.rootURL,
+            replaceBookmarkIfStale: false,
+            existingBookmark: bookmarkData
+        )
+    }
+
+    /// Async twin of `bindCardAccess` — same binding rules, probe off the main actor.
+    @discardableResult
+    private func bindCardAccessAsync(
+        _ url: URL,
+        replaceBookmarkIfStale: Bool,
+        existingBookmark: Data?
+    ) async -> Bool {
+        let started = url.startAccessingSecurityScopedResource()
+        if await probeCardWritableAsync(url) {
+            if let previous = accessURL,
+               previous.standardizedFileURL != url.standardizedFileURL
+            {
+                previous.stopAccessingSecurityScopedResource()
+            }
+            accessURL = url
+            if replaceBookmarkIfStale || bookmarkData == nil {
+                bookmarkData = VolumeStore.makeBookmark(for: url) ?? existingBookmark ?? bookmarkData
+            }
+            return true
+        }
+        if started {
+            url.stopAccessingSecurityScopedResource()
+        }
+        return false
     }
 
     private static let cardAccessHelp =

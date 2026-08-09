@@ -241,10 +241,7 @@ struct IpBinReaderTests {
         #expect(IpBinReader.parse(ipData: data) == nil)
     }
 
-    /// Homebrew CDIs put big CDDA sessions before the data track, so IP.BIN can sit
-    /// far into the image. The old 8 MB scan cap made those games fall back to
-    /// placeholder headers (date 19990909) in LIST.INI.
-    @Test func readsHeaderDeepInsideCDI() throws {
+    private func makeFastStrikerHeader() -> Data {
         var header = Data(count: 256)
         header.replaceSubrange(0..<16, with: Array("SEGA SEGAKATANA ".utf8))
         header.replaceSubrange(0x25..<0x2B, with: Array("GD-ROM".utf8))
@@ -256,17 +253,108 @@ struct IpBinReaderTests {
         header.replaceSubrange(0x4A..<0x50, with: Array("V1.000".utf8))
         header.replaceSubrange(0x50..<0x58, with: Array("20061202".utf8))
         header.replaceSubrange(0x80..<(0x80 + 12), with: Array("FAST STRIKER".utf8))
+        return header
+    }
 
+    private func makeTempFolder() throws -> URL {
         let folder = FileManager.default.temporaryDirectory
             .appendingPathComponent("katana-ipbin-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder
+    }
+
+    /// Homebrew CDIs put big CDDA sessions before the data track, so IP.BIN can sit
+    /// far into the image. The old 8 MB scan cap made those games fall back to
+    /// placeholder headers (date 19990909) in LIST.INI.
+    @Test func readsHeaderDeepInsideCDIWithoutTrackTable() throws {
+        let folder = try makeTempFolder()
         defer { try? FileManager.default.removeItem(at: folder) }
 
         // 9 MB of "audio" before the header — beyond the old cap, spanning chunk edges.
+        // No CDI footer → exercises the bounded fallback scan.
         let url = folder.appendingPathComponent("disc.cdi")
         var image = Data(repeating: 0x55, count: 9 * 1024 * 1024 + 123)
-        image.append(header)
+        image.append(makeFastStrikerHeader())
         image.append(Data(repeating: 0, count: 2048))
+        try image.write(to: url)
+
+        let info = try #require(
+            IpBinReader.read(folderURL: folder, imageFileName: "disc.cdi", format: .cdi)
+        )
+        #expect(info.name == "FAST STRIKER")
+        #expect(info.releaseDate == "20061202")
+    }
+
+    /// DiscJuggler CDI with a real track table: the data session starts *past* the
+    /// brute-scan cap, so only footer/TOC parsing can find the header — and it must
+    /// do so by reading a few hundred KB, not the whole image.
+    @Test func readsHeaderViaCDITrackTable() throws {
+        let folder = try makeTempFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let sectorSize = 2352
+        let audioSectors = 30_000 // ≈ 70 MB — beyond the 64 MB fallback scan cap
+        let dataPregap = 150
+        let audioBytes = audioSectors * sectorSize
+        let headerOffset = audioBytes + dataPregap * sectorSize + 16 // sync+header of first raw sector
+
+        var image = Data(count: headerOffset)
+        image.append(makeFastStrikerHeader())
+        image.append(Data(count: 4 * sectorSize))
+
+        // Footer: [u16 sessions][session: u16 ntracks + track records][per-session tail]…[version][headerOffset]
+        var toc = Data()
+        func le16(_ v: Int) { toc.append(contentsOf: [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF)]) }
+        func le32(_ v: UInt32) {
+            toc.append(contentsOf: [
+                UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8((v >> 24) & 0xFF),
+            ])
+        }
+        func track(pregap: Int, length: Int, mode: UInt32, sectorSizeID: UInt32) {
+            le32(0) // no extra data
+            let mark: [UInt8] = [0, 0, 1, 0, 0, 0, 255, 255, 255, 255]
+            toc.append(contentsOf: mark)
+            toc.append(contentsOf: mark)
+            toc.append(Data(count: 4))
+            toc.append(0) // filename length
+            toc.append(Data(count: 11 + 4 + 4))
+            le32(0) // not the DJ4 marker
+            toc.append(Data(count: 2))
+            le32(UInt32(pregap))
+            le32(UInt32(length))
+            toc.append(Data(count: 6))
+            le32(mode)
+            toc.append(Data(count: 12))
+            le32(0) // start LBA
+            le32(UInt32(pregap + length)) // total length
+            toc.append(Data(count: 16))
+            le32(sectorSizeID)
+            toc.append(Data(count: 29))
+            toc.append(Data(count: 5)) // v3 tail
+            le32(0) // not DJ 3.00780+
+        }
+        func endSession() {
+            toc.append(Data(count: 4 + 8 + 1)) // v3 tail
+        }
+        le16(2) // sessions
+        le16(1) // session 1: one audio track
+        track(pregap: 150, length: audioSectors - 150, mode: 0, sectorSizeID: 1)
+        endSession()
+        le16(1) // session 2: one data track
+        track(pregap: dataPregap, length: 4, mode: 2, sectorSizeID: 1)
+        endSession()
+
+        let tocStart = UInt32(image.count)
+        image.append(toc)
+        var footer = Data()
+        footer.append(contentsOf: [0x05, 0x00, 0x00, 0x80]) // CDI v3
+        footer.append(contentsOf: [
+            UInt8(tocStart & 0xFF), UInt8((tocStart >> 8) & 0xFF),
+            UInt8((tocStart >> 16) & 0xFF), UInt8((tocStart >> 24) & 0xFF),
+        ])
+        image.append(footer)
+
+        let url = folder.appendingPathComponent("disc.cdi")
         try image.write(to: url)
 
         let info = try #require(
