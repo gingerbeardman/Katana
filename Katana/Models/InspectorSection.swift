@@ -3,6 +3,7 @@ import Foundation
 /// Collapsible inspector sections; expand/collapse is persisted in UserDefaults.
 enum InspectorSection: String, CaseIterable, Identifiable, Sendable {
     case title
+    case openMenu
     case duplicate
     case ipBin
     case gdtex
@@ -15,6 +16,7 @@ enum InspectorSection: String, CaseIterable, Identifiable, Sendable {
     var title: String {
         switch self {
         case .title: return "Title"
+        case .openMenu: return "openMenu"
         case .duplicate: return "Duplicate"
         case .ipBin: return "IP.BIN"
         case .gdtex: return "Cover"
@@ -27,7 +29,7 @@ enum InspectorSection: String, CaseIterable, Identifiable, Sendable {
     /// First-launch default (before any UserDefaults write).
     var defaultExpanded: Bool {
         switch self {
-        case .title, .duplicate, .ipBin, .gdtex, .onCard, .actions, .selection:
+        case .title, .openMenu, .duplicate, .ipBin, .gdtex, .onCard, .actions, .selection:
             return true
         }
     }

@@ -18,8 +18,12 @@ private nonisolated struct VolumePreferences: Codable, Sendable {
     var recents: [RememberedVolume]
     /// Per-volume visual table sort (does not affect on-card slot numbering).
     var displaySortByVolume: [String: DisplaySortPreference]
-    /// Per-volume GDmenu vs openMenu preference (rebuild target).
+    /// Per-volume GDmenu / openMenu / openMenu Extended preference (rebuild target).
     var menuKindByVolume: [String: MenuKind]
+    /// Kind last successfully baked (or detected) in slot 01.
+    var bakedMenuKindByVolume: [String: MenuKind]
+    /// 0 = 2.1 stored ateam as `openMenu`. 1 = `openMenu` is stock, ateam is `openMenuExtended`.
+    var menuKindSchemaVersion: Int
     /// Last measured content-hash throughput (bytes/sec) per volume — seeds ETA on next run.
     var hashBytesPerSecondByVolume: [String: Double]
     /// Per-volume “not a duplicate” identity keys (`DuplicateIdentity.key`).
@@ -30,15 +34,19 @@ private nonisolated struct VolumePreferences: Codable, Sendable {
         recents: [RememberedVolume],
         displaySortByVolume: [String: DisplaySortPreference],
         menuKindByVolume: [String: MenuKind] = [:],
+        bakedMenuKindByVolume: [String: MenuKind] = [:],
         hashBytesPerSecondByVolume: [String: Double] = [:],
-        notDuplicateKeysByVolume: [String: [String]] = [:]
+        notDuplicateKeysByVolume: [String: [String]] = [:],
+        menuKindSchemaVersion: Int = 1
     ) {
         self.lastVolumeUUID = lastVolumeUUID
         self.recents = recents
         self.displaySortByVolume = displaySortByVolume
         self.menuKindByVolume = menuKindByVolume
+        self.bakedMenuKindByVolume = bakedMenuKindByVolume
         self.hashBytesPerSecondByVolume = hashBytesPerSecondByVolume
         self.notDuplicateKeysByVolume = notDuplicateKeysByVolume
+        self.menuKindSchemaVersion = menuKindSchemaVersion
     }
 
     init(from decoder: Decoder) throws {
@@ -53,6 +61,10 @@ private nonisolated struct VolumePreferences: Codable, Sendable {
             [String: MenuKind].self,
             forKey: .menuKindByVolume
         ) ?? [:]
+        bakedMenuKindByVolume = try c.decodeIfPresent(
+            [String: MenuKind].self,
+            forKey: .bakedMenuKindByVolume
+        ) ?? [:]
         hashBytesPerSecondByVolume = try c.decodeIfPresent(
             [String: Double].self,
             forKey: .hashBytesPerSecondByVolume
@@ -61,6 +73,16 @@ private nonisolated struct VolumePreferences: Codable, Sendable {
             [String: [String]].self,
             forKey: .notDuplicateKeysByVolume
         ) ?? [:]
+        menuKindSchemaVersion = try c.decodeIfPresent(Int.self, forKey: .menuKindSchemaVersion) ?? 0
+    }
+
+    /// 2.1 persisted ateam as `openMenu`. Map those onto Extended once.
+    mutating func applyMenuKindSchemaMigration() -> Bool {
+        guard menuKindSchemaVersion < 1 else { return false }
+        menuKindByVolume = menuKindByVolume.mapValues(MenuKind.migratingFromPreExtendedSchema)
+        bakedMenuKindByVolume = bakedMenuKindByVolume.mapValues(MenuKind.migratingFromPreExtendedSchema)
+        menuKindSchemaVersion = 1
+        return true
     }
 }
 
@@ -93,6 +115,7 @@ actor VolumeStore {
         recents: [],
         displaySortByVolume: [:],
         menuKindByVolume: [:],
+        bakedMenuKindByVolume: [:],
         hashBytesPerSecondByVolume: [:],
         notDuplicateKeysByVolume: [:]
     )
@@ -145,6 +168,17 @@ actor VolumeStore {
     func setMenuKind(_ kind: MenuKind, for volumeUUID: String) throws {
         try ensureLoaded()
         prefs.menuKindByVolume[volumeUUID] = kind
+        try save()
+    }
+
+    func bakedMenuKind(for volumeUUID: String) throws -> MenuKind? {
+        try ensureLoaded()
+        return prefs.bakedMenuKindByVolume[volumeUUID]
+    }
+
+    func setBakedMenuKind(_ kind: MenuKind, for volumeUUID: String) throws {
+        try ensureLoaded()
+        prefs.bakedMenuKindByVolume[volumeUUID] = kind
         try save()
     }
 
@@ -243,6 +277,7 @@ actor VolumeStore {
         prefs.recents.removeAll { $0.volumeUUID == uuid }
         prefs.displaySortByVolume.removeValue(forKey: uuid)
         prefs.menuKindByVolume.removeValue(forKey: uuid)
+        prefs.bakedMenuKindByVolume.removeValue(forKey: uuid)
         prefs.hashBytesPerSecondByVolume.removeValue(forKey: uuid)
         prefs.notDuplicateKeysByVolume.removeValue(forKey: uuid)
         if prefs.lastVolumeUUID == uuid {
@@ -351,6 +386,9 @@ actor VolumeStore {
         try LaunchTrace.measure("VolumeStore read+decode volumes.json") {
             let data = try Data(contentsOf: storeURL)
             prefs = try decoder.decode(VolumePreferences.self, from: data)
+        }
+        if prefs.applyMenuKindSchemaMigration() {
+            try save()
         }
         LaunchTrace.mark("VolumeStore.ensureLoaded: \(prefs.recents.count) recents")
     }

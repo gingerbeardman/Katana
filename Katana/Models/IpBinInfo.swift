@@ -52,14 +52,29 @@ nonisolated struct IpBinInfo: Hashable, Sendable, Codable {
 
 nonisolated enum MenuKind: String, Sendable, Codable, CaseIterable, Identifiable {
     case gdMenu
+    /// Stock openMenu (`OPENMENU.INI` without virtual-folder keys).
     case openMenu
+    /// ateam Virtual Folder Bundle (folders, disc types, Folders themes).
+    case openMenuExtended
 
     var id: String { rawValue }
+
+    var isOpenMenuFamily: Bool {
+        switch self {
+        case .gdMenu: return false
+        case .openMenu, .openMenuExtended: return true
+        }
+    }
+
+    /// Folder / Type columns, inspector, and `folder=` / `type=` in OPENMENU.INI.
+    var supportsVirtualFolders: Bool {
+        self == .openMenuExtended
+    }
 
     var volumeIdentifier: String {
         switch self {
         case .gdMenu: return "GDMENU"
-        case .openMenu: return "OPENMENU"
+        case .openMenu, .openMenuExtended: return "OPENMENU"
         }
     }
 
@@ -67,14 +82,14 @@ nonisolated enum MenuKind: String, Sendable, Codable, CaseIterable, Identifiable
     var menuFolderName: String {
         switch self {
         case .gdMenu: return "GDMENU"
-        case .openMenu: return "openMenu"
+        case .openMenu, .openMenuExtended: return "openMenu"
         }
     }
 
     var listFileName: String {
         switch self {
         case .gdMenu: return "LIST.INI"
-        case .openMenu: return "OPENMENU.INI"
+        case .openMenu, .openMenuExtended: return "OPENMENU.INI"
         }
     }
 
@@ -82,6 +97,16 @@ nonisolated enum MenuKind: String, Sendable, Codable, CaseIterable, Identifiable
         switch self {
         case .gdMenu: return "GDmenu"
         case .openMenu: return "openMenu"
+        case .openMenuExtended: return "openMenu Extended"
+        }
+    }
+
+    /// Segmented-control labels — keep the three segments similar width.
+    var segmentTitle: String {
+        switch self {
+        case .gdMenu: return "GDmenu"
+        case .openMenu: return "openMenu"
+        case .openMenuExtended: return "Extended"
         }
     }
 
@@ -89,13 +114,22 @@ nonisolated enum MenuKind: String, Sendable, Codable, CaseIterable, Identifiable
     var helpText: String {
         switch self {
         case .gdMenu:
-            return "Classic GDmenu (LIST.INI in slot 01)."
+            return "Classic GDmenu (LIST.INI in slot 01). Folder and Type columns stay hidden."
         case .openMenu:
-            return "openMenu (OPENMENU.INI, themes, product IDs)."
+            return "Stock openMenu (OPENMENU.INI). Folder and Type columns stay hidden."
+        case .openMenuExtended:
+            return "openMenu 1.6.3-ateam Virtual Folder Bundle — folders, disc types, and Folders themes."
         }
     }
 
+    /// 2.1 stored ateam as `openMenu`. Schema 1 keeps `openMenu` for stock.
+    static func migratingFromPreExtendedSchema(_ kind: MenuKind) -> MenuKind {
+        kind == .openMenu ? .openMenuExtended : kind
+    }
+
     /// Detect from a display / `name.txt` string.
+    /// Slot-01 is still named `openMenu` for both stock and Extended; callers refine via
+    /// `supportsVirtualFolders` metadata on the card.
     static func detect(fromName name: String) -> MenuKind? {
         let n = name
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -105,6 +139,7 @@ nonisolated enum MenuKind: String, Sendable, Codable, CaseIterable, Identifiable
             .replacingOccurrences(of: "-", with: "")
         if n.isEmpty { return nil }
         if n == "gdmenu" || n == "gdemu" { return .gdMenu }
+        if n.contains("ateam") || n.contains("extended") { return .openMenuExtended }
         if n == "openmenu" { return .openMenu }
         return nil
     }

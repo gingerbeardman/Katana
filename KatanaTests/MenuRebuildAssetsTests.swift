@@ -16,7 +16,7 @@ struct MenuRebuildAssetsTests {
     }
 
     @Test func assetsURLExtractsBothMenusWithIPBIN() throws {
-        for kind in [MenuKind.gdMenu, MenuKind.openMenu] {
+        for kind in MenuKind.allCases {
             let assets = try MenuRebuildService.assetsURL(for: kind)
             let ip = assets.appendingPathComponent("IP.BIN").path
             #expect(FileManager.default.fileExists(atPath: ip))

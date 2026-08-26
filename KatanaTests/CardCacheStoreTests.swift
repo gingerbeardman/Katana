@@ -115,7 +115,12 @@ struct CardCacheStoreTests {
         try "MK6969".write(to: folder.appendingPathComponent("serial.txt"), atomically: true, encoding: .utf8)
         try Data("fake".utf8).write(to: folder.appendingPathComponent("disc.gdi"))
 
-        let first = try await CardScanner.scan(rootURL: root, preferSnapshotCache: false)
+        let preferred = VolumeIdentity.stableIDPrefix + UUID().uuidString
+        let first = try await CardScanner.scan(
+            rootURL: root,
+            preferSnapshotCache: false,
+            preferredVolumeUUID: preferred
+        )
         #expect(first.entries.count == 1)
 
         let volumeUUID = first.volume.volumeUUID
@@ -124,9 +129,14 @@ struct CardCacheStoreTests {
             namesByFolder: ["01": (name: "Custom Menu", isMenu: true)]
         )
 
-        let snap = try await CardScanner.loadSnapshotIfValid(rootURL: root)
+        let snap = try await CardScanner.loadSnapshotIfValid(
+            rootURL: root,
+            preferredVolumeUUID: preferred
+        )
         #expect(snap != nil)
         #expect(snap?.entries.first?.name == "Custom Menu")
         #expect(snap?.cacheMisses == 0)
+
+        try await CardCacheStore.shared.clear(volumeUUID: volumeUUID)
     }
 }

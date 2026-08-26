@@ -1,6 +1,6 @@
 # Katana — Features
 
-Native macOS manager for **GDEMU** SD cards (Sega Dreamcast), with **GDmenu** and **openMenu** support.
+Native macOS manager for **GDEMU** SD cards (Sega Dreamcast), with **GDmenu**, **openMenu**, and **openMenu Extended** support.
 
 Open a card, browse the numbered game folders, rename / reorder / delete with immediate on-card writes, inspect game metadata and cover art, find duplicates, hash content, and rebuild the slot-01 menu image so the console list matches the card.
 
@@ -37,11 +37,13 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 ## Game List
 
 - **Multi-select table** — Title, Serial, Format, Size, and slot number columns
-- **Toggleable columns** — Control-click a column header to show or hide Serial, Format, or Size (same native SwiftUI table customization as 2UP). # and Title stay visible; widths and visibility persist across launches
+- **Toggleable columns** — Control-click a column header to show or hide Serial, Folder, Type, Disc, Format, or Size (same native SwiftUI table customization as 2UP). # and Title stay visible; widths and visibility persist per menu type. **Folder** and **Type** are shown by default only for **openMenu Extended** (hidden for GDmenu and stock openMenu)
 - **Display-only sorting** — click a column header to sort the view. Slot numbers on the card are never touched. A status strip spells this out whenever a non-slot sort is active, with one-click **Newest First** / **Slot Order**
 - **Sort remembered per card** — each volume keeps its own display sort across sessions
 - **Apply A–Z to Card** — the deliberate, separate action that actually renumbers folders on the SD card
-- **Search** — filter by name, serial, or slot number
+- **Search** — filter by name, serial, virtual folder, type, or slot number
+- **openMenu Folder / Type** — shown when the card’s menu type is **openMenu Extended**. Inspector Folder is an editable combo: type a nested path (`Games\RPGs`) or pick/autocomplete from paths already on the card (empty unfiles). **Assign Folder** in the context menu applies one path to a multi-select (**None**, existing paths, **Type a Path…** with the same autocomplete). Extra folder paths so a disc can appear in more than one folder. Disc type Game / Other / PSX. Written immediately to `folder.txt` / `type.txt` / `folder_altN.txt` (same layout as GDMENU Card Manager)
+- **Disc / Region / Serial** — inspector edits write `disc.txt`, `region.txt`, and `serial.txt`. Multi-disc Compact grouping needs a shared serial plus sequential disc numbers (`1/4`, `2/4`). Region is any mix of J/U/E (stored in that order)
 - **Format badges** — GDI, CDI, CCD
 - **Reveal in Finder** for any selection
 
@@ -59,7 +61,7 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 
 ## Adding & Removing Games
 
-- **Add Games** (`⌘``I`) — pick disc images or game folders into the next free slots, or **drag and drop** from Finder onto the game list
+- **Add Games** (`⌘``I`) — pick disc images or game folders into the lowest free slots (gaps after delete are reused), or **drag and drop** from Finder onto the game list
 - **Finder drop target** — AppKit pasteboard destination (2UP-style), not SwiftUI `.onDrop`, so multi-select Finder drops work reliably; accent ring while hovering
 - **Multi-file sets** — multi-select a `.gdi` with its tracks (or `.ccd` + companions); Katana groups them into one game. GDI imports copy **only** the cue + referenced tracks (not the whole parent folder). Redump-style **quoted track names** (spaces) are supported for copy and IP.BIN
 - **ZIP import** — drop or pick a `.zip` of game folders / disc-image sets; extracted in-process (sandbox-safe), then imported like loose packages
@@ -76,7 +78,9 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 
 ## Reordering
 
-- **Move Up / Move Down on Card** — renumber the selection, one slot at a time
+- **Move Up / Down** (⌘↑ / ⌘↓) — one row in the current list. Opens **Arrange**; folders change only when you **Apply**
+- **Move to Top / Bottom** (⌥⌘↑ / ⌥⌘↓) — jump the selection to slot 02 (after the menu) or the last slot, still in Arrange until Apply
+- **Arrange** — drag already-selected rows to a new position (dragging unselected rows still extends the selection), or choose **Arrange**. Reorders follow the **current table sort** (Newest First stays newest-first); a multi-select moves as a block. **Apply** writes one folder renumber; **Cancel** discards. Slot 01 stays put
 - **Apply A–Z Order to Card** — alphabetical renumber of the whole card
 - **Compact packing** — after deletes, remaining games only move down into freed slots, one rename each, with a two-phase fallback when a destination is still occupied
 - **Correct folder width** — menu slot is always `01`; other slots follow the card’s magnitude (`02`… or `002`…), matching GDEMU / GCM
@@ -126,16 +130,17 @@ Collapsible sections, each remembering its expanded state:
 
 ## Menu Rebuild
 
-- **Native Swift bake** — GDmenu (`LIST.INI`) or openMenu (`OPENMENU.INI`) written into slot 01
+- **Native Swift bake** — GDmenu (`LIST.INI`), stock openMenu (`OPENMENU.INI`), or openMenu Extended (`OPENMENU.INI` with `folder=`, `folder_altN=`, `type=`) written into slot 01
+- **Artwork DATs kept on rebuild** — existing `BOX.DAT` / `ICON.DAT` / `META.DAT` / `FOLDRART.*` inside the current menu image are extracted and written back into the new bake (assigning new art is still GDMENU Card Manager)
 - **Real GDI output** — ISO 9660 Level 1, multi-track GDI at LBA 45000, with truncate and CDDA handling, MIL-CD-safe
 - **No helper binaries** — no .NET runtime, no nested executables, no brotli dylibs in the app bundle; menu asset zips unpack **in-process** (sandbox-safe; no `/usr/bin/unzip`)
 - **List keys match folders** — menu stays in **`01`** (same as GDMENU Card Manager); game slots use card-wide width (`002`… on a 100+ game card) so GDmenu can resolve titles
-- **Menu type picker** — switch between GDmenu and openMenu from Settings or the Card menu
+- **Menu type picker** — switch between GDmenu, openMenu, and openMenu Extended from Settings or the Card menu. The type also chooses which list columns are available (Folder / Type only for Extended)
 - **Out-of-date banner** — a warning strip appears above the list when names or order no longer match the baked menu; **fingerprint-based** dirty state clears if you reverse the change (e.g. add a game then delete it, or undo a rename)
 - **Prompt on quit** — you're asked before leaving with a stale menu image; quit-time rebuild skips UI thrash so exit stays responsive
 - **Progress** — headers (2–80%), bake stages (assets, tracks, disc.gdi), and byte-tracked install on the edge bar; bar reaches full width on completion; the status line shows where headers come from (**“270 cached · 12 from card”**)
 - **Cached IP headers** — import, enrichment, rebuilds, and the inspector store IP.BIN fields on each game **and in the on-disk card cache**, so rebuilds skip re-reading every GDI across launches; cleared when the disc content hash changes (homebrew images without a readable IP.BIN are re-read each time)
-- **Bundled stock assets** — GDmenu and openMenu packs ship inside the app as zip resources
+- **Bundled stock assets** — GDmenu and **openMenu 1.6.3-ateam** (Virtual Folder Bundle) packs ship inside the app as zip resources. Stock openMenu and openMenu Extended share that ateam pack for now; Extended is what writes `folder=` / `type=` and shows those columns
 
 ## Game Database
 
@@ -157,8 +162,8 @@ Collapsible sections, each remembering its expanded state:
 ## Mac Native
 
 - **SwiftUI** with a NavigationSplitView: sidebar, table, and trailing inspector
-- **Customisable toolbar** — the default set is Open · Add · Delete · Rebuild · A–Z · Eject · Inspector, with Move Up, Move Down, and Duplicates available in the palette
-- **Full keyboard support** — `⌘``O` open, `⌘``I` add, `⌘``S` rebuild, `⌘``R` clear cache and rescan, `⇧``⌘``E` eject, `⌫` soft-delete, `⌥``⌫` delete immediately, Return to rename, `⌥``⌘``I` inspector, `⌘``D` duplicate tools, `⌥``⌘``D` duplicate markers, `⌘``Z` undo
+- **Customisable toolbar** — the default set is Open · Add · Delete · Rebuild · Arrange · A–Z · Eject · Inspector, with Move and Duplicates available in the palette
+- **Full keyboard support** — `⌘``O` open, `⌘``I` add, `⌘``S` rebuild, `⌘``R` clear cache and rescan, `⇧``⌘``E` eject, `⌫` soft-delete, `⌥``⌫` delete immediately, Return to rename, `⌥``⌘``I` inspector, `⌘``D` duplicate tools, `⌥``⌘``D` duplicate markers, `⌘``↑` / `⌘``↓` move one row, `⌥``⌘``↑` / `⌥``⌘``↓` move to top/bottom, `⌘``Z` undo. Arrange: Escape cancels, Return applies
 - **Context menus** throughout the game list
 - **Dark Mode**, full screen, and window state restoration
 - **Welcome window** on first launch, reopenable from the Help menu
@@ -190,7 +195,8 @@ Collapsible sections, each remembering its expanded state:
 | Platform | macOS only | Windows, Linux, macOS |
 | Built with | Native Swift / SwiftUI | C# / .NET 6 / Avalonia |
 | Runtime required | None | .NET 6 Desktop Runtime |
-| GDmenu + openMenu | Yes | Yes |
+| GDmenu + openMenu | Yes (GDmenu, stock openMenu, **openMenu Extended** / 1.6.3-ateam) | Yes |
+| Virtual folders / disc type | Yes (`folder.txt`, `type.txt`, extras) | ateam fork |
 | Menu GDI bake | Native Swift | Bundled tooling |
 | GDI / CDI / CCD | Yes | Yes |
 | MDS images | – | Yes |
@@ -204,7 +210,7 @@ Collapsible sections, each remembering its expanded state:
 | Multi-file GDI/CCD drop grouping | Yes | Yes |
 | Transparent add (live list + byte-weighted progress) | Yes | – |
 | Sort alphabetically | Yes | Yes |
-| Drag-and-drop manual order | – | Yes |
+| Drag-and-drop manual order | Arrange mode, Apply once | Yes |
 | Move up / down on card | Yes | – |
 | Auto-rename from GameDB / IP.BIN / folder / file | Yes | Yes |
 | Variant/build-tag filenames kept on auto-rename | Yes | – |

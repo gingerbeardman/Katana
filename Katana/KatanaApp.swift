@@ -47,21 +47,25 @@ struct KatanaApp: App {
                 Button("Open Card…") {
                     state.openCard()
                 }
-                .keyboardShortcut("o", modifiers: .command)
+                .keyboardShortcutUnlessTextEditing("o", textEditing: state.isTextInputFocused)
             }
 
             CommandGroup(after: .pasteboard) {
                 Button("Undo") {
                     state.undoManager.undo()
                 }
-                .keyboardShortcut("z", modifiers: .command)
+                .keyboardShortcutUnlessTextEditing("z", textEditing: state.isTextInputFocused)
                 // While typing, leave ⌘Z to the field editor / system Edit menu.
                 .disabled(!state.undoManager.canUndo || state.isTextInputFocused)
 
                 Button("Redo") {
                     state.undoManager.redo()
                 }
-                .keyboardShortcut("z", modifiers: [.command, .shift])
+                .keyboardShortcutUnlessTextEditing(
+                    "z",
+                    modifiers: [.command, .shift],
+                    textEditing: state.isTextInputFocused
+                )
                 .disabled(!state.undoManager.canRedo || state.isTextInputFocused)
             }
 
@@ -70,15 +74,25 @@ struct KatanaApp: App {
                 Button("Add Games…") {
                     state.addGames()
                 }
-                .keyboardShortcut("i", modifiers: .command)
+                .keyboardShortcutUnlessTextEditing("i", textEditing: state.isTextInputFocused)
                 .disabled(!state.canAddGames)
                 .help("Add disc images or game folders. Hold ⌥ to keep source names (skip auto-rename).")
 
                 Button("Apply A–Z Order to Card") {
                     state.sortAlphabetically()
                 }
-                .disabled(state.volume == nil || state.isBusy)
+                .disabled(state.volume == nil || state.isBusy || state.isArranging)
                 .help("Renumber game folders A–Z on the SD card (not table display sort)")
+
+                Button(state.isArranging ? "Cancel Arrange" : "Arrange List…") {
+                    if state.isArranging {
+                        state.cancelArrange()
+                    } else {
+                        state.beginArrange()
+                    }
+                }
+                .disabled((!state.canArrange && !state.isArranging) || state.isTextInputFocused)
+                .help("Drag rows to reorder. Apply once to rename folders.")
 
                 Divider()
 
@@ -86,21 +100,15 @@ struct KatanaApp: App {
                     state.rebuildMenuList()
                 }
                 .keyboardShortcut("s", modifiers: .command)
-                .disabled(!state.canRebuildMenu || state.isTextInputFocused)
+                .disabled(!state.canRebuildMenu)
                 .help("Bake LIST.INI / OPENMENU.INI into slot 01")
 
-                Menu("Menu Type") {
+                Picker("Menu Type", selection: Binding(
+                    get: { state.menuKind },
+                    set: { state.setMenuKind($0) }
+                )) {
                     ForEach(MenuKind.allCases) { kind in
-                        Button {
-                            state.setMenuKind(kind)
-                        } label: {
-                            HStack {
-                                Text(kind.displayName)
-                                if state.menuKind == kind {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
-                        }
+                        Text(kind.displayName).tag(kind)
                     }
                 }
                 .disabled(state.volume == nil || state.isBusy)
@@ -135,7 +143,11 @@ struct KatanaApp: App {
                 Button("Eject Card") {
                     Task { await state.eject() }
                 }
-                .keyboardShortcut("e", modifiers: [.command, .shift])
+                .keyboardShortcutUnlessTextEditing(
+                    "e",
+                    modifiers: [.command, .shift],
+                    textEditing: state.isTextInputFocused
+                )
                 .disabled(!state.canEject)
 
                 Divider()
@@ -149,7 +161,7 @@ struct KatanaApp: App {
                 Button("Clear Cache and Rescan") {
                     Task { await state.clearCacheAndRescan() }
                 }
-                .keyboardShortcut("r", modifiers: .command)
+                .keyboardShortcutUnlessTextEditing("r", textEditing: state.isTextInputFocused)
                 .disabled(state.volume == nil || state.isBusy)
                 .help("Delete this card’s scan cache, then re-read every game folder from disk")
             }
@@ -189,7 +201,11 @@ struct KatanaApp: App {
                        : "Delete Selected") {
                     state.deleteSelected()
                 }
-                .keyboardShortcut(.delete, modifiers: [])
+                .keyboardShortcutUnlessTextEditing(
+                    .delete,
+                    modifiers: [],
+                    textEditing: state.isTextInputFocused
+                )
                 // ⌫ must delete characters in a text field, not games.
                 .disabled(!state.canDeleteSelection || state.isTextInputFocused)
                 .help("Soft-delete to card trash (fast, undoable). Hold ⌥ for Delete Immediately.")
@@ -199,31 +215,68 @@ struct KatanaApp: App {
                        : "Delete Immediately…") {
                     state.deleteSelectedImmediately()
                 }
-                .keyboardShortcut(.delete, modifiers: [.option])
+                .keyboardShortcutUnlessTextEditing(
+                    .delete,
+                    modifiers: [.option],
+                    textEditing: state.isTextInputFocused
+                )
                 .disabled(!state.canDeleteSelection || state.isTextInputFocused)
                 .help("Erase from the card now — not moved to trash; cannot be undone")
 
                 Divider()
 
-                Button("Move Up on Card") {
-                    state.moveSelection(up: true)
+                Button(state.moveUpTitle) {
+                    state.moveSelectionTowardTop()
                 }
+                .keyboardShortcutUnlessTextEditing(
+                    .upArrow,
+                    modifiers: .command,
+                    textEditing: state.isTextInputFocused
+                )
                 .disabled(!state.canMoveSelectionUp || state.isBusy)
-                .help("Lower SD slot number for the selection (not table sort)")
+                .help(state.moveUpHelp)
 
-                Button("Move Down on Card") {
-                    state.moveSelection(up: false)
+                Button(state.moveDownTitle) {
+                    state.moveSelectionTowardBottom()
                 }
+                .keyboardShortcutUnlessTextEditing(
+                    .downArrow,
+                    modifiers: .command,
+                    textEditing: state.isTextInputFocused
+                )
                 .disabled(!state.canMoveSelectionDown || state.isBusy)
-                .help("Higher SD slot number for the selection (not table sort)")
+                .help(state.moveDownHelp)
+
+                Button("Move to Top") {
+                    state.moveSelectionToTop()
+                }
+                .keyboardShortcutUnlessTextEditing(
+                    .upArrow,
+                    modifiers: [.command, .option],
+                    textEditing: state.isTextInputFocused
+                )
+                .disabled(!state.canMoveSelectionToTop || state.isBusy)
+                .help(state.moveToTopHelp)
+
+                Button("Move to Bottom") {
+                    state.moveSelectionToBottom()
+                }
+                .keyboardShortcutUnlessTextEditing(
+                    .downArrow,
+                    modifiers: [.command, .option],
+                    textEditing: state.isTextInputFocused
+                )
+                .disabled(!state.canMoveSelectionToBottom || state.isBusy)
+                .help(state.moveToBottomHelp)
 
                 Divider()
 
                 Button("Select All") {
                     state.selection = Set(state.filteredGames.map(\.id))
                 }
-                .keyboardShortcut("a", modifiers: .command)
-                // ⌘A must select field text, not every game row.
+                .keyboardShortcutUnlessTextEditing("a", textEditing: state.isTextInputFocused)
+                // ⌘A must select field text, not every game row — and a *disabled*
+                // item that still has the equivalent beeps instead of reaching the field.
                 .disabled(state.games.isEmpty || state.isBusy || state.isTextInputFocused)
 
                 Button("Deselect All") {
@@ -269,14 +322,18 @@ struct KatanaApp: App {
                     get: { state.duplicatesEnabled },
                     set: { state.duplicatesEnabled = $0 }
                 ))
-                .keyboardShortcut("d", modifiers: .command)
+                .keyboardShortcutUnlessTextEditing("d", textEditing: state.isTextInputFocused)
 
                 if state.duplicatesEnabled {
                     Toggle("Show Duplicate Markers", isOn: Binding(
                         get: { state.showDuplicateMarkers },
                         set: { state.showDuplicateMarkers = $0 }
                     ))
-                    .keyboardShortcut("d", modifiers: [.command, .option])
+                    .keyboardShortcutUnlessTextEditing(
+                        "d",
+                        modifiers: [.command, .option],
+                        textEditing: state.isTextInputFocused
+                    )
 
                     Toggle("Show Duplicates Only", isOn: Binding(
                         get: { state.showDuplicatesOnly },
@@ -290,7 +347,11 @@ struct KatanaApp: App {
                 Button(state.isInspectorPresented ? "Hide Inspector" : "Show Inspector") {
                     state.isInspectorPresented.toggle()
                 }
-                .keyboardShortcut("i", modifiers: [.command, .option])
+                .keyboardShortcutUnlessTextEditing(
+                    "i",
+                    modifiers: [.command, .option],
+                    textEditing: state.isTextInputFocused
+                )
             }
 
             CommandGroup(after: .help) {

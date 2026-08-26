@@ -56,3 +56,66 @@ struct GameEntryTests {
         #expect(!entry(format: .cdi, byteSize: 800_000_000, detailsLoaded: true, ipHeader: ip).needsDetailEnrichment)
     }
 }
+
+struct OpenMenuRegionTests {
+    @Test func cleanedJUEOrderAndStripsJunk() {
+        #expect(OpenMenuRegion.cleaned("eu") == "UE")
+        #expect(OpenMenuRegion.cleaned("J U E extra") == "JUE")
+        #expect(OpenMenuRegion.cleaned("xyz") == "")
+        #expect(OpenMenuRegion.cleaned("") == "")
+    }
+}
+
+struct OpenMenuFolderPathTests {
+    @Test func cleanedNormalizesSlashesAndDropsEmpties() {
+        #expect(OpenMenuFolderPath.cleaned("Games/RPGs") == "Games\\RPGs")
+        #expect(OpenMenuFolderPath.cleaned(" \\Games\\ \\JP\\ ") == "Games\\JP")
+        #expect(OpenMenuFolderPath.cleaned("") == "")
+    }
+
+    @Test func knownFoldersUniquesAndSortsPrimaryAndExtras() {
+        func game(_ number: Int, folder: String, extras: [String] = [], isMenu: Bool = false) -> GameEntry {
+            GameEntry(
+                id: UUID(),
+                number: number,
+                name: isMenu ? "openMenu" : "Game \(number)",
+                serial: "",
+                format: .cdi,
+                imageFileName: "disc.cdi",
+                folderPath: "/tmp/\(number)",
+                byteSize: 1,
+                payloadByteSize: 1,
+                contentSHA256: nil,
+                isMenu: isMenu,
+                virtualFolder: folder,
+                extraFolders: extras
+            )
+        }
+        let folders = OpenMenuFolderPath.knownFolders(in: [
+            game(1, folder: "Games\\RPGs", isMenu: true),
+            game(2, folder: "Games\\RPGs", extras: ["Favorites", "Games\\A-Z"]),
+            game(3, folder: "games\\rpgs"),
+            game(4, folder: "", extras: ["Favorites"]),
+            game(5, folder: "Homebrew"),
+        ])
+        #expect(Set(folders) == Set([
+            "Favorites", "Games", "Games\\A-Z", "Games\\RPGs", "Homebrew", "games", "games\\rpgs",
+        ]))
+        #expect(folders == folders.sorted { $0.localizedStandardCompare($1) == .orderedAscending })
+    }
+
+    @Test func prefixesWalksNestedSegments() {
+        #expect(OpenMenuFolderPath.prefixes(of: "Games/RPGs/Shenmue") == [
+            "Games", "Games\\RPGs", "Games\\RPGs\\Shenmue",
+        ])
+        #expect(OpenMenuFolderPath.prefixes(of: "") == [])
+    }
+
+    @Test func extrasDedupAgainstPrimaryAndCapAtFive() {
+        let extras = OpenMenuFolderPath.cleanedExtras(
+            ["Games\\RPGs", "A", "B", "C", "D", "E", "F"],
+            excluding: "Games\\RPGs"
+        )
+        #expect(extras == ["A", "B", "C", "D", "E"])
+    }
+}

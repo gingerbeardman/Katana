@@ -13,6 +13,9 @@ nonisolated enum MenuGDIBake: Sendable {
         var assetsRoot: URL
         var outDir: URL
         var truncate: Bool = true
+        /// Extra files written into high-density `menu_data` after staging stock assets
+        /// (openMenu `BOX.DAT` / `ICON.DAT` / `META.DAT` / `FOLDRART.*` preserved from the card).
+        var extraMenuDataFiles: [String: Data] = [:]
         /// Optional bake progress: message + fraction **within this bake** (0…1).
         var progress: (@Sendable (String, Double) -> Void)? = nil
     }
@@ -61,6 +64,15 @@ nonisolated enum MenuGDIBake: Sendable {
 
         report?("Staging menu assets…", 0.05)
         try copyDirectory(from: menuData, to: dataPath)
+        if !options.extraMenuDataFiles.isEmpty {
+            for (name, data) in options.extraMenuDataFiles where !data.isEmpty {
+                let dest = dataPath.appendingPathComponent(name)
+                if fm.fileExists(atPath: dest.path) {
+                    try fm.removeItem(at: dest)
+                }
+                try data.write(to: dest, options: .atomic)
+            }
+        }
         report?("Staging menu assets…", 0.20)
         try copyDirectory(from: menuGdi, to: cdiPath)
         if fm.fileExists(atPath: menuLow.path) {

@@ -13,6 +13,22 @@ nonisolated struct FolderFingerprint: Codable, Hashable, Sendable {
     var imageModTimeSeconds: Int64
     var nameTxt: String?
     var serialTxt: String?
+    /// openMenu `folder.txt` (empty/nil = unfiled).
+    var folderTxt: String? = nil
+    /// openMenu `type.txt` (`game` / `other` / `psx`).
+    var typeTxt: String? = nil
+    /// `folder_alt1.txt`…`folder_alt5.txt` values that exist on disk.
+    var extraFolderTxt: [String] = []
+    /// `disc.txt` (multi-disc `2/4`).
+    var discTxt: String? = nil
+    /// `region.txt` (`J`/`U`/`E`).
+    var regionTxt: String? = nil
+    /// `vga.txt` (`1`/`0`).
+    var vgaTxt: String? = nil
+    /// `version.txt`.
+    var versionTxt: String? = nil
+    /// `date.txt`.
+    var dateTxt: String? = nil
     /// Number of regular files in the folder (from a cheap name listing).
     var fileCount: Int
 

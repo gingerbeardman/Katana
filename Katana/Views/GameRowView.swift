@@ -63,7 +63,7 @@ struct NumberColumnCell: View {
 
     var body: some View {
         HStack(spacing: 4) {
-            Text(FolderNumbering.format(game.number))
+            Text(FolderNumbering.format(state.pendingSlot(for: game.id) ?? game.number))
                 .font(.body.monospacedDigit())
                 .foregroundStyle(.secondary)
             if state.isImportingGame(game) {

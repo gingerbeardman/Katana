@@ -31,6 +31,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 object: nil
             )
         }
+        // Begin-editing only fires after the first character. Click-to-focus must
+        // still flip `isTextInputFocused` so menu key equivalents are dropped
+        // before ⌘A / ⌫ hit a disabled Game-menu item (which beeps).
+        NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .keyDown]) { event in
+            DispatchQueue.main.async { [weak self] in
+                self?.syncTextInputFocusNow()
+            }
+            return event
+        }
         LaunchTrace.mark("applicationDidFinishLaunching (observers installed)")
     }
 
@@ -47,22 +56,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func syncTextInputFocus(_ notification: Notification) {
         // Defer one turn so the field editor is installed before we sample firstResponder.
         DispatchQueue.main.async { [weak self] in
-            guard let self, let appState = self.appState else { return }
-            let editing = Self.isEditingText(in: NSApp.keyWindow)
-            if appState.isTextInputFocused != editing {
-                appState.isTextInputFocused = editing
-            }
+            self?.syncTextInputFocusNow()
         }
     }
 
-    /// Field editor (`NSTextView`) or an editable `NSTextField` owns typing shortcuts.
-    private static func isEditingText(in window: NSWindow?) -> Bool {
-        guard let first = window?.firstResponder else { return false }
-        if let textView = first as? NSTextView {
-            return textView.isEditable
+    private func syncTextInputFocusNow() {
+        guard let appState else { return }
+        let editing = Self.isEditingText(in: NSApp.keyWindow)
+        if appState.isTextInputFocused != editing {
+            appState.isTextInputFocused = editing
         }
-        if let textField = first as? NSTextField {
-            return textField.isEditable
+    }
+
+    /// Field editor, editable `NSTextField` / `NSComboBox` / search field.
+    private static func isEditingText(in window: NSWindow?) -> Bool {
+        var responder: NSResponder? = window?.firstResponder
+        while let current = responder {
+            if let textView = current as? NSTextView, textView.isEditable {
+                return true
+            }
+            if let field = current as? NSTextField, field.isEditable {
+                return true
+            }
+            responder = current.nextResponder
         }
         return false
     }

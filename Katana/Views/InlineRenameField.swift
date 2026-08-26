@@ -208,6 +208,7 @@ struct RenameAwareTitleCell: View {
                     .fontWeight(game.isMenu ? .semibold : .regular)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                    .allowsHitTesting(false)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

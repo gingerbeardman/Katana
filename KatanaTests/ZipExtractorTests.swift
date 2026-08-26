@@ -41,6 +41,19 @@ struct ZipExtractorTests {
                 atPath: dest.appendingPathComponent("menu_data/theme").path
             )
         )
+        #expect(
+            FileManager.default.fileExists(
+                atPath: dest.appendingPathComponent("menu_data/theme/FOLDERS/THEME.INI").path
+            )
+        )
+        let version = try String(
+            contentsOf: dest.appendingPathComponent("VERSION.TXT"),
+            encoding: .utf8
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        #expect(version == "1.6.3-ateam")
+        let binSize = try dest.appendingPathComponent("menu_data/1ST_READ.BIN")
+            .resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        #expect(binSize > 400_000)
     }
 
     private func projectRoot() -> URL {

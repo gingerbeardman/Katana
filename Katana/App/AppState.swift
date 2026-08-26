@@ -105,6 +105,10 @@ final class AppState {
     /// Finder-style inline rename target in the game table (`nil` when idle).
     /// Observed inside `RenameAwareTitleCell` so SwiftUI Table cell caching still updates.
     var renamingGameID: GameEntry.ID?
+    /// Arrange mode: drag rows in memory; folders change only on Apply.
+    var isArranging = false
+    /// Full-list order while arranging (`games` stays in on-card slot order until Apply).
+    var pendingOrderIDs: [UUID] = []
     /// Non-nil while a disk mutation runs (renumber, copy, delete).
     /// Drives the edge progress bar + window subtitle — not a center blocking card.
     var busyMessage: String?
@@ -132,7 +136,7 @@ final class AppState {
     /// Volume UUID that `displaySort` was loaded for — avoids writing the previous card’s
     /// sort onto a newly opened UUID during the open race.
     private var displaySortLoadedForUUID: String?
-    /// Which console menu image to bake (GDmenu or openMenu). Persisted per volume.
+    /// Which console menu image to bake (GDmenu, openMenu, or openMenu Extended). Persisted per volume.
     var menuKind: MenuKind = .gdMenu
     /// Kind currently installed in slot 01 (last successful bake, or detected on open).
     /// Switching preference away and back without list changes does not dirty the menu.
@@ -183,40 +187,46 @@ final class AppState {
     private static let sizesAsIntegerMBKey = "sizesAsIntegerMB"
     private static let isInspectorPresentedKey = "isInspectorPresented"
     private static let inspectorSectionsKey = "inspectorSectionExpanded"
-    /// SwiftUI `TableColumnCustomization` JSON (widths, visibility, order) — same approach as 2UP.
-    private static let tableColumnCustomizationKey = "tableColumnCustomization"
+    /// SwiftUI `TableColumnCustomization` JSON (widths, visibility, order) — per menu type
+    /// so GDmenu / openMenu start without Folder/Type, while Extended shows them.
+    private static let tableColumnCustomizationKeyPrefix = "tableColumnCustomization."
 
     // MARK: - Table column customization (2UP-style)
 
-    /// Encoded column widths / visibility / order. Native Table header menu toggles columns.
-    var tableColumnCustomizationData: Data = AppState.loadTableColumnCustomization() {
-        didSet {
-            guard tableColumnCustomizationData != oldValue else { return }
-            UserDefaults.standard.set(tableColumnCustomizationData, forKey: AppState.tableColumnCustomizationKey)
-            tableColumnCustomizationCache = nil
-        }
-    }
-    private var tableColumnCustomizationCache: (data: Data, value: TableColumnCustomization<GameEntry>)?
+    private var tableColumnCustomizationCache: (
+        kind: MenuKind,
+        data: Data,
+        value: TableColumnCustomization<GameEntry>
+    )?
 
     /// Decoded view for the game table binding (cached — body evaluates often).
     var tableColumnCustomization: TableColumnCustomization<GameEntry> {
-        if let cache = tableColumnCustomizationCache, cache.data == tableColumnCustomizationData {
+        let kind = menuKind
+        let data = Self.loadTableColumnCustomization(for: kind)
+        if let cache = tableColumnCustomizationCache, cache.kind == kind, cache.data == data {
             return cache.value
         }
         let value = (try? JSONDecoder().decode(
             TableColumnCustomization<GameEntry>.self,
-            from: tableColumnCustomizationData
+            from: data
         )) ?? TableColumnCustomization<GameEntry>()
-        tableColumnCustomizationCache = (tableColumnCustomizationData, value)
+        tableColumnCustomizationCache = (kind, data, value)
         return value
     }
 
     func setTableColumnCustomization(_ value: TableColumnCustomization<GameEntry>) {
-        tableColumnCustomizationData = (try? JSONEncoder().encode(value)) ?? Data()
+        let kind = menuKind
+        let data = (try? JSONEncoder().encode(value)) ?? Data()
+        UserDefaults.standard.set(data, forKey: Self.tableColumnCustomizationKey(for: kind))
+        tableColumnCustomizationCache = (kind, data, value)
     }
 
-    private static func loadTableColumnCustomization() -> Data {
-        UserDefaults.standard.data(forKey: tableColumnCustomizationKey) ?? Data()
+    private static func tableColumnCustomizationKey(for kind: MenuKind) -> String {
+        tableColumnCustomizationKeyPrefix + kind.rawValue
+    }
+
+    private static func loadTableColumnCustomization(for kind: MenuKind) -> Data {
+        UserDefaults.standard.data(forKey: tableColumnCustomizationKey(for: kind)) ?? Data()
     }
 
     /// Default on when the key has never been written (first launch).
@@ -472,6 +482,11 @@ final class AppState {
         return list.filter { game in
             game.name.localizedCaseInsensitiveContains(q)
                 || game.serial.localizedCaseInsensitiveContains(q)
+                || game.virtualFolder.localizedCaseInsensitiveContains(q)
+                || game.extraFolders.contains { $0.localizedCaseInsensitiveContains(q) }
+                || game.discType.displayName.localizedCaseInsensitiveContains(q)
+                || game.discLabel.localizedCaseInsensitiveContains(q)
+                || game.regionLabel.localizedCaseInsensitiveContains(q)
                 || FolderNumbering.format(game.number).contains(q)
                 || game.format.displayName.localizedCaseInsensitiveContains(q)
         }
@@ -576,19 +591,123 @@ final class AppState {
     }
 
     var canAddGames: Bool {
-        volume != nil && !isBusy && volume?.isReadOnly != true
+        volume != nil && !isBusy && volume?.isReadOnly != true && !isArranging
     }
 
-    var canDeleteSelection: Bool { !selection.isEmpty && !isBusy }
+    var canDeleteSelection: Bool { !selection.isEmpty && !isBusy && !isArranging }
 
-    var canMoveSelectionUp: Bool {
-        guard !isBusy, let first = selectedIndices.first else { return false }
-        return first > 0
+    var canArrange: Bool {
+        volume != nil && !isBusy && volume?.isReadOnly != true && games.count > 1
     }
 
-    var canMoveSelectionDown: Bool {
-        guard !isBusy, let last = selectedIndices.last else { return false }
-        return last < games.count - 1
+    var arrangeIsDirty: Bool {
+        isArranging && pendingCardOrderIDs != games.map(\.id)
+    }
+
+    /// Slot order implied by the Arrange list (which follows the current display sort).
+    var pendingCardOrderIDs: [UUID] {
+        CardListOrder.cardOrder(
+            fromDisplayOrder: pendingOrderIDs,
+            menuID: menuGameID,
+            newestFirst: displaySort.isNewestFirst
+        )
+    }
+
+    var menuGameID: UUID? {
+        games.first(where: { $0.isMenu || $0.number == 1 })?.id
+    }
+
+    var arrangedGames: [GameEntry] {
+        guard isArranging, !pendingOrderIDs.isEmpty else { return games }
+        let byID = Dictionary(uniqueKeysWithValues: games.map { ($0.id, $0) })
+        return pendingOrderIDs.compactMap { byID[$0] }
+    }
+
+    func pendingSlot(for id: UUID) -> Int? {
+        guard isArranging else { return nil }
+        guard let idx = pendingCardOrderIDs.firstIndex(of: id) else { return nil }
+        return idx + 1
+    }
+
+    /// Visual “up” means a lower slot, except Newest First (high slots at the top).
+    var moveUpLowersSlot: Bool {
+        displaySort.visualUpLowersSlot
+    }
+
+    var moveUpTitle: String {
+        if isArranging || displaySort.followsSlotOrder { return "Move Up" }
+        return "Move to Lower Slot"
+    }
+
+    var moveDownTitle: String {
+        if isArranging || displaySort.followsSlotOrder { return "Move Down" }
+        return "Move to Higher Slot"
+    }
+
+    var moveUpHelp: String {
+        if isArranging || displaySort.followsSlotOrder {
+            return "Move the selection one row up. Opens Arrange; Apply writes folders."
+        }
+        return "Opens Arrange and moves one slot toward the menu. Apply writes folders."
+    }
+
+    var moveDownHelp: String {
+        if isArranging || displaySort.followsSlotOrder {
+            return "Move the selection one row down. Opens Arrange; Apply writes folders."
+        }
+        return "Opens Arrange and moves one slot toward the end. Apply writes folders."
+    }
+
+    var canMoveSelectionUp: Bool { canMoveSelection(towardTop: true) }
+    var canMoveSelectionDown: Bool { canMoveSelection(towardTop: false) }
+    var canMoveSelectionToTop: Bool { canLowerSlot() }
+    var canMoveSelectionToBottom: Bool { canRaiseSlot() }
+
+    var moveToTopHelp: String {
+        "Jump the selection to the top of this list. Apply writes folders."
+    }
+
+    var moveToBottomHelp: String {
+        "Jump the selection to the bottom of this list. Apply writes folders."
+    }
+
+    func canMoveSelection(towardTop: Bool, ids: Set<UUID>? = nil) -> Bool {
+        towardTop ? canMoveTowardStart(ids: ids) : canMoveTowardEnd(ids: ids)
+    }
+
+    func canLowerSlot(ids: Set<UUID>? = nil) -> Bool {
+        canMoveTowardStart(ids: ids)
+    }
+
+    func canRaiseSlot(ids: Set<UUID>? = nil) -> Bool {
+        canMoveTowardEnd(ids: ids)
+    }
+
+    /// Games in the order Arrange (or the table) currently shows.
+    private var reorderList: [GameEntry] {
+        if isArranging { return arrangedGames }
+        return games.sorted(using: displaySort.comparators)
+    }
+
+    func canMoveTowardStart(ids: Set<UUID>? = nil) -> Bool {
+        guard !isBusy else { return false }
+        let selected = ids ?? selection
+        let list = reorderList
+        let floor = (list.first?.isMenu == true || list.first?.number == 1) ? 1 : 0
+        guard let first = list.firstIndex(where: { selected.contains($0.id) && !$0.isMenu && $0.number != 1 })
+                ?? list.firstIndex(where: { selected.contains($0.id) })
+        else { return false }
+        return first > floor
+    }
+
+    func canMoveTowardEnd(ids: Set<UUID>? = nil) -> Bool {
+        guard !isBusy else { return false }
+        let selected = ids ?? selection
+        let list = reorderList
+        guard let last = list.lastIndex(where: { selected.contains($0.id) && !$0.isMenu && $0.number != 1 })
+                ?? list.lastIndex(where: { selected.contains($0.id) })
+        else { return false }
+        return last < list.count - 1
     }
 
     func focusRenameInInspector(for id: UUID? = nil) {
@@ -1069,6 +1188,7 @@ final class AppState {
         forceRescan: Bool = false,
         preferredVolumeUUID: String? = nil
     ) async {
+        cancelArrange()
         LaunchTrace.mark(
             "open begin forceRescan=\(forceRescan) preferred=\(preferredVolumeUUID ?? "nil") path=\(url.path)"
         )
@@ -1220,6 +1340,23 @@ final class AppState {
             // Assume on-card menu matches the scanned list until the user edits it.
             captureBakedMenuFingerprint()
             menuContentDirty = false
+            // Slot-01 name is enough to know GDmenu vs openMenu (Extended is refined
+            // from folder sidecars / persisted baked kind). Don't wait for IP.BIN or a
+            // deferred task, or the picker vs default baked (.gdMenu) looks stale.
+            if let menu = result.entries.first(where: { $0.number == 1 || $0.isMenu }),
+               let fromName = MenuKind.detect(fromName: menu.name)
+            {
+                bakedMenuKind = fromName
+            }
+            let uuid = result.volume.volumeUUID
+            if let baked = try? await VolumeStore.shared.bakedMenuKind(for: uuid) {
+                bakedMenuKind = baked
+            }
+            if let saved = try? await VolumeStore.shared.menuKind(for: uuid) {
+                menuKind = saved
+            } else {
+                menuKind = bakedMenuKind
+            }
 
             // List is interactive as soon as rows are assigned — do not block on menu
             // detection (IP.BIN), trash summary, or bookmark refresh.
@@ -1463,6 +1600,12 @@ final class AppState {
                 // provisional sizes.
                 if let prior = storedByID[game.id],
                    prior.entry.contentSHA256 == game.contentSHA256,
+                   prior.entry.virtualFolder == game.virtualFolder,
+                   prior.entry.extraFolders == game.extraFolders,
+                   prior.entry.discType == game.discType,
+                   prior.entry.serial == game.serial,
+                   prior.entry.discLabel == game.discLabel,
+                   prior.entry.regionLabel == game.regionLabel,
                    !game.isMenu, game.number != 1
                 {
                     var fp = prior.fingerprint
@@ -1704,23 +1847,31 @@ final class AppState {
         let snapshot = games
         let detected = await LaunchTrace.measureAsync("detectMenuKind (detached)") {
             await Task.detached(priority: .utility) {
-                MenuRebuildService.detectMenuKind(games: snapshot) ?? .gdMenu
+                MenuRebuildService.detectMenuKind(games: snapshot)
             }.value
         }
-        bakedMenuKind = detected
+        if let detected {
+            bakedMenuKind = detected
+            try? await VolumeStore.shared.setBakedMenuKind(detected, for: volumeUUID)
+        }
         if let saved = try? await VolumeStore.shared.menuKind(for: volumeUUID) {
             menuKind = saved
         } else {
-            menuKind = detected
+            menuKind = bakedMenuKind
             // Remember detection so rebuild stays consistent even if name.txt is edited later.
             try? await VolumeStore.shared.setMenuKind(menuKind, for: volumeUUID)
         }
     }
 
-    /// User chose GDmenu vs openMenu. Rebuild only if type ≠ baked image or list is dirty.
+    /// User chose GDmenu / openMenu / openMenu Extended. Rebuild only if type ≠ baked image or list is dirty.
     func setMenuKind(_ kind: MenuKind) {
         guard menuKind != kind else { return }
         menuKind = kind
+        if !kind.supportsVirtualFolders,
+           displaySort.field == .folder || displaySort.field == .type
+        {
+            saveDisplaySort(.mostRecentFirst)
+        }
         if let uuid = volume?.volumeUUID {
             Task {
                 try? await VolumeStore.shared.setMenuKind(kind, for: uuid)
@@ -2029,6 +2180,7 @@ final class AppState {
 
     func eject() async {
         guard let volume, !isBusy else { return }
+        cancelArrange()
         beginMutation("Ejecting \(volume.volumeName)…")
         defer { endMutation() }
 
@@ -2269,6 +2421,279 @@ final class AppState {
                 }
             }
             lastError = cardWriteErrorMessage(error)
+        }
+    }
+
+    /// Write openMenu virtual folder / extra paths / type for one game (immediate, undoable).
+    func setOpenMenuMeta(
+        id: UUID,
+        virtualFolder: String,
+        extraFolders: [String],
+        discType: OpenMenuItemType
+    ) {
+        guard !isBusy, let index = games.firstIndex(where: { $0.id == id }) else { return }
+        let game = games[index]
+        guard !game.isMenu, game.number != 1 else { return }
+        let folder = OpenMenuFolderPath.cleaned(virtualFolder)
+        let extras = OpenMenuFolderPath.cleanedExtras(extraFolders, excluding: folder)
+        guard folder != game.virtualFolder
+            || extras != game.extraFolders
+            || discType != game.discType
+        else { return }
+        if !requestCardWriteAccess() { return }
+
+        let cardRoot = accessURL ?? volume?.rootURL
+        do {
+            let previous = try CardOperations.writeOpenMenuMeta(
+                game: game,
+                virtualFolder: folder,
+                extraFolders: extras,
+                discType: discType,
+                cardRoot: cardRoot
+            )
+            applyOpenMenuMetaInMemory(
+                id: id,
+                virtualFolder: folder,
+                extraFolders: extras,
+                discType: discType
+            )
+            undoManager.registerUndo(withTarget: self) { target in
+                target.setOpenMenuMeta(
+                    id: id,
+                    virtualFolder: previous.virtualFolder,
+                    extraFolders: previous.extraFolders,
+                    discType: previous.discType
+                )
+            }
+            undoManager.setActionName("Edit openMenu Info")
+        } catch {
+            if isPermissionError(error), requestCardWriteAccess() {
+                setOpenMenuMeta(
+                    id: id,
+                    virtualFolder: folder,
+                    extraFolders: extras,
+                    discType: discType
+                )
+                return
+            }
+            lastError = cardWriteErrorMessage(error)
+        }
+    }
+
+    /// Distinct openMenu folder paths already on this card (for pickers / Assign Folder).
+    var knownVirtualFolders: [String] {
+        OpenMenuFolderPath.knownFolders(in: games)
+    }
+
+    func setVirtualFolder(id: UUID, to path: String) {
+        guard let game = games.first(where: { $0.id == id }) else { return }
+        setOpenMenuMeta(
+            id: id,
+            virtualFolder: path,
+            extraFolders: game.extraFolders,
+            discType: game.discType
+        )
+    }
+
+    func setDiscType(id: UUID, to type: OpenMenuItemType) {
+        guard let game = games.first(where: { $0.id == id }) else { return }
+        setOpenMenuMeta(
+            id: id,
+            virtualFolder: game.virtualFolder,
+            extraFolders: game.extraFolders,
+            discType: type
+        )
+    }
+
+    func setSerial(id: UUID, to newSerial: String) {
+        guard !isBusy, let index = games.firstIndex(where: { $0.id == id }) else { return }
+        let game = games[index]
+        guard !game.isMenu, game.number != 1 else { return }
+        let cleaned = OpenMenuSerial.cleaned(newSerial)
+        guard cleaned != game.serial else { return }
+        if !requestCardWriteAccess() { return }
+        do {
+            let previous = try CardOperations.writeSerial(
+                game: game,
+                to: cleaned,
+                cardRoot: accessURL ?? volume?.rootURL
+            )
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                games[index].serial = cleaned
+                markMenuNeedsRebuild()
+            }
+            persistCacheAfterMutation()
+            if selection.contains(id) { rebuildInspectorSnapshot() }
+            undoManager.registerUndo(withTarget: self) { target in
+                target.setSerial(id: id, to: previous)
+            }
+            undoManager.setActionName("Edit Serial")
+        } catch {
+            lastError = cardWriteErrorMessage(error)
+        }
+    }
+
+    func setDiscLabel(id: UUID, to newDisc: String) {
+        guard !isBusy, let index = games.firstIndex(where: { $0.id == id }) else { return }
+        let game = games[index]
+        guard !game.isMenu, game.number != 1 else { return }
+        let cleaned = OpenMenuDiscLabel.cleaned(newDisc)
+        guard cleaned != game.discLabel else { return }
+        if !requestCardWriteAccess() { return }
+        do {
+            let previous = try CardOperations.writeDiscLabel(
+                game: game,
+                to: cleaned,
+                cardRoot: accessURL ?? volume?.rootURL
+            )
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                games[index].discLabel = cleaned
+                // Sidecar-built headers baked the old disc.txt into ipHeader.
+                if cleaned.isEmpty { games[index].ipHeader = nil }
+                markMenuNeedsRebuild()
+            }
+            persistCacheAfterMutation()
+            if selection.contains(id) { rebuildInspectorSnapshot() }
+            undoManager.registerUndo(withTarget: self) { target in
+                target.setDiscLabel(id: id, to: previous)
+            }
+            undoManager.setActionName("Edit Disc")
+        } catch {
+            lastError = cardWriteErrorMessage(error)
+        }
+    }
+
+    func setRegionLabel(id: UUID, to newRegion: String) {
+        guard !isBusy, let index = games.firstIndex(where: { $0.id == id }) else { return }
+        let game = games[index]
+        guard !game.isMenu, game.number != 1 else { return }
+        let cleaned = OpenMenuRegion.cleaned(newRegion)
+        guard cleaned != game.regionLabel else { return }
+        if !requestCardWriteAccess() { return }
+        do {
+            let previous = try CardOperations.writeRegionLabel(
+                game: game,
+                to: cleaned,
+                cardRoot: accessURL ?? volume?.rootURL
+            )
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                games[index].regionLabel = cleaned
+                if cleaned.isEmpty { games[index].ipHeader = nil }
+                markMenuNeedsRebuild()
+            }
+            persistCacheAfterMutation()
+            if selection.contains(id) { rebuildInspectorSnapshot() }
+            undoManager.registerUndo(withTarget: self) { target in
+                target.setRegionLabel(id: id, to: previous)
+            }
+            undoManager.setActionName("Edit Region")
+        } catch {
+            lastError = cardWriteErrorMessage(error)
+        }
+    }
+
+    /// Assign the same virtual folder to every selected non-menu game.
+    func assignVirtualFolder(ids: Set<UUID>, to path: String) {
+        let targets = games.filter { ids.contains($0.id) && !$0.isMenu && $0.number != 1 }
+        guard !targets.isEmpty, !isBusy else { return }
+        let folder = OpenMenuFolderPath.cleaned(path)
+        let previous: [(UUID, CardOperations.OpenMenuMetaSnapshot)] = targets.map {
+            ($0.id, CardOperations.OpenMenuMetaSnapshot(
+                virtualFolder: $0.virtualFolder,
+                extraFolders: $0.extraFolders,
+                discType: $0.discType
+            ))
+        }
+        if !requestCardWriteAccess() { return }
+        let cardRoot = accessURL ?? volume?.rootURL
+        do {
+            for game in targets {
+                _ = try CardOperations.writeOpenMenuMeta(
+                    game: game,
+                    virtualFolder: folder,
+                    extraFolders: game.extraFolders,
+                    discType: game.discType,
+                    cardRoot: cardRoot
+                )
+                applyOpenMenuMetaInMemory(
+                    id: game.id,
+                    virtualFolder: folder,
+                    extraFolders: OpenMenuFolderPath.cleanedExtras(game.extraFolders, excluding: folder),
+                    discType: game.discType
+                )
+            }
+            undoManager.registerUndo(withTarget: self) { target in
+                target.restoreOpenMenuMetaSnapshots(previous)
+            }
+            undoManager.setActionName(targets.count == 1 ? "Assign Folder" : "Assign Folder Path")
+        } catch {
+            lastError = cardWriteErrorMessage(error)
+        }
+    }
+
+    private func restoreOpenMenuMetaSnapshots(
+        _ snapshots: [(UUID, CardOperations.OpenMenuMetaSnapshot)]
+    ) {
+        guard !isBusy else { return }
+        if !requestCardWriteAccess() { return }
+        let cardRoot = accessURL ?? volume?.rootURL
+        let redo: [(UUID, CardOperations.OpenMenuMetaSnapshot)] = snapshots.compactMap { id, _ in
+            guard let game = games.first(where: { $0.id == id }) else { return nil }
+            return (id, CardOperations.OpenMenuMetaSnapshot(
+                virtualFolder: game.virtualFolder,
+                extraFolders: game.extraFolders,
+                discType: game.discType
+            ))
+        }
+        do {
+            for (id, snap) in snapshots {
+                guard let game = games.first(where: { $0.id == id }) else { continue }
+                _ = try CardOperations.writeOpenMenuMeta(
+                    game: game,
+                    virtualFolder: snap.virtualFolder,
+                    extraFolders: snap.extraFolders,
+                    discType: snap.discType,
+                    cardRoot: cardRoot
+                )
+                applyOpenMenuMetaInMemory(
+                    id: id,
+                    virtualFolder: snap.virtualFolder,
+                    extraFolders: snap.extraFolders,
+                    discType: snap.discType
+                )
+            }
+            undoManager.registerUndo(withTarget: self) { target in
+                target.restoreOpenMenuMetaSnapshots(redo)
+            }
+        } catch {
+            lastError = cardWriteErrorMessage(error)
+        }
+    }
+
+    private func applyOpenMenuMetaInMemory(
+        id: UUID,
+        virtualFolder: String,
+        extraFolders: [String],
+        discType: OpenMenuItemType
+    ) {
+        guard let index = games.firstIndex(where: { $0.id == id }) else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            games[index].virtualFolder = virtualFolder
+            games[index].extraFolders = extraFolders
+            games[index].discType = discType
+            markMenuNeedsRebuild()
+        }
+        persistCacheAfterMutation()
+        if selection.contains(id) {
+            rebuildInspectorSnapshot()
         }
     }
 
@@ -2549,44 +2974,134 @@ final class AppState {
         }
     }
 
-    /// Move the selection as a block up or down one slot (packs non-contiguous picks together).
-    func moveSelection(up: Bool) {
-        guard !isBusy, !selection.isEmpty else { return }
-        if up, !canMoveSelectionUp { return }
-        if !up, !canMoveSelectionDown { return }
-
-        let selectedIDs = games.filter { selection.contains($0.id) }.map(\.id)
-        let otherIDs = games.filter { !selection.contains($0.id) }.map(\.id)
-        guard let firstSelectedIndex = games.firstIndex(where: { selection.contains($0.id) }) else { return }
-
-        let othersBefore = games[0..<firstSelectedIndex].filter { !selection.contains($0.id) }.count
-        let insertAt: Int
-        if up {
-            insertAt = max(0, othersBefore - 1)
-        } else {
-            insertAt = min(otherIDs.count, othersBefore + 1)
-        }
-
-        var newOrder = otherIDs
-        newOrder.insert(contentsOf: selectedIDs, at: insertAt)
-        applyOrder(newOrder, actionName: up ? "Move Up" : "Move Down", preserveSelection: selection)
+    /// Move the selection one row toward the top of the current list (⌘↑).
+    func moveSelectionTowardTop() {
+        moveSelection(up: true)
     }
 
-    func moveSelection(to offsets: IndexSet, destination: Int) {
+    /// Move the selection one row toward the bottom of the current list (⌘↓).
+    func moveSelectionTowardBottom() {
+        moveSelection(up: false)
+    }
+
+    /// Jump to slot 02 (after the menu). Opens Arrange; folders change on Apply.
+    func moveSelectionToTop() {
+        moveSelectionToExtreme(toTop: true)
+    }
+
+    /// Jump to the last slot. Opens Arrange; folders change on Apply.
+    func moveSelectionToBottom() {
+        moveSelectionToExtreme(toTop: false)
+    }
+
+    /// Move the selection as a block up or down one slot (packs non-contiguous picks together).
+    /// `up: true` means a **lower slot number** (toward the menu), not necessarily visual up.
+    /// Always staged in Arrange — never writes the card until Apply.
+    func moveSelection(up: Bool) {
+        guard !isBusy, !selection.isEmpty else { return }
+        if up, !canMoveTowardStart() { return }
+        if !up, !canMoveTowardEnd() { return }
+        ensureArranging()
+        pendingOrderIDs = CardListOrder.movingSelection(
+            ids: pendingOrderIDs,
+            selected: selection,
+            up: up,
+            menuID: menuGameID
+        )
+    }
+
+    func moveSelectionToExtreme(toTop: Bool) {
+        guard !isBusy, !selection.isEmpty else { return }
+        if toTop, !canMoveTowardStart() { return }
+        if !toTop, !canMoveTowardEnd() { return }
+        ensureArranging()
+        pendingOrderIDs = CardListOrder.movingSelectionToExtreme(
+            ids: pendingOrderIDs,
+            selected: selection,
+            toTop: toTop,
+            menuID: menuGameID
+        )
+    }
+
+    func movePending(fromOffsets: IndexSet, toOffset: Int) {
+        guard isArranging, !isBusy else { return }
+        pendingOrderIDs = CardListOrder.moving(
+            ids: pendingOrderIDs,
+            fromOffsets: fromOffsets,
+            toOffset: toOffset,
+            menuID: menuGameID,
+            selected: selection
+        )
+    }
+
+    /// Drop a dragged row (and the rest of the selection if it was selected) before `dest`.
+    func dropPending(id: UUID, before dest: Int) {
+        guard let source = pendingOrderIDs.firstIndex(of: id) else { return }
+        movePending(fromOffsets: IndexSet(integer: source), toOffset: dest)
+    }
+
+    /// Table/list drop: enter Arrange if needed, then land `sourceID` before `targetID`
+    /// (`targetID == nil` means after the last row).
+    func acceptReorderDrop(sourceID: UUID, before targetID: UUID?) {
         guard !isBusy else { return }
-        // Map from filtered list is risky; only allow reorder when not filtering.
-        guard searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            flash("Clear search to reorder")
-            return
+        if games.first(where: { $0.id == sourceID })?.isMenu == true { return }
+        if !isArranging {
+            beginArrange(selecting: sourceID)
         }
-        var order = games.map(\.id)
-        order.move(fromOffsets: offsets, toOffset: destination)
-        let moved = Set(offsets.map { games[$0].id })
-        applyOrder(order, actionName: "Reorder", preserveSelection: moved)
+        let dest: Int
+        if let targetID, let idx = pendingOrderIDs.firstIndex(of: targetID) {
+            dest = idx
+        } else {
+            dest = pendingOrderIDs.count
+        }
+        dropPending(id: sourceID, before: dest)
+    }
+
+    /// Enter Arrange if needed so reorder commands can be staged and Applied once.
+    private func ensureArranging() {
+        guard !isArranging else { return }
+        beginArrange()
+    }
+
+    func beginArrange(selecting id: UUID? = nil) {
+        if let id, !selection.contains(id) {
+            selection = [id]
+        }
+        guard canArrange, !isArranging else { return }
+        cancelInlineRename()
+        searchText = ""
+        pendingOrderIDs = games.sorted(using: displaySort.comparators).map(\.id)
+        isArranging = true
+    }
+
+    func cancelArrange() {
+        isArranging = false
+        pendingOrderIDs = []
+    }
+
+    func commitArrange() {
+        Task { _ = await commitArrangeAsync() }
+    }
+
+    @discardableResult
+    func commitArrangeAsync() async -> Bool {
+        guard isArranging, !isBusy else { return !isArranging }
+        let order = pendingCardOrderIDs
+        if order == games.map(\.id) {
+            cancelArrange()
+            return true
+        }
+        let ok = await applyOrderAsync(
+            order,
+            actionName: "Reorder",
+            preserveSelection: selection
+        )
+        if ok { cancelArrange() }
+        return ok
     }
 
     func sortAlphabetically() {
-        guard !isBusy, games.count > 1 else { return }
+        guard !isBusy, !isArranging, games.count > 1 else { return }
         var items = games
         // Pin menu (first isMenu or number 1 named menu) at top if present.
         let menu = items.first(where: \.isMenu)
@@ -2606,53 +3121,73 @@ final class AppState {
         actionName: String,
         preserveSelection: Set<GameEntry.ID>? = nil
     ) {
-        guard let volume else { return }
-        if !requestCardWriteAccess() { return }
+        Task { _ = await applyOrderAsync(orderedIDs, actionName: actionName, preserveSelection: preserveSelection) }
+    }
+
+    @discardableResult
+    private func applyOrderAsync(
+        _ orderedIDs: [UUID],
+        actionName: String,
+        preserveSelection: Set<GameEntry.ID>? = nil
+    ) async -> Bool {
+        guard let volume else { return false }
+        // Set busy *before* any await so ⌘↑/⌘↓ key-repeat cannot start a second
+        // two-phase renumber (that parks the card in `.katana-tmp` and looks empty).
+        guard !isBusy else { return false }
         let previous = games.map(\.id)
-        guard orderedIDs != previous else { return }
+        let pinned = CardListOrder.pinningMenu(ids: orderedIDs, menuID: menuGameID)
+        guard pinned != previous else { return true }
+        beginMutation("Updating folder numbers…")
+        defer { endMutation() }
+        if !requestCardWriteAccess() { return false }
         let snapshot = games
         let root = accessURL ?? volume.rootURL
         let keepSelection = preserveSelection ?? selection
         let progress = makeProgressHandler()
 
-        Task {
-            beginMutation("Updating folder numbers…")
-            defer { endMutation() }
-            do {
-                let updated = try await Task.detached {
-                    try CardOperations.applyOrder(
-                        orderedIDs: orderedIDs,
-                        games: snapshot,
-                        rootURL: root,
-                        progress: progress
-                    )
-                }.value
+        do {
+            let updated = try await Task.detached {
+                try CardOperations.applyOrder(
+                    orderedIDs: pinned,
+                    games: snapshot,
+                    rootURL: root,
+                    progress: progress
+                )
+            }.value
 
-                games = updated
-                selection = keepSelection.intersection(Set(orderedIDs))
-                markMenuNeedsRebuild()
-                refreshStatus()
-                scheduleDuplicateRecompute()
-                persistCacheAfterMutation()
+            games = updated
+            selection = keepSelection.intersection(Set(pinned))
+            markMenuNeedsRebuild()
+            refreshStatus()
+            scheduleDuplicateRecompute()
+            persistCacheAfterMutation()
 
-                undoManager.registerUndo(withTarget: self) { target in
-                    target.applyOrder(previous, actionName: actionName, preserveSelection: keepSelection)
-                }
-                undoManager.setActionName(actionName)
-            } catch {
-                if isPermissionError(error) {
-                    _ = requestCardWriteAccess()
-                }
-                lastError = cardWriteErrorMessage(error)
-                await rescan()
+            undoManager.registerUndo(withTarget: self) { target in
+                target.applyOrder(previous, actionName: actionName, preserveSelection: keepSelection)
             }
+            undoManager.setActionName(actionName)
+            return true
+        } catch {
+            if isPermissionError(error) {
+                _ = requestCardWriteAccess()
+            }
+            lastError = cardWriteErrorMessage(error)
+            let recovered = (try? await Task.detached {
+                try CardOperations.recoverParkedRenumberFolders(rootURL: root)
+            }.value) ?? 0
+            endMutation()
+            await rescan()
+            if recovered > 0 {
+                flash("Restored \(recovered) game\(recovered == 1 ? "" : "s") after a failed reorder")
+            }
+            return false
         }
     }
 
     // MARK: - GDmenu list rebuild
 
     var canRebuildMenu: Bool {
-        volume != nil && !games.isEmpty && !isBusy && !isHashing
+        volume != nil && !games.isEmpty && !isBusy && !isHashing && !isArranging
     }
 
     /// Recompute whether the live list still matches the last bake / open snapshot.
@@ -2674,6 +3209,11 @@ final class AppState {
         menuContentDirty = false
         bakedMenuKind = menuKind
         captureBakedMenuFingerprint()
+        if let uuid = volume?.volumeUUID {
+            Task {
+                try? await VolumeStore.shared.setBakedMenuKind(menuKind, for: uuid)
+            }
+        }
     }
 
     /// Snapshot list-relevant fields (slot, name, serial, menu flag) for dirty tracking.
@@ -2681,7 +3221,8 @@ final class AppState {
         games
             .sorted { $0.number < $1.number }
             .map { g in
-                "\(g.number)\u{1e}\(g.name)\u{1e}\(g.serial)\u{1e}\(g.isMenu ? 1 : 0)"
+                let extras = g.extraFolders.joined(separator: ",")
+                return "\(g.number)\u{1e}\(g.name)\u{1e}\(g.serial)\u{1e}\(g.isMenu ? 1 : 0)\u{1e}\(g.virtualFolder)\u{1e}\(extras)\u{1e}\(g.discType.rawValue)\u{1e}\(g.discLabel)\u{1e}\(g.regionLabel)"
             }
             .joined(separator: "\u{1f}")
     }
@@ -2835,13 +3376,14 @@ final class AppState {
             }
             menuKind = result.menuKind
             clearMenuNeedsRebuild()
-            if !quitting, let uuid = volume?.volumeUUID {
+            if let uuid = volume?.volumeUUID {
                 try? await VolumeStore.shared.setMenuKind(result.menuKind, for: uuid)
+                try? await VolumeStore.shared.setBakedMenuKind(result.menuKind, for: uuid)
             }
 
+            persistCacheAfterMutation()
             if !quitting {
                 refreshStatus()
-                persistCacheAfterMutation()
                 flash("Rebuilt \(result.menuKind.displayName) · \(result.itemCount) items")
                 statusText = "\(result.menuKind.displayName) rebuilt · \(result.itemCount) items · \(formatSize(Int64(result.listByteCount))) list"
             }
@@ -2889,6 +3431,30 @@ final class AppState {
             alert.addButton(withTitle: "OK")
             alert.runModal()
             return .terminateCancel
+        }
+
+        if isArranging, arrangeIsDirty {
+            let alert = NSAlert()
+            alert.messageText = "Apply new game order?"
+            alert.informativeText = "You rearranged the list. Folders on the card have not been renamed yet."
+            alert.alertStyle = .informational
+            alert.addButton(withTitle: "Apply & Quit")
+            alert.addButton(withTitle: "Discard & Quit")
+            alert.addButton(withTitle: "Cancel")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                isHandlingQuit = true
+                Task {
+                    let ok = await self.commitArrangeAsync()
+                    NSApp.reply(toApplicationShouldTerminate: ok)
+                    self.isHandlingQuit = false
+                }
+                return .terminateLater
+            case .alertSecondButtonReturn:
+                cancelArrange()
+            default:
+                return .terminateCancel
+            }
         }
 
         if menuNeedsRebuild, volume != nil, !games.isEmpty {
@@ -3563,18 +4129,54 @@ private nonisolated final class FirstProgressMark: @unchecked Sendable {
 }
 
 /// Weak MainActor hop for rebuild progress from a detached bake task.
+/// Coalesces ticks so a 283-row table isn't invalidated dozens of times per second.
 private nonisolated final class RebuildProgressRelay: @unchecked Sendable {
     private weak var state: AppState?
+    private let lock = NSLock()
+    private var pendingMessage: String?
+    private var pendingFraction: Double?
+    private var scheduled = false
 
     init(_ state: AppState) {
         self.state = state
     }
 
     func update(message: String, fraction: Double) {
-        let target = state
-        Task { @MainActor in
-            guard let target else { return }
-            target.rebuildProgress = min(1, max(0, fraction))
+        lock.lock()
+        pendingMessage = message
+        pendingFraction = fraction
+        let flushNow = fraction >= 0.999 || fraction <= 0.021
+        let needSchedule = !scheduled
+        if !flushNow {
+            scheduled = true
+        }
+        lock.unlock()
+
+        if flushNow {
+            Task { @MainActor [weak self] in
+                self?.applyPending()
+            }
+            return
+        }
+        guard needSchedule else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(50))
+            self?.applyPending()
+        }
+    }
+
+    @MainActor
+    private func applyPending() {
+        let message: String
+        let fraction: Double
+        lock.lock()
+        message = pendingMessage ?? ""
+        fraction = pendingFraction ?? 0
+        scheduled = false
+        lock.unlock()
+        guard let target = state else { return }
+        target.rebuildProgress = min(1, max(0, fraction))
+        if !message.isEmpty {
             target.statusText = message
         }
     }

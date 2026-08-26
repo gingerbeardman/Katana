@@ -94,12 +94,11 @@ private struct CardSettingsPanel: View {
                     set: { state.setMenuKind($0) }
                 )) {
                     ForEach(MenuKind.allCases) { kind in
-                        Text(kind.displayName).tag(kind)
+                        Text(kind.segmentTitle).tag(kind)
                     }
                 }
                 .labelsHidden()
                 .pickerStyle(.segmented)
-                .frame(width: 220)
                 .disabled(state.volume == nil || state.isBusy)
 
                 Text(state.menuKind.helpText)
@@ -108,10 +107,11 @@ private struct CardSettingsPanel: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.top, 4)
 
-                SettingsDescription(
-                    "After renames or reordering, use Card → Rebuild (⌘S) so the menu matches the SD card. On quit you will be prompted if the menu image is out of date."
-                )
-                .padding(.top, 2)
+                Text("After renames or reordering, use Card → Rebuild (⌘S) so the menu matches the SD card. On quit you will be prompted if the menu image is out of date.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 2)
             }
 
             SettingsSeparator()

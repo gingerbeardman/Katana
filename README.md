@@ -1,6 +1,6 @@
 # Katana
 
-Native **macOS** app for managing **GDEMU** SD cards (Dreamcast) with **GDmenu** and **openMenu**.
+Native **macOS** app for managing **GDEMU** SD cards (Dreamcast) with **GDmenu**, **openMenu**, and **openMenu Extended**.
 
 Open a card root, browse numbered game folders, rename / reorder / delete with **immediate on-card writes**, inspect game metadata and covers, detect duplicates, hash content, and rebuild the slot-01 menu image so the console list matches the SD card.
 
@@ -10,13 +10,13 @@ Open a card root, browse numbered game folders, rename / reorder / delete with *
 | --- | --- |
 | **Cards** | Open a GDEMU root (folders `01`, `02`, …); recent cards via security-scoped bookmarks; optional eject on quit |
 | **Scan** | Fast folder scan (`name.txt`, `serial.txt`, disc image); snapshot cache for quick re-open; progress in the window subtitle |
-| **List** | Multi-select table; toggle columns via header menu (2UP-style); search; **display-only** column sort (per card) vs **Apply A–Z to Card** (renumbers folders) |
+| **List** | Multi-select table; toggle columns via header menu (2UP-style); search; **display-only** column sort (per card) vs **Arrange** (drag rows, Apply once) / **Apply A–Z to Card** (renumbers folders); **Folder** / **Type** when the menu is openMenu Extended |
 | **Rename** | Finder-style **inline rename** (right-click / double-click / Return); bulk sentence case and auto-rename from IP.BIN / GameDB / file / folder name |
 | **Add games** | Toolbar / `⇧⌘N` or drag-and-drop from Finder; new slots appear immediately with a top progress bar and per-row spinner while files copy |
 | **Inspector** | Title, IP.BIN fields, **0GDTEX** cover (PVR decode), on-card path, actions; collapsible sections (persisted) |
 | **Duplicates** | Serial / name / size / hash signals; grade badges; “not a duplicate” marks **per card** (persisted with the volume) |
 | **Hashing** | Background SHA-256 of game payload; sidecars; rate/ETA; mutual exclusion with menu rebuild |
-| **Menu rebuild** | Native Swift bake of **GDmenu** (`LIST.INI`) or **openMenu** (`OPENMENU.INI`) into slot 01; prompt on quit if out of date |
+| **Menu rebuild** | Native Swift bake of **GDmenu**, stock **openMenu**, or **openMenu Extended** (ateam `OPENMENU.INI` with virtual folders and disc types) into slot 01; existing cover-art DATs are kept; prompt on quit if out of date |
 | **Safety** | Read-only card detection (e.g. SD lock); writes are immediate — no separate Save; ⌘Z undo where supported |
 | **Updates** | Help → Check for Updates… (GitHub Releases); quiet launch check with a dismissible banner |
 
@@ -60,7 +60,7 @@ Pipeline: archive → Developer ID export → notarize/staple app → HFS-compre
 | Resource | Purpose |
 | --- | --- |
 | `MenuAssets/gdMenu.zip` | Stock GDmenu assets for slot-01 rebuild |
-| `MenuAssets/openMenu.zip` | Stock openMenu assets for slot-01 rebuild |
+| `MenuAssets/openMenu.zip` | openMenu **1.6.3-ateam** assets for slot-01 rebuild (virtual folders, Folders themes) |
 | `GameDB/dreamcast-titles.json` | Serial → pretty title map (scan / auto-rename) |
 
 ## Architecture notes
@@ -114,6 +114,7 @@ As also credited by GDMENUCardManager:
 
 - **GDmenu** by neuroacid  
 - **[openMenu](https://github.com/mrneo240/openmenu/)** by mrneo240  
+- **[openMenu Virtual Folder Bundle](https://github.com/DerekPascarella/openMenu-Virtual-Folder-Bundle)** by Derek Pascarella (ateam) — bundled openMenu bake target (1.6.3-ateam)  
 - openMenu DAT resources: [imagedb](https://github.com/mrneo240/openMenu_imagedb), [metadb](https://github.com/mrneo240/openMenu_metadb)  
 - Special thanks to **megavolt85** and the wider Dreamcast scene  
 

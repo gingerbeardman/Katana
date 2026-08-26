@@ -7,6 +7,9 @@ nonisolated struct DisplaySortPreference: Codable, Hashable, Sendable {
         case number
         case name
         case serial
+        case folder
+        case type
+        case disc
         case format
         case size
     }
@@ -20,6 +23,16 @@ nonisolated struct DisplaySortPreference: Codable, Hashable, Sendable {
 
     static let discOrder = DisplaySortPreference(field: .number, ascending: true)
 
+    /// Table is showing slot numbers (either direction), so a row move is also a visual move.
+    var followsSlotOrder: Bool { field == .number }
+
+    /// Highest slot numbers at the top of the list (the default table sort).
+    var isNewestFirst: Bool { field == .number && !ascending }
+
+    /// Visual “up” decreases the slot number (slot-order list, or any non-slot sort).
+    /// Newest-first is the exception: the top of the list is the *highest* slot.
+    var visualUpLowersSlot: Bool { field != .number || ascending }
+
     var comparators: [KeyPathComparator<GameEntry>] {
         let order: SortOrder = ascending ? .forward : .reverse
         switch field {
@@ -29,6 +42,12 @@ nonisolated struct DisplaySortPreference: Codable, Hashable, Sendable {
             return [KeyPathComparator(\.name, order: order)]
         case .serial:
             return [KeyPathComparator(\.serial, order: order)]
+        case .folder:
+            return [KeyPathComparator(\.virtualFolderSortKey, order: order)]
+        case .type:
+            return [KeyPathComparator(\.discTypeSortKey, order: order)]
+        case .disc:
+            return [KeyPathComparator(\.discLabelSortKey, order: order)]
         case .format:
             return [KeyPathComparator(\.formatSortKey, order: order)]
         case .size:
@@ -45,6 +64,9 @@ nonisolated struct DisplaySortPreference: Codable, Hashable, Sendable {
         case \GameEntry.number: field = .number
         case \GameEntry.name: field = .name
         case \GameEntry.serial: field = .serial
+        case \GameEntry.virtualFolderSortKey: field = .folder
+        case \GameEntry.discTypeSortKey: field = .type
+        case \GameEntry.discLabelSortKey: field = .disc
         case \GameEntry.formatSortKey: field = .format
         case \GameEntry.byteSize: field = .size
         default: return nil
@@ -67,6 +89,9 @@ nonisolated struct DisplaySortPreference: Codable, Hashable, Sendable {
             return ascending ? "Slot order" : "Newest slots first"
         case .name: return "Title \(dir)"
         case .serial: return "Serial \(dir)"
+        case .folder: return "Folder \(dir)"
+        case .type: return "Type \(dir)"
+        case .disc: return "Disc \(dir)"
         case .format: return "Format \(dir)"
         case .size: return "Size \(dir)"
         }

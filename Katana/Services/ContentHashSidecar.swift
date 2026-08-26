@@ -28,6 +28,10 @@ enum ContentHashSidecar: Sendable {
 
     nonisolated static let metadataNames: Set<String> = [
         "name.txt", "serial.txt", "info.txt",
+        "folder.txt", "type.txt",
+        "folder_alt1.txt", "folder_alt2.txt", "folder_alt3.txt",
+        "folder_alt4.txt", "folder_alt5.txt",
+        "disc.txt", "region.txt", "vga.txt", "version.txt", "date.txt",
         aggregateFileName.lowercased(),
     ]
 

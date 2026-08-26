@@ -28,6 +28,66 @@ struct CardOperationsTests {
         #expect(written == "Sonic Adventure")
     }
 
+    @Test func writeOpenMenuMetaRoundTripsFolderTypeAndExtras() throws {
+        let root = try makeFixture(names: ["openMenu", "Shenmue"])
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let games = try loadEntries(root: root)
+        let game = games[1]
+        let previous = try CardOperations.writeOpenMenuMeta(
+            game: game,
+            virtualFolder: "Games/RPGs",
+            extraFolders: ["Games\\A-Z", "Favorites", "Games\\RPGs"],
+            discType: .psx
+        )
+        #expect(previous.virtualFolder.isEmpty)
+        #expect(previous.discType == .game)
+
+        let folder = try String(contentsOf: game.folderURL.appendingPathComponent("folder.txt"), encoding: .utf8)
+        #expect(folder == "Games\\RPGs")
+        let alt1 = try String(contentsOf: game.folderURL.appendingPathComponent("folder_alt1.txt"), encoding: .utf8)
+        #expect(alt1 == "Games\\A-Z")
+        let alt2 = try String(contentsOf: game.folderURL.appendingPathComponent("folder_alt2.txt"), encoding: .utf8)
+        #expect(alt2 == "Favorites")
+        #expect(!FileManager.default.fileExists(atPath: game.folderURL.appendingPathComponent("folder_alt3.txt").path))
+        let type = try String(contentsOf: game.folderURL.appendingPathComponent("type.txt"), encoding: .utf8)
+        #expect(type == "psx")
+
+        _ = try CardOperations.writeOpenMenuMeta(
+            game: game,
+            virtualFolder: "",
+            extraFolders: [],
+            discType: .game
+        )
+        #expect(!FileManager.default.fileExists(atPath: game.folderURL.appendingPathComponent("folder.txt").path))
+        #expect(!FileManager.default.fileExists(atPath: game.folderURL.appendingPathComponent("folder_alt1.txt").path))
+        let clearedType = try String(contentsOf: game.folderURL.appendingPathComponent("type.txt"), encoding: .utf8)
+        #expect(clearedType == "game")
+    }
+
+    @Test func writeDiscAndRegionSidecars() throws {
+        let root = try makeFixture(names: ["openMenu", "Shenmue"])
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let games = try loadEntries(root: root)
+        let game = games[1]
+        _ = try CardOperations.writeDiscLabel(game: game, to: " 2 / 4 ")
+        _ = try CardOperations.writeRegionLabel(game: game, to: "eu j")
+        _ = try CardOperations.writeSerial(game: game, to: "MK-51059-extra")
+
+        let disc = try String(contentsOf: game.folderURL.appendingPathComponent("disc.txt"), encoding: .utf8)
+        #expect(disc == "2 / 4")
+        let region = try String(contentsOf: game.folderURL.appendingPathComponent("region.txt"), encoding: .utf8)
+        #expect(region == "JUE")
+        let serial = try String(contentsOf: game.folderURL.appendingPathComponent("serial.txt"), encoding: .utf8)
+        #expect(serial == "MK-51059-ext")
+
+        _ = try CardOperations.writeDiscLabel(game: game, to: "")
+        _ = try CardOperations.writeRegionLabel(game: game, to: "xyz")
+        #expect(!FileManager.default.fileExists(atPath: game.folderURL.appendingPathComponent("disc.txt").path))
+        #expect(!FileManager.default.fileExists(atPath: game.folderURL.appendingPathComponent("region.txt").path))
+    }
+
     @Test func deleteSoftTrashesAndRenumbers() throws {
         let root = try makeFixture(names: ["GDMENU", "A", "B", "C"])
         defer { try? FileManager.default.removeItem(at: root) }
@@ -108,6 +168,97 @@ struct CardOperationsTests {
         let n3 = try String(contentsOf: root.appendingPathComponent("03/name.txt"), encoding: .utf8)
         #expect(n2 == "B")
         #expect(n3 == "A")
+    }
+
+    @Test func reorderDoesNotRewriteUnchangedPaddedFolders() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("katana-pad-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        // 3-digit names under 100, plus 100 — a 2-slot swap must not park 001–099.
+        for n in 1...100 {
+            let folder = root.appendingPathComponent(String(format: "%03d", n), isDirectory: true)
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            try "G\(n)".write(to: folder.appendingPathComponent("name.txt"), atomically: true, encoding: .utf8)
+            try Data("x".utf8).write(to: folder.appendingPathComponent("disc.cdi"))
+        }
+        let games = try loadEntries(root: root)
+        #expect(games.count == 100)
+        var order = games.map(\.id)
+        order.swapAt(98, 99)
+        try CardOperations.applyOrder(orderedIDs: order, games: games, rootURL: root)
+
+        #expect(fm.fileExists(atPath: root.appendingPathComponent("001").path))
+        let g1 = try String(contentsOf: root.appendingPathComponent("001/name.txt"), encoding: .utf8)
+        #expect(g1 == "G1")
+        #expect(!fm.fileExists(atPath: root.appendingPathComponent(".katana-tmp").path))
+        let n99 = try String(contentsOf: root.appendingPathComponent("99/name.txt"), encoding: .utf8)
+        let n100 = try String(contentsOf: root.appendingPathComponent("100/name.txt"), encoding: .utf8)
+        #expect(n99 == "G100")
+        #expect(n100 == "G99")
+    }
+
+    @Test func recoverParkedRenumberFoldersRestoresToFreeSlots() throws {
+        let root = try makeFixture(names: ["GDMENU", "Keep"])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fm = FileManager.default
+        let tmp = root.appendingPathComponent(CardOperations.tmpFolderName, isDirectory: true)
+        let parked = tmp.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fm.createDirectory(at: parked, withIntermediateDirectories: true)
+        try "Lost".write(to: parked.appendingPathComponent("name.txt"), atomically: true, encoding: .utf8)
+        try Data("x".utf8).write(to: parked.appendingPathComponent("disc.cdi"))
+
+        let restored = try CardOperations.recoverParkedRenumberFolders(rootURL: root)
+        #expect(restored == 1)
+        #expect(fm.fileExists(atPath: root.appendingPathComponent("03").path))
+        let name = try String(contentsOf: root.appendingPathComponent("03/name.txt"), encoding: .utf8)
+        #expect(name == "Lost")
+        #expect(!fm.fileExists(atPath: parked.path))
+    }
+
+    @Test func recoverParkedRenumberFoldersRestoresManyGames() throws {
+        let root = try makeFixture(names: ["GDMENU"])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fm = FileManager.default
+        let tmp = root.appendingPathComponent(CardOperations.tmpFolderName, isDirectory: true)
+        try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+        for title in ["Sonic", "Crazy Taxi", "Jet Set Radio", "Shenmue"] {
+            let parked = tmp.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try fm.createDirectory(at: parked, withIntermediateDirectories: true)
+            try title.write(to: parked.appendingPathComponent("name.txt"), atomically: true, encoding: .utf8)
+            try Data("x".utf8).write(to: parked.appendingPathComponent("disc.cdi"))
+        }
+        let restored = try CardOperations.recoverParkedRenumberFolders(rootURL: root)
+        #expect(restored == 4)
+        let games = try loadEntries(root: root)
+        #expect(games.count == 5)
+        #expect(Set(games.map(\.name)).isSuperset(of: ["GDMENU", "Sonic", "Crazy Taxi", "Jet Set Radio", "Shenmue"]))
+    }
+
+    @Test func overlappingApplyOrderStillLeavesEveryFolder() async throws {
+        let root = try makeFixture(names: ["GDMENU", "A", "B", "C", "D", "E"])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let games = try loadEntries(root: root)
+        let ids = games.map(\.id)
+        var swapLast = ids
+        swapLast.swapAt(4, 5)
+        var swapMid = ids
+        swapMid.swapAt(2, 3)
+
+        async let first: Void = {
+            try CardOperations.applyOrder(orderedIDs: swapLast, games: games, rootURL: root)
+        }()
+        async let second: Void = {
+            try CardOperations.applyOrder(orderedIDs: swapMid, games: games, rootURL: root)
+        }()
+        _ = try? await first
+        _ = try? await second
+        let recovered = try CardOperations.recoverParkedRenumberFolders(rootURL: root)
+        _ = recovered
+        let remaining = try loadEntries(root: root)
+        #expect(remaining.count == 6)
+        #expect(Set(remaining.map(\.name)) == ["GDMENU", "A", "B", "C", "D", "E"])
     }
 
     @Test func importCDICreatesNextSlotWithNameAndSerial() throws {
@@ -375,6 +526,97 @@ struct CardOperationsTests {
         #expect(fm.fileExists(atPath: root.appendingPathComponent("01/name.txt").path))
     }
 
+    /// Deleting the last two slots then adding one must fill the first hole, not skip it.
+    @Test func importFillsGapAfterDeletingLastTwoSlots() throws {
+        let root = try makeFixture(names: ["GDMENU", "A", "B", "C", "D"])
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let games = try loadEntries(root: root)
+        let lastTwo = Set(games.suffix(2).map(\.id))
+        let deleted = try CardOperations.delete(gameIDs: lastTwo, games: games, rootURL: root)
+        #expect(deleted.updatedGames.map(\.number) == [1, 2, 3])
+
+        let cdi = try makeTempCDI(named: "NewGame.cdi")
+        defer { try? FileManager.default.removeItem(at: cdi.deletingLastPathComponent()) }
+
+        let result = try CardOperations.importDiscs(
+            sources: [cdi],
+            games: deleted.updatedGames,
+            rootURL: root
+        )
+        #expect(result.added.count == 1)
+        #expect(result.added[0].number == 4)
+        #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("04/disc.cdi").path))
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("05").path))
+    }
+
+    /// Empty leftover folder at the first hole (name.txt only) must be reused, not skipped.
+    @Test func importReusesEmptyLeftoverSlotInsteadOfSkipping() throws {
+        let root = try makeFixture(names: ["GDMENU", "A", "B", "C", "D"])
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let games = try loadEntries(root: root)
+        let lastTwo = Set(games.suffix(2).map(\.id))
+        let deleted = try CardOperations.delete(gameIDs: lastTwo, games: games, rootURL: root)
+
+        let leftover = root.appendingPathComponent("04", isDirectory: true)
+        try FileManager.default.createDirectory(at: leftover, withIntermediateDirectories: true)
+        try "stale".write(
+            to: leftover.appendingPathComponent("name.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let cdi = try makeTempCDI(named: "FillHole.cdi")
+        defer { try? FileManager.default.removeItem(at: cdi.deletingLastPathComponent()) }
+
+        let result = try CardOperations.importDiscs(
+            sources: [cdi],
+            games: deleted.updatedGames,
+            rootURL: root
+        )
+        #expect(result.added.count == 1)
+        #expect(result.added[0].number == 4)
+        #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("04/disc.cdi").path))
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("05").path))
+        let name = try String(
+            contentsOf: root.appendingPathComponent("04/name.txt"),
+            encoding: .utf8
+        )
+        #expect(name == "FillHole")
+    }
+
+    /// A hole in numbering (01–03, 05) must pack then append at 05, not jump to 06.
+    @Test func importAfterNumberingHoleAppendsContiguously() throws {
+        let root = try makeFixture(names: ["GDMENU", "A", "B", "C"])
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try FileManager.default.moveItem(
+            at: root.appendingPathComponent("04", isDirectory: true),
+            to: root.appendingPathComponent("05", isDirectory: true)
+        )
+        let games = try loadEntries(root: root)
+        #expect(games.map(\.number) == [1, 2, 3, 5])
+
+        let cdi = try makeTempCDI(named: "Packed.cdi")
+        defer { try? FileManager.default.removeItem(at: cdi.deletingLastPathComponent()) }
+
+        let result = try CardOperations.importDiscs(
+            sources: [cdi],
+            games: games,
+            rootURL: root
+        )
+        #expect(result.added.count == 1)
+        #expect(result.added[0].number == 5)
+        let name04 = try String(
+            contentsOf: root.appendingPathComponent("04/name.txt"),
+            encoding: .utf8
+        )
+        #expect(name04 == "C")
+        #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("05/disc.cdi").path))
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("06").path))
+    }
+
     @Test func gdiReferencedFileNamesParsesCue() {
         let text = """
         3
@@ -610,6 +852,16 @@ struct CardOperationsTests {
     }
 
     // MARK: - Fixtures
+
+    private func makeTempCDI(named fileName: String) throws -> URL {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory
+            .appendingPathComponent("katana-cdi-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let cdi = dir.appendingPathComponent(fileName)
+        try Data(repeating: 0x5A, count: 64).write(to: cdi)
+        return cdi
+    }
 
     private func makeFixture(names: [String]) throws -> URL {
         let fm = FileManager.default

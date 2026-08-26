@@ -18,6 +18,17 @@ struct ScanResult: Sendable {
 enum CardScanner: Sendable {
     private nonisolated static let nameFile = "name.txt"
     private nonisolated static let serialFile = "serial.txt"
+    private nonisolated static let folderFile = "folder.txt"
+    private nonisolated static let typeFile = "type.txt"
+    private nonisolated static let folderAltFiles = [
+        "folder_alt1.txt", "folder_alt2.txt", "folder_alt3.txt",
+        "folder_alt4.txt", "folder_alt5.txt",
+    ]
+    private nonisolated static let discFile = "disc.txt"
+    private nonisolated static let regionFile = "region.txt"
+    private nonisolated static let vgaFile = "vga.txt"
+    private nonisolated static let versionFile = "version.txt"
+    private nonisolated static let dateFile = "date.txt"
     private nonisolated static let preferredImageNames = ["disc.gdi", "disc.cdi", "disc.ccd"]
 
     /// How many folders to deliver to the UI in one MainActor hop (avoids 1-hop-per-row thrash).
@@ -171,6 +182,13 @@ enum CardScanner: Sendable {
             try VolumeIdentity.resolve(rootURL: rootURL, preferredUUID: preferredVolumeUUID)
         }
 
+        // Interrupted Move Up/Down parks folders in `.katana-tmp`. Restore before
+        // inventory so a failed reorder doesn't look like a 2-game card.
+        let recoveredParked = (try? CardOperations.recoverParkedRenumberFolders(rootURL: rootURL)) ?? 0
+        if recoveredParked > 0 {
+            LaunchTrace.mark("CardScanner recovered \(recoveredParked) parked folder(s)")
+        }
+
         // Load cache from Application Support first (SSD) — do not wait on SD readdir.
         let cached = await LaunchTrace.measureAsync("CardCacheStore.load") {
             try? await CardCacheStore.shared.load(volumeUUID: volume.volumeUUID)
@@ -180,7 +198,7 @@ enum CardScanner: Sendable {
         // Warm reopen: trust the saved slot list and paint immediately.
         // SD root inventory on a cold FAT reader with 200+ folders is the multi-second pause;
         // folder-set verification is optional for trust path (Rescan still does a full pass).
-        if preferSnapshotCache, let cached, !cached.entries.isEmpty {
+        if preferSnapshotCache, recoveredParked == 0, let cached, !cached.entries.isEmpty {
             let trusted = LaunchTrace.measure("CardScanner trust-cache build") {
                 entriesFromCache(rootURL: rootURL, cache: cached)
             }
@@ -415,6 +433,37 @@ enum CardScanner: Sendable {
         let serialOnDisk = names.contains(where: { $0.caseInsensitiveCompare(serialFile) == .orderedSame })
             ? readSidecar(named: serialFile, in: folderURL)
             : nil
+        let folderOnDisk = names.contains(where: { $0.caseInsensitiveCompare(folderFile) == .orderedSame })
+            ? readSidecar(named: folderFile, in: folderURL)
+            : nil
+        let typeOnDisk = names.contains(where: { $0.caseInsensitiveCompare(typeFile) == .orderedSame })
+            ? readSidecar(named: typeFile, in: folderURL)
+            : nil
+        var extraOnDisk: [String] = []
+        extraOnDisk.reserveCapacity(folderAltFiles.count)
+        for altName in folderAltFiles {
+            guard names.contains(where: { $0.caseInsensitiveCompare(altName) == .orderedSame }) else {
+                continue
+            }
+            if let value = readSidecar(named: altName, in: folderURL), !value.isEmpty {
+                extraOnDisk.append(value)
+            }
+        }
+        let discOnDisk = names.contains(where: { $0.caseInsensitiveCompare(discFile) == .orderedSame })
+            ? readSidecar(named: discFile, in: folderURL)
+            : nil
+        let regionOnDisk = names.contains(where: { $0.caseInsensitiveCompare(regionFile) == .orderedSame })
+            ? readSidecar(named: regionFile, in: folderURL)
+            : nil
+        let vgaOnDisk = names.contains(where: { $0.caseInsensitiveCompare(vgaFile) == .orderedSame })
+            ? readSidecar(named: vgaFile, in: folderURL)
+            : nil
+        let versionOnDisk = names.contains(where: { $0.caseInsensitiveCompare(versionFile) == .orderedSame })
+            ? readSidecar(named: versionFile, in: folderURL)
+            : nil
+        let dateOnDisk = names.contains(where: { $0.caseInsensitiveCompare(dateFile) == .orderedSame })
+            ? readSidecar(named: dateFile, in: folderURL)
+            : nil
 
         return FolderFingerprint(
             folderName: folderURL.lastPathComponent,
@@ -425,6 +474,14 @@ enum CardScanner: Sendable {
             ),
             nameTxt: nameOnDisk,
             serialTxt: serialOnDisk,
+            folderTxt: folderOnDisk,
+            typeTxt: typeOnDisk,
+            extraFolderTxt: extraOnDisk,
+            discTxt: discOnDisk,
+            regionTxt: regionOnDisk,
+            vgaTxt: vgaOnDisk,
+            versionTxt: versionOnDisk,
+            dateTxt: dateOnDisk,
             fileCount: names.count
         )
     }
@@ -465,6 +522,12 @@ enum CardScanner: Sendable {
         let displayName = resolved.name
         let serial = resolved.serial
         let isMenu = number == 1 || GameEntry.isMenuName(displayName)
+        let virtualFolder = OpenMenuFolderPath.cleaned(fingerprint.folderTxt ?? "")
+        let extras = OpenMenuFolderPath.cleanedExtras(fingerprint.extraFolderTxt, excluding: virtualFolder)
+        let discType = OpenMenuItemType.parse(fingerprint.typeTxt)
+        let discLabel = OpenMenuDiscLabel.cleaned(fingerprint.discTxt ?? "")
+        let regionLabel = OpenMenuRegion.cleaned(fingerprint.regionTxt ?? "")
+        let sidecarIP = sidecarIpHeader(from: fingerprint, name: displayName, serial: serial)
 
         // Provisional sizes = image only; real totals fill in via loadFolderDetails.
         let entry = GameEntry(
@@ -479,7 +542,13 @@ enum CardScanner: Sendable {
             payloadByteSize: imageSize,
             contentSHA256: nil,
             isMenu: isMenu,
-            detailsLoaded: false
+            detailsLoaded: false,
+            ipHeader: sidecarIP,
+            virtualFolder: isMenu ? "" : virtualFolder,
+            extraFolders: isMenu ? [] : extras,
+            discType: isMenu ? .game : discType,
+            discLabel: isMenu ? "" : discLabel,
+            regionLabel: isMenu ? "" : regionLabel
         )
 
         return FolderScan(entry: entry, fingerprint: fingerprint, cacheHit: false)
@@ -602,6 +671,33 @@ enum CardScanner: Sendable {
         case "ccd": return .ccd
         default: return .unknown
         }
+    }
+
+    /// GCM writes disc/vga/version/date/region together as an IP.BIN cache.
+    /// When all five are present, rebuild can skip opening the disc image.
+    nonisolated private static func sidecarIpHeader(
+        from fingerprint: FolderFingerprint,
+        name: String,
+        serial: String
+    ) -> IpBinInfo? {
+        guard let disc = fingerprint.discTxt, !disc.isEmpty,
+              let vgaRaw = fingerprint.vgaTxt,
+              let version = fingerprint.versionTxt,
+              let date = fingerprint.dateTxt,
+              let regionRaw = fingerprint.regionTxt
+        else { return nil }
+        let vga = vgaRaw == "1" || vgaRaw.caseInsensitiveCompare("true") == .orderedSame
+        let region = OpenMenuRegion.cleaned(regionRaw)
+        return IpBinInfo(
+            name: name,
+            productNumber: serial,
+            disc: OpenMenuDiscLabel.cleaned(disc),
+            region: region.isEmpty ? "JUE" : region,
+            vga: vga,
+            version: version.isEmpty ? "V1.000" : version,
+            releaseDate: date.isEmpty ? "19990909" : date,
+            isCodeBreaker: false
+        )
     }
 
     private nonisolated static func readSidecar(named name: String, in folder: URL) -> String? {

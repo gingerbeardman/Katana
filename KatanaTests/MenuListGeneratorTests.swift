@@ -102,6 +102,69 @@ struct MenuListGeneratorTests {
         #expect(text.contains("num_items=1\n"))
         #expect(text.contains("[ITEMS]\n"))
         #expect(text.contains("01.product=MK1\n"))
+        #expect(!text.contains(".folder="))
+        #expect(!text.contains(".type="))
+        let extended = MenuListGenerator.makeOpenMenuList(items: items, extended: true)
+        #expect(extended.contains("01.folder=\n"))
+        #expect(extended.contains("01.type=game\n"))
+    }
+
+    @Test func openMenuListWritesFolderTypeAndExtras() {
+        let ip = IpBinInfo.fallback(name: "Shenmue", serial: "MK-51059")
+        let items = [
+            MenuListGenerator.Item(
+                number: 2,
+                name: "Shenmue",
+                serial: "MK-51059",
+                ip: ip,
+                virtualFolder: "Games\\RPGs",
+                extraFolders: ["Games\\A–Z", "Favorites"],
+                discType: .other
+            ),
+        ]
+        let stock = MenuListGenerator.makeList(kind: .openMenu, items: items)
+        #expect(stock.contains("02.product=MK51059\n"))
+        #expect(!stock.contains(".folder="))
+        #expect(!stock.contains(".type="))
+        let text = MenuListGenerator.makeList(kind: .openMenuExtended, items: items)
+        #expect(text.contains("02.name=Shenmue\n"))
+        #expect(text.contains("02.product=MK51059\n"))
+        #expect(text.contains("02.folder=Games\\RPGs\n"))
+        #expect(text.contains("02.folder_alt1=Games\\A–Z\n"))
+        #expect(text.contains("02.folder_alt2=Favorites\n"))
+        #expect(text.contains("02.type=other\n"))
+        #expect(!text.contains("folder_alt3="))
+        let gd = MenuListGenerator.makeGDMenuList(items: items)
+        #expect(!gd.contains(".folder="))
+        #expect(!gd.contains(".type="))
+    }
+
+    @Test func openMenuListPrefersDiscAndRegionOverrides() {
+        let ip = IpBinInfo(
+            name: "Shenmue",
+            productNumber: "MK-51059",
+            disc: "1/1",
+            region: "J",
+            vga: true,
+            version: "V1.000",
+            releaseDate: "19991201",
+            isCodeBreaker: false
+        )
+        let items = [
+            MenuListGenerator.Item(
+                number: 3,
+                name: "Shenmue",
+                serial: "MK-51059",
+                ip: ip,
+                discLabel: "2/4",
+                regionLabel: "UE"
+            ),
+        ]
+        let text = MenuListGenerator.makeOpenMenuList(items: items)
+        #expect(text.contains("03.disc=2/4\n"))
+        #expect(text.contains("03.region=UE\n"))
+        #expect(!text.contains("03.disc=1/1\n"))
+        #expect(!text.contains("03.region=J\n"))
     }
 
     @Test func codeBreakerClearsDiscField() {
@@ -174,6 +237,8 @@ struct MenuListGeneratorTests {
         #expect(MenuKind.detect(fromName: "gdmenu") == .gdMenu)
         #expect(MenuKind.detect(fromName: "openMenu") == .openMenu)
         #expect(MenuKind.detect(fromName: "OPEN MENU") == .openMenu)
+        #expect(MenuKind.detect(fromName: "openMenu 1.6.3-ateam") == .openMenuExtended)
+        #expect(MenuKind.detect(fromName: "openMenu Extended") == .openMenuExtended)
         #expect(MenuKind.detect(fromName: "Sonic") == nil)
 
         let gdIP = IpBinInfo.menuDefaults
@@ -191,6 +256,51 @@ struct MenuListGeneratorTests {
         )
         #expect(MenuKind.detect(fromIP: openIP) == .openMenu)
         #expect(MenuKind.detect(fromIP: IpBinInfo.fallback(name: "Game", serial: "T-123")) == nil)
+    }
+
+    @Test func menuKindColumnsAndPersistence() {
+        #expect(MenuKind.allCases.map(\.rawValue) == ["gdMenu", "openMenu", "openMenuExtended"])
+        #expect(!MenuKind.gdMenu.supportsVirtualFolders)
+        #expect(!MenuKind.openMenu.supportsVirtualFolders)
+        #expect(MenuKind.openMenuExtended.supportsVirtualFolders)
+        #expect(MenuKind.openMenu.isOpenMenuFamily)
+        #expect(MenuKind.migratingFromPreExtendedSchema(.openMenu) == .openMenuExtended)
+        #expect(MenuKind.migratingFromPreExtendedSchema(.gdMenu) == .gdMenu)
+        #expect(MenuKind.migratingFromPreExtendedSchema(.openMenuExtended) == .openMenuExtended)
+        #expect(MenuKind(rawValue: "openMenu") == .openMenu)
+        #expect(MenuKind(rawValue: "openMenuExtended") == .openMenuExtended)
+    }
+
+    @Test func detectMenuKindPromotesOpenMenuWhenFoldersExist() {
+        let menu = GameEntry(
+            id: UUID(),
+            number: 1,
+            name: "openMenu",
+            serial: "NEODC_1",
+            format: .gdi,
+            imageFileName: "disc.gdi",
+            folderPath: "/tmp/katana-no-menu",
+            byteSize: 1,
+            payloadByteSize: 1,
+            contentSHA256: nil,
+            isMenu: true
+        )
+        let game = GameEntry(
+            id: UUID(),
+            number: 2,
+            name: "Shenmue",
+            serial: "MK-51059",
+            format: .gdi,
+            imageFileName: "disc.gdi",
+            folderPath: "/tmp/katana-no-game",
+            byteSize: 1,
+            payloadByteSize: 1,
+            contentSHA256: nil,
+            isMenu: false,
+            virtualFolder: "Games\\RPGs"
+        )
+        #expect(MenuRebuildService.detectMenuKind(games: [menu]) == .openMenu)
+        #expect(MenuRebuildService.detectMenuKind(games: [menu, game]) == .openMenuExtended)
     }
 }
 

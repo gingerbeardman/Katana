@@ -52,25 +52,37 @@ struct ContentView: View {
                               : "Soft-delete selected game (⌫). Option-click / ⌥⌫ erases immediately.")
                     }
 
-                    ToolbarItem(id: "moveUp", placement: .primaryAction) {
-                        Button {
-                            state.moveSelection(up: true)
-                        } label: {
-                            Label("Up", systemImage: "arrow.up")
+                    ToolbarItem(id: "move", placement: .primaryAction) {
+                        ControlGroup {
+                            Button {
+                                state.moveSelectionToTop()
+                            } label: {
+                                Label("Top", systemImage: "arrow.up.to.line")
+                            }
+                            .disabled(!state.canMoveSelectionToTop)
+                            .help(state.moveToTopHelp)
+                            Button {
+                                state.moveSelectionTowardTop()
+                            } label: {
+                                Label("Up", systemImage: "arrow.up")
+                            }
+                            .disabled(!state.canMoveSelectionUp)
+                            .help(state.moveUpHelp)
+                            Button {
+                                state.moveSelectionTowardBottom()
+                            } label: {
+                                Label("Down", systemImage: "arrow.down")
+                            }
+                            .disabled(!state.canMoveSelectionDown)
+                            .help(state.moveDownHelp)
+                            Button {
+                                state.moveSelectionToBottom()
+                            } label: {
+                                Label("Bottom", systemImage: "arrow.down.to.line")
+                            }
+                            .disabled(!state.canMoveSelectionToBottom)
+                            .help(state.moveToBottomHelp)
                         }
-                        .disabled(!state.canMoveSelectionUp)
-                        .help("Move selection earlier on the card (renumbers folders)")
-                    }
-                    .defaultCustomization(.hidden)
-
-                    ToolbarItem(id: "moveDown", placement: .primaryAction) {
-                        Button {
-                            state.moveSelection(up: false)
-                        } label: {
-                            Label("Down", systemImage: "arrow.down")
-                        }
-                        .disabled(!state.canMoveSelectionDown)
-                        .help("Move selection later on the card (renumbers folders)")
                     }
                     .defaultCustomization(.hidden)
 
@@ -95,13 +107,33 @@ struct ContentView: View {
                         .symbolVariant(state.menuNeedsRebuild ? .fill : .none)
                     }
 
+                    ToolbarItem(id: "arrange", placement: .primaryAction) {
+                        Button {
+                            if state.isArranging {
+                                state.cancelArrange()
+                            } else {
+                                state.beginArrange()
+                            }
+                        } label: {
+                            Label(
+                                state.isArranging ? "Cancel Arrange" : "Arrange",
+                                systemImage: "line.3.horizontal"
+                            )
+                        }
+                        .disabled(!state.canArrange && !state.isArranging)
+                        .help(state.isArranging
+                              ? "Leave arrange mode without applying (or Apply in the bar above the list)"
+                              : "Drag selected rows to reorder, or click here. Folders change only when you Apply.")
+                        .symbolVariant(state.isArranging ? .fill : .none)
+                    }
+
                     ToolbarItem(id: "sortAZ", placement: .primaryAction) {
                         Button {
                             state.sortAlphabetically()
                         } label: {
                             Label("Apply A–Z to Card", systemImage: "arrow.up.arrow.down.square")
                         }
-                        .disabled(state.volume == nil || state.games.count < 2 || state.isBusy)
+                        .disabled(state.volume == nil || state.games.count < 2 || state.isBusy || state.isArranging)
                         .help("Renumber folders A–Z on the SD card. Click table headers to sort the view only.")
                     }
 

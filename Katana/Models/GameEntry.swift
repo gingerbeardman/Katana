@@ -24,6 +24,16 @@ nonisolated struct GameEntry: Identifiable, Codable, Hashable, Sendable {
     /// Cached IP.BIN fields for LIST.INI rebuild (avoids re-reading every GDI on the card).
     /// Filled on import / enrichment / inspector; cleared when the disc image hash changes.
     var ipHeader: IpBinInfo? = nil
+    /// openMenu virtual folder path (`Games\RPGs`), from `folder.txt` / `OPENMENU.INI`.
+    var virtualFolder: String = ""
+    /// Extra openMenu folder paths (up to 5) so a disc can appear in more than one folder.
+    var extraFolders: [String] = []
+    /// openMenu disc kind (`type.txt` / `type=`). Ignored by GDmenu.
+    var discType: OpenMenuItemType = .game
+    /// Override for `N.disc=` / `disc.txt` (e.g. `2/4`). Empty → IP.BIN disc field.
+    var discLabel: String = ""
+    /// Override for `N.region=` / `region.txt` (JUE). Empty → IP.BIN region field.
+    var regionLabel: String = ""
 
     var folderURL: URL {
         URL(fileURLWithPath: folderPath, isDirectory: true)
@@ -31,6 +41,35 @@ nonisolated struct GameEntry: Identifiable, Codable, Hashable, Sendable {
 
     /// Sort key for the Format table column (display-only sorting).
     var formatSortKey: String { format.displayName }
+
+    /// Sort key for the Folder table column (display-only).
+    var virtualFolderSortKey: String { virtualFolder }
+
+    /// Sort key for the Type table column (display-only).
+    var discTypeSortKey: String { discType.displayName }
+
+    /// Sort key for the Disc table column (display-only).
+    var discLabelSortKey: String { resolvedDisc() }
+
+    /// Sidecars that only openMenu Extended bakes (`folder.txt` / extras / non-game type).
+    var hasOpenMenuFolderMeta: Bool {
+        guard !isMenu, number != 1 else { return false }
+        return !virtualFolder.isEmpty || !extraFolders.isEmpty || discType != .game
+    }
+
+    /// Disc number written to LIST/OPENMENU (`2/4`), preferring `disc.txt`.
+    func resolvedDisc(ip: IpBinInfo? = nil) -> String {
+        if !discLabel.isEmpty { return discLabel }
+        let fromIP = (ip ?? ipHeader)?.disc ?? ""
+        return fromIP.isEmpty ? "1/1" : fromIP
+    }
+
+    /// Region flags written to LIST/OPENMENU (`JUE`), preferring `region.txt`.
+    func resolvedRegion(ip: IpBinInfo? = nil) -> String {
+        if !regionLabel.isEmpty { return regionLabel }
+        let fromIP = (ip ?? ipHeader)?.region ?? ""
+        return fromIP.isEmpty ? "JUE" : fromIP
+    }
 
     var hasContentHash: Bool {
         contentSHA256 != nil && !(contentSHA256?.isEmpty ?? true)

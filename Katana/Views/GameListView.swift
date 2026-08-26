@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Game table with **display-only** column sorting (Brutify / 2UP style).
 /// `AppState.games` stays in on-card slot order; table sort never renumbers folders.
@@ -16,9 +17,16 @@ struct GameListView: View {
     /// Finder drag highlight (AppKit drop destination, same idea as 2UP pane drops).
     @State private var isDropTargeted = false
 
+    /// Row IDs that were selected when the mouse went down. NSTableView selects the
+    /// clicked row before asking for a drag, so this is the only way to tell “drag the
+    /// selected block” from “drag to extend the selection”.
+    @State private var selectionAtMouseDown = MouseDownSelectionSnapshot()
+
     /// Filtered list sorted for display. Does not mutate card slot order.
+    /// While arranging, the pending order *is* the display order.
     private var displayedGames: [GameEntry] {
-        state.filteredGames.sorted(using: sortOrder)
+        if state.isArranging { return state.arrangedGames }
+        return state.filteredGames.sorted(using: sortOrder)
     }
 
     /// True when not sorting by slot number (either direction).
@@ -32,17 +40,24 @@ struct GameListView: View {
         // Bottom insets on NavigationSplitView detail + Table were clipped unless
         // the window was extremely tall — users never saw the bar.
         VStack(spacing: 0) {
-            if state.volume != nil, state.menuNeedsRebuild, !state.isRebuildingMenu {
+            if state.isArranging {
+                arrangeBar
+            } else if state.volume != nil, state.menuNeedsRebuild, !state.isRebuildingMenu {
                 menuRebuildBar
             }
 
             // Column widths, visibility, and reorder use SwiftUI’s native
             // `columnCustomization` (same pattern as 2UP): Control-click a header
-            // to show/hide columns. Persisted via `AppState.tableColumnCustomizationData`.
+            // to show/hide columns. Persisted per menu type.
+            // One Table for browsing *and* Arrange. Row drag is NSTableView’s own
+            // (`TableRow.itemProvider` / `onInsert`): rows that were not selected at
+            // mouse-down return no provider, so dragging them extends the selection
+            // natively; dragging an already-selected block reorders it and enters Arrange.
             Table(
-                displayedGames,
+                of: GameEntry.self,
                 selection: $state.selection,
-                sortOrder: $sortOrder,
+                // Header clicks are ignored while arranging — the pending order is the sort.
+                sortOrder: state.isArranging ? .constant(sortOrder) : $sortOrder,
                 columnCustomization: columnCustomizationBinding
             ) {
                 TableColumn("#", value: \.number) { game in
@@ -73,6 +88,38 @@ struct GameListView: View {
                 .width(min: 72, ideal: 100, max: 140)
                 .customizationID("serial")
 
+                TableColumn("Folder", value: \.virtualFolderSortKey) { game in
+                    Text(game.virtualFolder.isEmpty ? "—" : game.virtualFolder)
+                        .foregroundStyle(game.virtualFolder.isEmpty ? .tertiary : .primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(game.extraFolders.isEmpty
+                              ? "openMenu virtual folder"
+                              : "Also in: \(game.extraFolders.joined(separator: "; "))")
+                        .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
+                }
+                .width(min: 80, ideal: 140, max: 220)
+                .customizationID("folder")
+                .defaultVisibility(state.menuKind.supportsVirtualFolders ? .visible : .hidden)
+
+                TableColumn("Type", value: \.discTypeSortKey) { game in
+                    Text(game.isMenu || game.number == 1 ? "—" : game.discType.displayName)
+                        .foregroundStyle((game.isMenu || game.number == 1) ? .tertiary : .primary)
+                        .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
+                }
+                .width(min: 52, ideal: 64, max: 80)
+                .customizationID("type")
+                .defaultVisibility(state.menuKind.supportsVirtualFolders ? .visible : .hidden)
+
+                TableColumn("Disc", value: \.discLabelSortKey) { game in
+                    Text(game.isMenu || game.number == 1 ? "—" : game.resolvedDisc())
+                        .font(.body.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
+                }
+                .width(min: 44, ideal: 52, max: 64)
+                .customizationID("disc")
+
                 TableColumn("Format", value: \.formatSortKey) { game in
                     FormatBadge(format: game.format)
                         .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
@@ -89,6 +136,14 @@ struct GameListView: View {
                 }
                 .width(min: 72, ideal: 88, max: 110)
                 .customizationID("size")
+            } rows: {
+                ForEach(displayedGames) { game in
+                    TableRow(game)
+                        .itemProvider { rowDragProvider(for: game) }
+                }
+                .onInsert(of: [.text]) { index, _ in
+                    acceptRowDrop(at: index)
+                }
             }
             // Keep rows visible while scanning / rebuilding / mutating — block interaction only.
             // Imports paint placeholders with row spinners; no center blocking card.
@@ -115,6 +170,7 @@ struct GameListView: View {
                       !state.isBusy,
                       !state.isScanning,
                       !state.isRebuildingMenu,
+                      !state.isArranging,
                       state.selection.count == 1,
                       let id = state.selection.first
                 else { return .ignored }
@@ -159,7 +215,7 @@ struct GameListView: View {
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                if state.volume != nil, isNonSlotSort {
+                if state.volume != nil, isNonSlotSort, !state.isArranging {
                     displaySortBar
                 }
             }
@@ -167,7 +223,9 @@ struct GameListView: View {
         .searchable(
             text: $state.searchText,
             placement: .toolbar,
-            prompt: "Name, serial, number…"
+            prompt: state.menuKind.supportsVirtualFolders
+                ? "Name, serial, folder, disc…"
+                : "Name, serial, disc…"
         )
         .onChange(of: state.selection) { _, newValue in
             // Leave rename mode if the renamed row is no longer selected.
@@ -208,6 +266,10 @@ struct GameListView: View {
         }
         .onAppear {
             applySortFromState(remount: false)
+            selectionAtMouseDown.install { state.selection }
+        }
+        .onDisappear {
+            selectionAtMouseDown.uninstall()
         }
         // Finder → Add Games (2UP-style AppKit pasteboard drop, not SwiftUI `.onDrop`).
         .overlay {
@@ -229,7 +291,7 @@ struct GameListView: View {
     /// update chevrons natively, and remounting would throw away scroll position.
     private var tableIdentity: String {
         let vol = state.volume?.volumeUUID ?? "none"
-        return "\(vol)|\(tableRemountToken)"
+        return "\(vol)|\(state.menuKind.rawValue)|\(tableRemountToken)"
     }
 
     /// Persist widths / visibility / order through AppState (UserDefaults), 2UP-style.
@@ -257,6 +319,75 @@ struct GameListView: View {
         state.saveDisplaySort(pref)
     }
 
+    // MARK: Row drag reorder
+
+    /// Called by NSTableView when a drag starts on `game`. `nil` = not draggable, so the
+    /// table extends the selection instead (native drag-select). Only a row that was
+    /// already selected before the click starts a reorder drag.
+    private func rowDragProvider(for game: GameEntry) -> NSItemProvider? {
+        guard !state.isBusy,
+              state.renamingGameID == nil,
+              !game.isMenu, game.number != 1,
+              selectionAtMouseDown.ids.contains(game.id)
+        else { return nil }
+        return NSItemProvider(object: game.id.uuidString as NSString)
+    }
+
+    /// Drop between rows: enters Arrange (Apply / Cancel bar) and stages the move.
+    /// The whole selection moves as a block when the dragged row was part of it.
+    private func acceptRowDrop(at index: Int) {
+        let rows = displayedGames
+        let dragged = rows.filter { selectionAtMouseDown.ids.contains($0.id) && !$0.isMenu && $0.number != 1 }
+        guard let source = dragged.first else { return }
+        let target: UUID? = index < rows.count ? rows[index].id : nil
+        if !state.selection.contains(source.id) {
+            state.selection = Set(dragged.map(\.id))
+        }
+        state.acceptReorderDrop(sourceID: source.id, before: target)
+    }
+
+    private var arrangeBar: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "line.3.horizontal")
+                .foregroundStyle(.secondary)
+                .imageScale(.medium)
+            Text("Drag rows to rearrange")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            Text("— drag selected rows to a new position, then Apply")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+            Spacer(minLength: 8)
+            Button("Cancel") {
+                state.cancelArrange()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(state.isBusy)
+            .keyboardShortcut(.cancelAction)
+            Button("Apply") {
+                state.commitArrange()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .disabled(state.isBusy || !state.arrangeIsDirty)
+            .keyboardShortcut(.defaultAction)
+            .help("Rename numbered folders once to match this order")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background {
+            Rectangle().fill(.bar)
+            Rectangle().fill(Color.accentColor.opacity(0.10))
+        }
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+
     /// Compact strip under the toolbar — warning chrome (not inverted white-on-orange).
     private var menuRebuildBar: some View {
         HStack(alignment: .center, spacing: 10) {
@@ -279,7 +410,7 @@ struct GameListView: View {
             .buttonStyle(.borderedProminent)
             .tint(.orange)
             .controlSize(.small)
-            .disabled(!state.canRebuildMenu || state.isTextInputFocused)
+            .disabled(!state.canRebuildMenu)
             .help("Bake names and order into \(state.menuKind.displayName) in slot 01 (⌘S)")
         }
         .padding(.horizontal, 12)
@@ -334,7 +465,7 @@ struct GameListView: View {
             Button("Rename") {
                 state.beginInlineRename(id)
             }
-            .disabled(state.isBusy || state.isScanning)
+            .disabled(state.isBusy || state.isScanning || state.isArranging)
         }
 
         Button("Show Details") {
@@ -390,21 +521,78 @@ struct GameListView: View {
         }
         .disabled(count == 0 || state.isBusy)
 
+        let assignable = selectedGames.filter { !$0.isMenu && $0.number != 1 }
+        if state.menuKind.supportsVirtualFolders, !assignable.isEmpty {
+            let ids = Set(assignable.map(\.id))
+            let shared = Set(assignable.map(\.virtualFolder))
+            let currentFolder = shared.count == 1 ? shared.first : nil
+            Menu("Assign Folder") {
+                Button("None") {
+                    state.assignVirtualFolder(ids: ids, to: "")
+                }
+                let known = state.knownVirtualFolders
+                if !known.isEmpty {
+                    Divider()
+                    ForEach(known, id: \.self) { path in
+                        Button(path) {
+                            state.assignVirtualFolder(ids: ids, to: path)
+                        }
+                    }
+                }
+                Divider()
+                Button("Type a Path…") {
+                    if let path = OpenMenuFolderPrompt.askPath(
+                        seed: currentFolder ?? "",
+                        suggestions: known
+                    ) {
+                        state.assignVirtualFolder(ids: ids, to: path)
+                    }
+                }
+            }
+            .disabled(state.isBusy)
+            .help("Assign the same openMenu folder to every selected game. None unfiles. Type a Path… uses autocomplete like the inspector.")
+        }
+
         Divider()
 
-        Button("Move Up on Card") {
-            state.selection = selectedIDs
-            state.moveSelection(up: true)
+        if !state.isArranging {
+            Button("Arrange…") {
+                if let id = selectedIDs.first {
+                    state.selection = selectedIDs
+                    state.beginArrange(selecting: id)
+                }
+            }
+            .disabled(state.isBusy || !state.canArrange)
+            .help("Drag selected rows, or use this, to reorder. Apply writes folders.")
         }
-        .disabled(state.isBusy || !canMove(selectedIDs, up: true))
-        .help("Changes SD folder numbers (not table sort)")
 
-        Button("Move Down on Card") {
+        Button(state.moveUpTitle) {
             state.selection = selectedIDs
-            state.moveSelection(up: false)
+            state.moveSelectionTowardTop()
         }
-        .disabled(state.isBusy || !canMove(selectedIDs, up: false))
-        .help("Changes SD folder numbers (not table sort)")
+        .disabled(state.isBusy || !state.canMoveSelection(towardTop: true, ids: selectedIDs))
+        .help(state.moveUpHelp)
+
+        Button(state.moveDownTitle) {
+            state.selection = selectedIDs
+            state.moveSelectionTowardBottom()
+        }
+        .disabled(state.isBusy || !state.canMoveSelection(towardTop: false, ids: selectedIDs))
+        .help(state.moveDownHelp)
+
+        Button("Move to Top") {
+            state.selection = selectedIDs
+            state.moveSelectionToTop()
+        }
+        .disabled(state.isBusy || !state.canLowerSlot(ids: selectedIDs))
+        .help(state.moveToTopHelp)
+
+        Button("Move to Bottom") {
+            state.selection = selectedIDs
+            state.moveSelectionToBottom()
+        }
+        .disabled(state.isBusy || !state.canRaiseSlot(ids: selectedIDs))
+        .help(state.moveToBottomHelp)
 
         Divider()
 
@@ -430,11 +618,26 @@ struct GameListView: View {
         .help("Erase from the card now — slow for large games; cannot be undone")
     }
 
-    private func canMove(_ ids: Set<GameEntry.ID>, up: Bool) -> Bool {
-        let indices = state.games.indices.filter { ids.contains(state.games[$0].id) }
-        guard let first = indices.first, let last = indices.last else { return false }
-        return up ? first > 0 : last < state.games.count - 1
-    }
-
 }
 
+
+/// Snapshots the table selection on every left mouse-down (a local event monitor sees the
+/// event before NSTableView changes the selection). See `GameListView.rowDragProvider`.
+@MainActor
+final class MouseDownSelectionSnapshot {
+    private(set) var ids: Set<GameEntry.ID> = []
+    private var monitor: Any?
+
+    func install(_ selection: @escaping () -> Set<GameEntry.ID>) {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            self?.ids = selection()
+            return event
+        }
+    }
+
+    func uninstall() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
+    }
+}

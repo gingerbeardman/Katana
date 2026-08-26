@@ -8,6 +8,11 @@ enum MenuListGenerator: Sendable {
         var name: String
         var serial: String
         var ip: IpBinInfo
+        var virtualFolder: String = ""
+        var extraFolders: [String] = []
+        var discType: OpenMenuItemType = .game
+        var discLabel: String = ""
+        var regionLabel: String = ""
     }
 
     /// Format a list key to match **on-disk** folder names: `01`…`99`, then `100`….
@@ -19,18 +24,18 @@ enum MenuListGenerator: Sendable {
     nonisolated static func makeGDMenuList(items: [Item]) -> String {
         var sb = "[GDMENU]\n"
         for item in items {
-            appendEntry(to: &sb, item: item, openMenu: false)
+            appendEntry(to: &sb, item: item, kind: .gdMenu)
         }
         return sb
     }
 
-    /// Generate OPENMENU.INI body for openMenu.
-    nonisolated static func makeOpenMenuList(items: [Item]) -> String {
+    /// Generate OPENMENU.INI body. Extended adds `folder=` / `folder_altN=` / `type=`.
+    nonisolated static func makeOpenMenuList(items: [Item], extended: Bool = false) -> String {
         var sb = "[OPENMENU]\n"
         sb += "num_items=\(items.count)\n\n"
         sb += "[ITEMS]\n"
         for item in items {
-            appendEntry(to: &sb, item: item, openMenu: true)
+            appendEntry(to: &sb, item: item, kind: extended ? .openMenuExtended : .openMenu)
         }
         return sb
     }
@@ -38,14 +43,15 @@ enum MenuListGenerator: Sendable {
     nonisolated static func makeList(kind: MenuKind, items: [Item]) -> String {
         switch kind {
         case .gdMenu: return makeGDMenuList(items: items)
-        case .openMenu: return makeOpenMenuList(items: items)
+        case .openMenu: return makeOpenMenuList(items: items, extended: false)
+        case .openMenuExtended: return makeOpenMenuList(items: items, extended: true)
         }
     }
 
     nonisolated private static func appendEntry(
         to sb: inout String,
         item: Item,
-        openMenu: Bool
+        kind: MenuKind = .gdMenu
     ) {
         let n = formatFolderNumber(item.number)
         let name = item.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -55,13 +61,15 @@ enum MenuListGenerator: Sendable {
         if ip.isCodeBreaker {
             sb += "\(n).disc=\n"
         } else {
-            sb += "\(n).disc=\(ip.disc)\n"
+            let disc = item.discLabel.isEmpty ? (ip.disc.isEmpty ? "1/1" : ip.disc) : item.discLabel
+            sb += "\(n).disc=\(disc)\n"
         }
         sb += "\(n).vga=\(ip.vga ? "1" : "0")\n"
-        sb += "\(n).region=\(ip.region)\n"
+        let region = item.regionLabel.isEmpty ? (ip.region.isEmpty ? "JUE" : ip.region) : item.regionLabel
+        sb += "\(n).region=\(region)\n"
         sb += "\(n).version=\(ip.version)\n"
         sb += "\(n).date=\(ip.releaseDate)\n"
-        if openMenu {
+        if kind.isOpenMenuFamily {
             // openMenu product id: strip dashes, first token only.
             let product = item.serial
                 .replacingOccurrences(of: "-", with: "")
@@ -69,6 +77,13 @@ enum MenuListGenerator: Sendable {
                 .first
                 .map(String.init) ?? ""
             sb += "\(n).product=\(product)\n"
+            if kind.supportsVirtualFolders {
+                sb += "\(n).folder=\(item.virtualFolder)\n"
+                for (index, extra) in item.extraFolders.prefix(5).enumerated() {
+                    sb += "\(n).folder_alt\(index + 1)=\(extra)\n"
+                }
+                sb += "\(n).type=\(item.discType.fileValue)\n"
+            }
         }
         sb += "\n"
     }
@@ -117,7 +132,7 @@ enum MenuListGenerator: Sendable {
                     switch menuKind {
                     case .gdMenu:
                         ip = IpBinInfo.menuDefaults
-                    case .openMenu:
+                    case .openMenu, .openMenuExtended:
                         // Matches stock openMenu IP.BIN product fields when unreadable.
                         ip = IpBinInfo(
                             name: menuKind.menuFolderName,
@@ -145,7 +160,12 @@ enum MenuListGenerator: Sendable {
                     number: game.number,
                     name: game.name,
                     serial: game.serial.isEmpty ? ip.productNumber : game.serial,
-                    ip: ip
+                    ip: ip,
+                    virtualFolder: game.isMenu ? "" : game.virtualFolder,
+                    extraFolders: game.isMenu ? [] : game.extraFolders,
+                    discType: game.isMenu ? .game : game.discType,
+                    discLabel: game.isMenu ? "" : game.discLabel,
+                    regionLabel: game.isMenu ? "" : game.regionLabel
                 )
             )
         }

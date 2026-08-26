@@ -10,11 +10,20 @@ struct InspectorView: View {
     @Bindable var state: AppState
 
     @State private var draftName: String = ""
+    @State private var draftFolder: String = ""
+    @State private var draftExtras: String = ""
+    @State private var draftSerial: String = ""
+    @State private var draftDisc: String = ""
+    @State private var draftRegion: String = ""
     @State private var ipInfo: IpBinInfo?
     @State private var gdtexImage: NSImage?
     @State private var gdtexStatus: String = ""
     @State private var detailLoadToken: UUID = UUID()
     @FocusState private var nameFieldFocused: Bool
+    @FocusState private var extrasFieldFocused: Bool
+    @FocusState private var serialFieldFocused: Bool
+    @FocusState private var discFieldFocused: Bool
+    @FocusState private var regionFieldFocused: Bool
 
     private var snap: InspectorSnapshot { state.inspectorSnapshot }
 
@@ -53,6 +62,12 @@ struct InspectorView: View {
             VStack(alignment: .leading, spacing: 0) {
                 collapsible(.title) {
                     titleSectionBody(game)
+                }
+                if state.menuKind.supportsVirtualFolders, !game.isMenu, game.number != 1 {
+                    sectionDivider
+                    collapsible(.openMenu) {
+                        openMenuSectionBody(game)
+                    }
                 }
                 if snap.duplicatesEnabled {
                     if let dup = duplicate {
@@ -97,6 +112,40 @@ struct InspectorView: View {
         .onChange(of: game.name) { _, new in
             if !nameFieldFocused, draftName != new {
                 draftName = new
+            }
+        }
+        .onChange(of: game.virtualFolder) { _, new in
+            if draftFolder != new {
+                draftFolder = new
+            }
+        }
+        .onChange(of: game.extraFolders) { _, new in
+            let joined = new.joined(separator: "; ")
+            if !extrasFieldFocused, draftExtras != joined {
+                draftExtras = joined
+            }
+        }
+        .onChange(of: game.serial) { _, new in
+            if !serialFieldFocused, draftSerial != new {
+                draftSerial = new
+            }
+        }
+        .onChange(of: game.discLabel) { _, _ in
+            if !discFieldFocused {
+                draftDisc = game.resolvedDisc(ip: ipInfo)
+            }
+        }
+        .onChange(of: game.regionLabel) { _, _ in
+            if !regionFieldFocused {
+                draftRegion = game.resolvedRegion(ip: ipInfo)
+            }
+        }
+        .onChange(of: ipInfo) { _, ip in
+            if !discFieldFocused {
+                draftDisc = game.resolvedDisc(ip: ip)
+            }
+            if !regionFieldFocused {
+                draftRegion = game.resolvedRegion(ip: ip)
             }
         }
         .onChange(of: state.focusNameFieldToken) { _, _ in
@@ -254,6 +303,85 @@ struct InspectorView: View {
         }
     }
 
+    // MARK: - openMenu (virtual folder + disc type)
+
+    private func openMenuSectionBody(_ game: GameEntry) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            inspectorRow("Folder") {
+                FolderPathComboField(
+                    text: draftFolder,
+                    suggestions: folderOptions(including: draftFolder),
+                    onCommit: { typed in
+                        draftFolder = typed
+                        state.setVirtualFolder(id: game.id, to: typed)
+                        if let updated = state.games.first(where: { $0.id == game.id }) {
+                            draftFolder = updated.virtualFolder
+                        }
+                    }
+                )
+                .frame(maxWidth: .infinity, minHeight: 22, alignment: .leading)
+                .help("Click the field and type a path, or use the arrow to pick one already on the card. Nested folders use backslashes (Games\\RPGs). Clear the field to unfile. Return or click away to save.")
+            }
+
+            inspectorRow("Also in") {
+                TextField("Games\\A–Z", text: $draftExtras)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($extrasFieldFocused)
+                    .onSubmit { commitOpenMenu(for: game) }
+                    .onChange(of: extrasFieldFocused) { _, focused in
+                        if !focused { commitOpenMenu(for: game) }
+                    }
+                    .help("Up to five extra folder paths, separated by semicolons, so the disc appears in more than one folder.")
+            }
+
+            inspectorRow("Type") {
+                Picker("Type", selection: Binding(
+                    get: { game.discType },
+                    set: { state.setDiscType(id: game.id, to: $0) }
+                )) {
+                    ForEach(OpenMenuItemType.allCases) { kind in
+                        Text(kind.displayName).tag(kind)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .help(game.discType.helpText)
+            }
+
+            Text(state.menuKind.supportsVirtualFolders
+                 ? "Written to folder.txt / type.txt and baked into OPENMENU.INI."
+                 : "Saved on the card; used the next time you rebuild as openMenu Extended.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func commitOpenMenu(for game: GameEntry) {
+        let extras = draftExtras
+            .split(whereSeparator: { $0 == ";" || $0 == "," || $0 == "\n" })
+            .map(String.init)
+        state.setOpenMenuMeta(
+            id: game.id,
+            virtualFolder: game.virtualFolder,
+            extraFolders: extras,
+            discType: game.discType
+        )
+        if let updated = state.games.first(where: { $0.id == game.id }) {
+            draftExtras = updated.extraFolders.joined(separator: "; ")
+        }
+    }
+
+    private func folderOptions(including current: String) -> [String] {
+        var folders = state.knownVirtualFolders
+        if !current.isEmpty, !folders.contains(current) {
+            folders.append(current)
+            folders.sort { $0.localizedStandardCompare($1) == .orderedAscending }
+        }
+        return folders
+    }
+
     private func titleStatusLine(for game: GameEntry) -> String {
         let slot = FolderNumbering.format(game.number)
         let size = state.formatGameSize(game)
@@ -378,25 +506,59 @@ struct InspectorView: View {
                         .help("Product name from IP.BIN (differs from the display name)")
                 }
 
-                Text(ipBinMetaLine(ip))
+                Text(ipBinMetaLine(ip, game: game))
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                let serial = preferredSerial(game: game, ip: ip)
-                inspectorRow("Serial") {
-                    Text(serial)
-                        .font(.body.monospaced())
-                        .textSelection(.enabled)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-
-                inspectorRow("Region") {
-                    Text(ip.region.isEmpty ? "—" : ip.region)
-                        .font(.body.monospaced())
-                        .lineLimit(1)
+                if game.isMenu || game.number == 1 {
+                    inspectorRow("Serial") {
+                        Text(preferredSerial(game: game, ip: ip))
+                            .font(.body.monospaced())
+                            .textSelection(.enabled)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    inspectorRow("Region") {
+                        Text(game.resolvedRegion(ip: ip).isEmpty ? "—" : game.resolvedRegion(ip: ip))
+                            .font(.body.monospaced())
+                            .lineLimit(1)
+                    }
+                } else {
+                    inspectorRow("Serial") {
+                        TextField("MK-51000", text: $draftSerial)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.body.monospaced())
+                            .focused($serialFieldFocused)
+                            .onSubmit { commitSerial(for: game) }
+                            .onChange(of: serialFieldFocused) { _, focused in
+                                if !focused { commitSerial(for: game) }
+                            }
+                            .help("Product ID (serial.txt). Multi-disc sets must share the same serial.")
+                    }
+                    inspectorRow("Disc") {
+                        TextField("1/1", text: $draftDisc)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.body.monospaced())
+                            .focused($discFieldFocused)
+                            .onSubmit { commitDisc(for: game) }
+                            .onChange(of: discFieldFocused) { _, focused in
+                                if !focused { commitDisc(for: game) }
+                            }
+                            .help("Disc number for openMenu Compact grouping (disc.txt), e.g. 1/4.")
+                    }
+                    inspectorRow("Region") {
+                        TextField("JUE", text: $draftRegion)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.body.monospaced())
+                            .focused($regionFieldFocused)
+                            .onSubmit { commitRegion(for: game) }
+                            .onChange(of: regionFieldFocused) { _, focused in
+                                if !focused { commitRegion(for: game) }
+                            }
+                            .help("Region flags for openMenu (region.txt). Any mix of J, U, and E.")
+                    }
                 }
 
                 inspectorRow("CRC") {
@@ -421,10 +583,32 @@ struct InspectorView: View {
         }
     }
 
-    private func ipBinMetaLine(_ ip: IpBinInfo) -> String {
-        var parts = [ip.version, "DISC \(ip.disc)"]
+    private func ipBinMetaLine(_ ip: IpBinInfo, game: GameEntry) -> String {
+        var parts = [ip.version, "DISC \(game.resolvedDisc(ip: ip))"]
         if ip.vga { parts.append("VGA") }
         return parts.joined(separator: " · ")
+    }
+
+    private func commitSerial(for game: GameEntry) {
+        state.setSerial(id: game.id, to: draftSerial)
+        if let updated = state.games.first(where: { $0.id == game.id }) {
+            draftSerial = updated.serial
+        }
+    }
+
+    private func commitDisc(for game: GameEntry) {
+        state.setDiscLabel(id: game.id, to: draftDisc)
+        if let updated = state.games.first(where: { $0.id == game.id }) {
+            draftDisc = updated.resolvedDisc(ip: ipInfo)
+        }
+    }
+
+    private func commitRegion(for game: GameEntry) {
+        state.setRegionLabel(id: game.id, to: draftRegion)
+        if let updated = state.games.first(where: { $0.id == game.id }) {
+            let resolved = updated.resolvedRegion(ip: ipInfo)
+            draftRegion = resolved
+        }
     }
 
     private func preferredSerial(game: GameEntry, ip: IpBinInfo) -> String {
@@ -635,6 +819,11 @@ struct InspectorView: View {
 
     private func syncDraft(from game: GameEntry) {
         draftName = game.name
+        draftFolder = game.virtualFolder
+        draftExtras = game.extraFolders.joined(separator: "; ")
+        draftSerial = game.serial
+        draftDisc = game.resolvedDisc(ip: ipInfo)
+        draftRegion = game.resolvedRegion(ip: ipInfo)
     }
 
     /// Load IP.BIN + 0GDTEX off the main actor when selection changes.

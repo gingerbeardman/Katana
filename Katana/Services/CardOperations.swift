@@ -7,6 +7,14 @@ enum CardOperations: Sendable {
     nonisolated static let tmpFolderName = ".katana-tmp"
     nonisolated static let nameFile = "name.txt"
     nonisolated static let serialFile = "serial.txt"
+    nonisolated static let folderFile = "folder.txt"
+    nonisolated static let typeFile = "type.txt"
+    nonisolated static let folderAltFiles = [
+        "folder_alt1.txt", "folder_alt2.txt", "folder_alt3.txt",
+        "folder_alt4.txt", "folder_alt5.txt",
+    ]
+    nonisolated static let discFile = "disc.txt"
+    nonisolated static let regionFile = "region.txt"
 
     // MARK: - Rename
 
@@ -26,6 +34,98 @@ enum CardOperations: Sendable {
         // the App Sandbox and often surfaces as “don’t have permission to save name.txt”.
         try trimmed.write(to: url, atomically: false, encoding: .utf8)
         return previous
+    }
+
+    // MARK: - openMenu folder / type
+
+    /// Previous virtual-folder / extra-path / type values, for undo.
+    struct OpenMenuMetaSnapshot: Sendable, Equatable {
+        var virtualFolder: String
+        var extraFolders: [String]
+        var discType: OpenMenuItemType
+    }
+
+    /// Write `folder.txt`, `folder_altN.txt`, and `type.txt` (GDMENU Card Manager layout).
+    @discardableResult
+    nonisolated static func writeOpenMenuMeta(
+        game: GameEntry,
+        virtualFolder: String,
+        extraFolders: [String],
+        discType: OpenMenuItemType,
+        cardRoot: URL? = nil
+    ) throws -> OpenMenuMetaSnapshot {
+        let previous = OpenMenuMetaSnapshot(
+            virtualFolder: game.virtualFolder,
+            extraFolders: game.extraFolders,
+            discType: game.discType
+        )
+        let folder = OpenMenuFolderPath.cleaned(virtualFolder)
+        let extras = OpenMenuFolderPath.cleanedExtras(extraFolders, excluding: folder)
+        let dest = scopedFolderURL(for: game, under: cardRoot)
+        try writeSidecar(folder, to: dest.appendingPathComponent(folderFile), deleteIfEmpty: true)
+        for (index, name) in folderAltFiles.enumerated() {
+            let value = index < extras.count ? extras[index] : ""
+            try writeSidecar(value, to: dest.appendingPathComponent(name), deleteIfEmpty: true)
+        }
+        try writeSidecar(discType.fileValue, to: dest.appendingPathComponent(typeFile), deleteIfEmpty: false)
+        return previous
+    }
+
+    /// Write `serial.txt`. Returns the previous serial for undo.
+    @discardableResult
+    nonisolated static func writeSerial(
+        game: GameEntry,
+        to newSerial: String,
+        cardRoot: URL? = nil
+    ) throws -> String {
+        let cleaned = OpenMenuSerial.cleaned(newSerial)
+        let previous = game.serial
+        let dest = scopedFolderURL(for: game, under: cardRoot)
+        try writeSidecar(cleaned, to: dest.appendingPathComponent(serialFile), deleteIfEmpty: true)
+        return previous
+    }
+
+    /// Write `disc.txt`. Empty value removes the override (IP.BIN disc is used).
+    @discardableResult
+    nonisolated static func writeDiscLabel(
+        game: GameEntry,
+        to newDisc: String,
+        cardRoot: URL? = nil
+    ) throws -> String {
+        let cleaned = OpenMenuDiscLabel.cleaned(newDisc)
+        let previous = game.discLabel
+        let dest = scopedFolderURL(for: game, under: cardRoot)
+        try writeSidecar(cleaned, to: dest.appendingPathComponent(discFile), deleteIfEmpty: true)
+        return previous
+    }
+
+    /// Write `region.txt` in JUE order. Empty value removes the override.
+    @discardableResult
+    nonisolated static func writeRegionLabel(
+        game: GameEntry,
+        to newRegion: String,
+        cardRoot: URL? = nil
+    ) throws -> String {
+        let cleaned = OpenMenuRegion.cleaned(newRegion)
+        let previous = game.regionLabel
+        let dest = scopedFolderURL(for: game, under: cardRoot)
+        try writeSidecar(cleaned, to: dest.appendingPathComponent(regionFile), deleteIfEmpty: true)
+        return previous
+    }
+
+    nonisolated private static func writeSidecar(
+        _ value: String,
+        to url: URL,
+        deleteIfEmpty: Bool
+    ) throws {
+        let fm = FileManager.default
+        if deleteIfEmpty, value.isEmpty {
+            if fm.fileExists(atPath: url.path) {
+                try fm.removeItem(at: url)
+            }
+            return
+        }
+        try value.write(to: url, atomically: false, encoding: .utf8)
     }
 
     // MARK: - Delete (soft → trash, or permanent wipe, then pack gaps)
@@ -486,8 +586,8 @@ enum CardOperations: Sendable {
         case message(String)
     }
 
-    /// Copy disc packages/images into the next free slots. Existing folders are renumbered
-    /// first when digit width must grow (e.g. 99 → 100).
+    /// Copy disc packages/images into the lowest free slots after packing the existing list.
+    /// Existing folders are renumbered first when digit width must grow (e.g. 99 → 100).
     ///
     /// Accepts folders, disc images, multi-select GDI/CCD track sets, and `.zip` archives.
     /// When `onEvent` is set, each new slot is prepared (folder + name) before hashing/copy
@@ -551,14 +651,6 @@ enum CardOperations: Sendable {
         let existing = games.sorted { $0.number < $1.number }
         let totalSlots = resolved.count
 
-        // Next slot must respect **on-disk** numbered folders, not only the in-memory list.
-        // A stale/empty `games` array (or snapshot desync) used to pick "001" while the menu
-        // already occupied that slot → "Destination folder already exists: 001".
-        let occupiedBefore = try occupiedSlotNumbers(on: rootURL)
-        let memoryMax = existing.map(\.number).max() ?? 0
-        let diskMax = occupiedBefore.max() ?? 0
-        let startNumber = max(memoryMax, diskMax, existing.count) + 1
-
         emit(.message("Preparing \(totalSlots) slot\(totalSlots == 1 ? "" : "s")…"))
         emit(.fraction(0))
 
@@ -595,9 +687,13 @@ enum CardOperations: Sendable {
 
         var added: [GameEntry] = []
         added.reserveCapacity(resolved.count)
-        var nextNumber = startNumber
-        // Re-read after renumber so free-slot search sees final names.
-        var occupied = try occupiedSlotNumbers(on: rootURL)
+        // Packed list is 1…n; append at n+1, reusing empty leftover folders (a high-water
+        // `max+1` used to skip holes — delete 283+284, add, land on 284 with 283 empty).
+        // Still skip on-disk slots that actually contain a disc, so a stale/empty `games`
+        // snapshot cannot clobber the menu at 01.
+        var nextNumber = updatedExisting.count + 1
+        var slotFolders = try numberedSlotFoldersByNumber(on: rootURL)
+        var occupied = Set(slotFolders.keys)
 
         /// One on-card slot ready for hash + byte-weighted copy.
         struct PreparedSlot {
@@ -617,11 +713,12 @@ enum CardOperations: Sendable {
         var prepared: [PreparedSlot] = []
         prepared.reserveCapacity(resolved.count)
         for source in resolved {
-            while occupied.contains(nextNumber) {
-                nextNumber += 1
-            }
-            let number = nextNumber
-            nextNumber += 1
+            let number = try claimFreeSlotNumber(
+                startingAt: &nextNumber,
+                rootURL: rootURL,
+                occupied: &occupied,
+                slotFolders: &slotFolders
+            )
             let folderName = FolderNumbering.format(number)
             var imageName = source.imageFileName
             let preferred = preferredImageName(for: source.imageFileName)
@@ -638,6 +735,7 @@ enum CardOperations: Sendable {
             }
             try fm.createDirectory(at: dest, withIntermediateDirectories: true)
             occupied.insert(number)
+            slotFolders[number, default: []].append(dest)
             try provisionalName.write(
                 to: dest.appendingPathComponent(nameFile),
                 atomically: true,
@@ -1612,20 +1710,125 @@ enum CardOperations: Sendable {
 
     /// Slot numbers that already have a folder on the card root (e.g. `001`, `02`).
     nonisolated static func occupiedSlotNumbers(on rootURL: URL) throws -> Set<Int> {
+        Set(try numberedSlotFoldersByNumber(on: rootURL).keys)
+    }
+
+    /// Every numbered root folder, grouped by slot. Duplicate widths (`01` and `001`)
+    /// both appear under the same number.
+    nonisolated static func numberedSlotFoldersByNumber(on rootURL: URL) throws -> [Int: [URL]] {
         let children = try FileManager.default.contentsOfDirectory(
             at: rootURL,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         )
-        var slots = Set<Int>()
+        var slots: [Int: [URL]] = [:]
         for child in children {
             let isDir = (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
             guard isDir else { continue }
-            if let n = FolderNumbering.parse(child.lastPathComponent) {
-                slots.insert(n)
-            }
+            guard let n = FolderNumbering.parse(child.lastPathComponent) else { continue }
+            slots[n, default: []].append(child)
         }
         return slots
+    }
+
+    /// True when the folder has no disc image — leftover empty/name.txt-only slot after
+    /// a failed import or incomplete delete. Safe to replace on add.
+    nonisolated static func slotFolderIsReusable(_ url: URL) -> Bool {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []
+        let visible = names.filter { !$0.hasPrefix(".") }
+        return detectImageName(in: visible) == nil
+    }
+
+    /// Folders parked in `.katana-tmp/<uuid>` by an interrupted two-phase renumber.
+    /// Moves each back onto the card at the lowest free slot. Returns how many were restored.
+    @discardableResult
+    nonisolated static func recoverParkedRenumberFolders(rootURL: URL) throws -> Int {
+        let fm = FileManager.default
+        let tmp = rootURL.appendingPathComponent(tmpFolderName, isDirectory: true)
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: tmp.path, isDirectory: &isDir), isDir.boolValue else {
+            return 0
+        }
+        let children = try fm.contentsOfDirectory(
+            at: tmp,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )
+        let parked = children.filter { url in
+            let dir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            return dir && !slotFolderIsReusable(url)
+        }
+        guard !parked.isEmpty else {
+            if let leftover = try? fm.contentsOfDirectory(atPath: tmp.path), leftover.isEmpty {
+                try? fm.removeItem(at: tmp)
+            }
+            return 0
+        }
+
+        var occupied = try occupiedSlotNumbers(on: rootURL)
+        var slotFolders = try numberedSlotFoldersByNumber(on: rootURL)
+        var next = 1
+        var restored = 0
+        for src in parked.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            let number = try claimFreeSlotNumber(
+                startingAt: &next,
+                rootURL: rootURL,
+                occupied: &occupied,
+                slotFolders: &slotFolders
+            )
+            let dest = rootURL.appendingPathComponent(
+                FolderNumbering.format(number),
+                isDirectory: true
+            )
+            if fm.fileExists(atPath: dest.path) {
+                try fm.removeItem(at: dest)
+            }
+            try fm.moveItem(at: src, to: dest)
+            occupied.insert(number)
+            restored += 1
+        }
+        if let leftover = try? fm.contentsOfDirectory(atPath: tmp.path), leftover.isEmpty {
+            try? fm.removeItem(at: tmp)
+        }
+        return restored
+    }
+
+    /// Lowest slot ≥ `startingAt` that is free or only has leftover non-disc files.
+    /// Reusable stray folders are removed so the new game can take that number.
+    nonisolated static func claimFreeSlotNumber(
+        startingAt nextNumber: inout Int,
+        rootURL: URL,
+        occupied: inout Set<Int>,
+        slotFolders: inout [Int: [URL]]
+    ) throws -> Int {
+        let fm = FileManager.default
+        while true {
+            let dest = rootURL.appendingPathComponent(
+                FolderNumbering.format(nextNumber),
+                isDirectory: true
+            )
+            var candidates = slotFolders[nextNumber] ?? []
+            if fm.fileExists(atPath: dest.path),
+               !candidates.contains(where: { $0.standardizedFileURL == dest.standardizedFileURL }) {
+                candidates.append(dest)
+            }
+
+            if !candidates.isEmpty {
+                if candidates.contains(where: { !slotFolderIsReusable($0) }) {
+                    nextNumber += 1
+                    continue
+                }
+                for url in candidates where fm.fileExists(atPath: url.path) {
+                    try fm.removeItem(at: url)
+                }
+                slotFolders.removeValue(forKey: nextNumber)
+                occupied.remove(nextNumber)
+            }
+
+            let claimed = nextNumber
+            nextNumber += 1
+            return claimed
+        }
     }
 
     /// Renumber folders. Returns final number+path for every id in `desiredNumbers`.
@@ -1660,9 +1863,15 @@ enum CardOperations: Sendable {
             planned.append(Planned(id: id, from: from, number: number, finalName: finalName))
         }
 
+        // Only folders whose *slot number* changes. Padding (`001` vs `01`) is not
+        // a reorder — rewriting 01–99 on a 100+ card as a side effect of swapping
+        // 282/283 is how a single Move Down can park the whole card in `.katana-tmp`.
         let needsMove = planned.filter {
-            $0.from.lastPathComponent != $0.finalName
-                || $0.from.deletingLastPathComponent().standardizedFileURL != rootURL.standardizedFileURL
+            let fromNumber = FolderNumbering.parse($0.from.lastPathComponent)
+            let numberChanged = fromNumber != $0.number
+            let offRoot = $0.from.deletingLastPathComponent().standardizedFileURL
+                != rootURL.standardizedFileURL
+            return numberChanged || offRoot
         }
 
         if needsMove.isEmpty {
@@ -1746,17 +1955,28 @@ enum CardOperations: Sendable {
                 }
             }
 
-            for (index, m) in phaseMoves.enumerated() {
-                let dest = rootURL.appendingPathComponent(m.finalName, isDirectory: true)
-                if fm.fileExists(atPath: dest.path) {
-                    throw OperationError.destinationExists(dest.lastPathComponent)
+            do {
+                for (index, m) in phaseMoves.enumerated() {
+                    let dest = rootURL.appendingPathComponent(m.finalName, isDirectory: true)
+                    if fm.fileExists(atPath: dest.path) {
+                        throw OperationError.destinationExists(dest.lastPathComponent)
+                    }
+                    try fm.moveItem(at: m.phaseA, to: dest)
+                    pathByID[m.id] = dest.path
+                    fractionProgress?(0.5 + 0.5 * Double(index + 1) / Double(max(phaseMoves.count, 1)))
+                    if index % 10 == 0 || index == phaseMoves.count - 1 {
+                        progress?("Placing \(index + 1)/\(phaseMoves.count)…")
+                    }
                 }
-                try fm.moveItem(at: m.phaseA, to: dest)
-                pathByID[m.id] = dest.path
-                fractionProgress?(0.5 + 0.5 * Double(index + 1) / Double(max(phaseMoves.count, 1)))
-                if index % 10 == 0 || index == phaseMoves.count - 1 {
-                    progress?("Placing \(index + 1)/\(phaseMoves.count)…")
+            } catch {
+                // Put anything still in tmp back so a failed reorder doesn't eat the card.
+                for m in phaseMoves {
+                    guard fm.fileExists(atPath: m.phaseA.path) else { continue }
+                    if !fm.fileExists(atPath: m.from.path) {
+                        try? fm.moveItem(at: m.phaseA, to: m.from)
+                    }
                 }
+                throw error
             }
 
             if let contents = try? fm.contentsOfDirectory(atPath: tmpRoot.path), contents.isEmpty {

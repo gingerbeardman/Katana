@@ -44,32 +44,60 @@ enum MenuRebuildService: Sendable {
         let ordered = games.sorted { $0.number < $1.number }
         let kind = menuKind ?? detectMenuKind(games: ordered) ?? .gdMenu
 
-        // Fixed spans: the per-item header pass owns the bulk of the bar (a warm cache
-        // simply sweeps it fast), bake and install stay short tails.
-        // Headers 0.02…0.80 · bake 0.80…0.96 · install 0.96…1.0
-        let headerSpan = 0.78
-        let headerEnd = 0.02 + headerSpan
+        // Cold: headers own the bar (card I/O). Warm: skip the crawl — zip/DAT/bake/install
+        // are the real work (ateam openMenu is a 5 MB pack, BOX.DAT lives on the card).
+        let needsDiskHeaders = ordered.contains {
+            $0.ipHeader == nil && !$0.isMenu && $0.number != 1
+        }
+        let headerEnd = needsDiskHeaders ? 0.80 : 0.06
+        let assetsEnd = needsDiskHeaders ? 0.84 : 0.20
         let bakeEnd = 0.96
 
-        progress?("Reading game headers…", 0.02)
-        let built = MenuListGenerator.itemsWithHeaderFills(for: ordered, menuKind: kind) { done, total, fromCard in
-            let t = max(total, 1)
-            // Report often enough for a smooth bar without flooding the UI.
-            if done == 0 || done == total || done % 10 == 0 || t < 40 {
-                let frac = 0.02 + headerSpan * (Double(done) / Double(t))
-                let source = fromCard == 0
-                    ? "all cached"
-                    : "\(done - fromCard) cached · \(fromCard) from card"
-                progress?("Reading game headers… \(done)/\(total) (\(source))", frac)
+        let built: (items: [MenuListGenerator.Item], filledHeaders: [MenuListGenerator.HeaderFill])
+        if needsDiskHeaders {
+            progress?("Reading game headers…", 0.02)
+            built = MenuListGenerator.itemsWithHeaderFills(for: ordered, menuKind: kind) {
+                done, total, fromCard in
+                let t = max(total, 1)
+                if done == 0 || done == total || done % 10 == 0 || t < 40 {
+                    let frac = 0.02 + (headerEnd - 0.02) * (Double(done) / Double(t))
+                    let source = fromCard == 0
+                        ? "all cached"
+                        : "\(done - fromCard) cached · \(fromCard) from card"
+                    progress?("Reading game headers… \(done)/\(total) (\(source))", frac)
+                }
             }
+        } else {
+            progress?("Writing \(kind.displayName) list…", 0.02)
+            built = MenuListGenerator.itemsWithHeaderFills(
+                for: ordered,
+                menuKind: kind,
+                progress: nil
+            )
         }
         let items = built.items
 
         // Keys must match on-disk folders: `01`…`99`, then `100`… (GCM).
         let listText = MenuListGenerator.makeList(kind: kind, items: items)
-        progress?("Building \(kind.displayName) image…", headerEnd)
+        progress?("Preparing \(kind.displayName) assets…", headerEnd)
 
         let assets = try assetsURL(for: kind)
+        var preservedDats: [String: Data] = [:]
+        if kind.isOpenMenuFamily,
+           let menu = ordered.first(where: { $0.number == 1 || $0.isMenu })
+        {
+            progress?("Reading artwork from menu…", (headerEnd + assetsEnd) / 2)
+            preservedDats = MenuArtworkDat.extract(
+                fromMenuFolder: menu.folderURL,
+                imageFileName: menu.imageFileName
+            )
+            if !preservedDats.isEmpty {
+                progress?(
+                    "Keeping \(preservedDats.count) artwork DAT\(preservedDats.count == 1 ? "" : "s")…",
+                    assetsEnd
+                )
+            }
+        }
 
         let tempRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("katana-menu-\(UUID().uuidString)", isDirectory: true)
@@ -88,8 +116,9 @@ enum MenuRebuildService: Sendable {
                     assetsRoot: assets,
                     outDir: outDir,
                     truncate: true,
+                    extraMenuDataFiles: preservedDats,
                     progress: { message, bakeFraction in
-                        let overall = headerEnd + (bakeEnd - headerEnd) * min(1, max(0, bakeFraction))
+                        let overall = assetsEnd + (bakeEnd - assetsEnd) * min(1, max(0, bakeFraction))
                         progress?(message, overall)
                     }
                 )
@@ -133,35 +162,47 @@ enum MenuRebuildService: Sendable {
     // MARK: - Detect
 
     /// Infer which menu system the card uses from slot 01 name and/or IP.BIN.
+    /// Stock and Extended share the `openMenu` name — folder sidecars promote to Extended.
     nonisolated static func detectMenuKind(games: [GameEntry]) -> MenuKind? {
         let menu = games.first(where: { $0.number == 1 || $0.isMenu }) ?? games.first
         guard let menu else { return nil }
 
+        var kind: MenuKind?
         if let k = MenuKind.detect(fromName: menu.name) {
             LaunchTrace.mark("detectMenuKind: from name \"\(menu.name)\" → \(k.rawValue)")
-            return k
+            kind = k
         }
-        let serialStart = CFAbsoluteTimeGetCurrent()
-        if let serial = try? String(
-            contentsOf: menu.folderURL.appendingPathComponent("serial.txt"),
-            encoding: .utf8
-        ), let k = MenuKind.detect(fromName: serial) {
-            LaunchTrace.mark(
-                "detectMenuKind: from serial.txt (\(Int((CFAbsoluteTimeGetCurrent() - serialStart) * 1000))ms) → \(k.rawValue)"
-            )
-            return k
+        if kind == nil {
+            let serialStart = CFAbsoluteTimeGetCurrent()
+            if let serial = try? String(
+                contentsOf: menu.folderURL.appendingPathComponent("serial.txt"),
+                encoding: .utf8
+            ), let k = MenuKind.detect(fromName: serial) {
+                LaunchTrace.mark(
+                    "detectMenuKind: from serial.txt (\(Int((CFAbsoluteTimeGetCurrent() - serialStart) * 1000))ms) → \(k.rawValue)"
+                )
+                kind = k
+            }
         }
-        let ipStart = CFAbsoluteTimeGetCurrent()
-        if let ip = IpBinReader.read(from: menu), let k = MenuKind.detect(fromIP: ip) {
-            LaunchTrace.mark(
-                "detectMenuKind: from IP.BIN (\(Int((CFAbsoluteTimeGetCurrent() - ipStart) * 1000))ms) → \(k.rawValue)"
-            )
-            return k
+        if kind == nil {
+            let ipStart = CFAbsoluteTimeGetCurrent()
+            if let ip = IpBinReader.read(from: menu), let k = MenuKind.detect(fromIP: ip) {
+                LaunchTrace.mark(
+                    "detectMenuKind: from IP.BIN (\(Int((CFAbsoluteTimeGetCurrent() - ipStart) * 1000))ms) → \(k.rawValue)"
+                )
+                kind = k
+            } else {
+                LaunchTrace.mark(
+                    "detectMenuKind: no match (IP.BIN attempt \(Int((CFAbsoluteTimeGetCurrent() - ipStart) * 1000))ms)"
+                )
+            }
         }
-        LaunchTrace.mark(
-            "detectMenuKind: no match (IP.BIN attempt \(Int((CFAbsoluteTimeGetCurrent() - ipStart) * 1000))ms)"
-        )
-        return nil
+        guard var kind else { return nil }
+        if kind.isOpenMenuFamily, games.contains(where: \.hasOpenMenuFolderMeta) {
+            kind = .openMenuExtended
+            LaunchTrace.mark("detectMenuKind: folder/type sidecars → openMenuExtended")
+        }
+        return kind
     }
 
     // MARK: - Bundle resources
@@ -172,8 +213,8 @@ enum MenuRebuildService: Sendable {
     /// doesn’t flatten nested track names. Nested folders and flat files are fallbacks.
     nonisolated static func assetsURL(for kind: MenuKind) throws -> URL {
         let fm = FileManager.default
-        let folderName = kind == .gdMenu ? "gdMenu" : "openMenu"
-        let zipName = kind == .gdMenu ? "gdMenu" : "openMenu"
+        let folderName = kind.isOpenMenuFamily ? "openMenu" : "gdMenu"
+        let zipName = folderName
 
         // 1) Nested source-tree layout (if somehow preserved).
         let nestedCandidates: [URL?] = [
@@ -207,6 +248,15 @@ enum MenuRebuildService: Sendable {
         let fm = FileManager.default
         let root = fm.temporaryDirectory
             .appendingPathComponent("katana-menu-assets-\(kind.rawValue)", isDirectory: true)
+        let stampURL = root.appendingPathComponent(".katana-zip-stamp")
+        let vals = try zipURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let stamp = "\(vals.fileSize ?? -1)-\(Int((vals.contentModificationDate ?? .distantPast).timeIntervalSince1970))"
+        if fm.fileExists(atPath: root.appendingPathComponent("IP.BIN").path),
+           let existing = try? String(contentsOf: stampURL, encoding: .utf8),
+           existing == stamp
+        {
+            return root
+        }
         if fm.fileExists(atPath: root.path) {
             try? fm.removeItem(at: root)
         }
@@ -222,6 +272,7 @@ enum MenuRebuildService: Sendable {
         guard fm.fileExists(atPath: root.appendingPathComponent("IP.BIN").path) else {
             throw RebuildError.missingAssets
         }
+        try stamp.write(to: stampURL, atomically: true, encoding: .utf8)
         return root
     }
 
@@ -349,6 +400,10 @@ enum MenuRebuildService: Sendable {
         let keepNames: Set<String> = [
             "name.txt", "serial.txt", "katana.sha",
             "info.txt", "0gdtex.pvr", "0GDTEX.PVR",
+            "folder.txt", "type.txt",
+            "folder_alt1.txt", "folder_alt2.txt", "folder_alt3.txt",
+            "folder_alt4.txt", "folder_alt5.txt",
+            "disc.txt", "region.txt", "vga.txt", "version.txt", "date.txt",
         ]
         let imageExts: Set<String> = ["gdi", "iso", "raw", "bin", "cdi", "img", "ccd", "sub", "mds", "mdf"]
 
