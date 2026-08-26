@@ -40,6 +40,12 @@ struct GameListView: View {
         // Bottom insets on NavigationSplitView detail + Table were clipped unless
         // the window was extremely tall — users never saw the bar.
         VStack(spacing: 0) {
+            if let err = state.lastError {
+                errorBar(err)
+            }
+            if state.availableUpdate != nil {
+                updateBar
+            }
             if state.isArranging {
                 arrangeBar
             } else if state.volume != nil, state.menuNeedsRebuild, !state.isRebuildingMenu {
@@ -346,20 +352,87 @@ struct GameListView: View {
         state.acceptReorderDrop(sourceID: source.id, before: target)
     }
 
+    /// Window-chrome overlay on NavigationSplitView sat in the titlebar; these
+    /// strips are table siblings (same as Arrange / Rebuild) so they sit under
+    /// the toolbar and push the list down.
+    private func errorBar(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.yellow)
+                .imageScale(.medium)
+                .padding(.top, 1)
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.primary)
+                .lineLimit(6)
+                .multilineTextAlignment(.leading)
+                .textSelection(.enabled)
+                .numericText()
+            Spacer(minLength: 8)
+            Button("Dismiss") { state.lastError = nil }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            Rectangle().fill(.bar)
+            Rectangle().fill(Color.yellow.opacity(0.16))
+        }
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    private var updateBar: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "arrow.down.circle.fill")
+                .foregroundStyle(.tint)
+                .imageScale(.medium)
+            if let update = state.availableUpdate {
+                (Text("Katana \(update.version) is available")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    + Text(" — you have \(UpdateChecker.currentVersion)")
+                    .font(.callout)
+                    .foregroundStyle(.secondary))
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+            }
+            Spacer(minLength: 8)
+            Button("View Release") {
+                state.openAvailableUpdate()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            Button("Dismiss") {
+                state.dismissAvailableUpdate()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background {
+            Rectangle().fill(.bar)
+            Rectangle().fill(Color.accentColor.opacity(0.10))
+        }
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
     private var arrangeBar: some View {
         HStack(alignment: .center, spacing: 10) {
             Image(systemName: "line.3.horizontal")
                 .foregroundStyle(.secondary)
                 .imageScale(.medium)
-            Text("Drag rows to rearrange")
+            (Text("Drag rows to rearrange")
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(.primary)
-                .lineLimit(1)
-            Text("— drag selected rows to a new position, then Apply")
+                + Text(" — drag selected rows to a new position, then Apply")
                 .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.85)
+                .foregroundStyle(.secondary))
+            .lineLimit(1)
+            .minimumScaleFactor(0.85)
             Spacer(minLength: 8)
             Button("Cancel") {
                 state.cancelArrange()
@@ -394,15 +467,14 @@ struct GameListView: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
                 .imageScale(.medium)
-            Text("\(state.menuKind.displayName) list is out of date")
+            (Text("\(state.menuKind.displayName) list is out of date")
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(.primary)
-                .lineLimit(1)
-            Text("— rebuild so the menu matches the card")
+                + Text(" — rebuild so the menu matches the card")
                 .font(.callout)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.85)
+                .foregroundStyle(.secondary))
+            .lineLimit(1)
+            .minimumScaleFactor(0.85)
             Spacer(minLength: 8)
             Button("Rebuild…") {
                 state.rebuildMenuList()

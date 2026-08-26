@@ -202,61 +202,22 @@ struct ContentView: View {
             // (that reflowed the whole window content up under the titlebar).
             .animation(.snappy, value: state.flashMessage)
         }
-        .overlay(alignment: .top) {
-            VStack(spacing: 8) {
-                if let err = state.lastError {
-                    HStack(alignment: .top) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .padding(.top, 2)
-                        Text(err)
-                            .lineLimit(6)
-                            .multilineTextAlignment(.leading)
-                            .textSelection(.enabled)
-                            .numericText()
-                        Spacer(minLength: 8)
-                        Button("Dismiss") { state.lastError = nil }
-                            .buttonStyle(.borderless)
-                    }
-                    .font(.callout)
-                    .padding(10)
-                    .background(.yellow.opacity(0.9), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                }
-
-                if let update = state.availableUpdate {
-                    HStack(spacing: 10) {
-                        Image(systemName: "arrow.down.circle.fill")
-                            .foregroundStyle(.tint)
-                        Text("Katana \(update.version) is available")
-                            .font(.callout.weight(.medium))
-                        Text("(you have \(UpdateChecker.currentVersion))")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                        Spacer(minLength: 8)
-                        Button("View Release") {
-                            state.openAvailableUpdate()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                        Button("Dismiss") {
-                            state.dismissAvailableUpdate()
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                    .padding(10)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                }
-            }
-            .padding()
-            .animation(.snappy, value: state.lastError)
-            .animation(.snappy, value: state.availableUpdate)
-        }
     }
 
 }
 
 #Preview {
     ContentView(state: AppState())
+        .frame(width: 1000, height: 640)
+}
+
+#Preview("Update available") {
+    let state = AppState()
+    state.availableUpdate = UpdateChecker.AvailableUpdate(
+        version: "4.0",
+        htmlURL: URL(string: "https://github.com/gingerbeardman/Katana/releases")!,
+        publishedAt: nil
+    )
+    return ContentView(state: state)
         .frame(width: 1000, height: 640)
 }

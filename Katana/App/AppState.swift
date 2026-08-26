@@ -3703,6 +3703,19 @@ final class AppState {
     }
 
     private func performUpdateCheck(userInitiated: Bool) async {
+        #if DEBUG
+        if let fake = ProcessInfo.processInfo.environment["KATANA_FAKE_UPDATE"],
+           !fake.isEmpty,
+           let url = URL(string: "https://github.com/gingerbeardman/Katana/releases/latest")
+        {
+            availableUpdate = UpdateChecker.AvailableUpdate(
+                version: fake,
+                htmlURL: url,
+                publishedAt: nil
+            )
+            return
+        }
+        #endif
         do {
             let result = try await UpdateChecker.check()
             if result.isNewer {
