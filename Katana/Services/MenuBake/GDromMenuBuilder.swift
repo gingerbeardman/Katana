@@ -335,6 +335,26 @@ nonisolated struct GDromMenuBuilder: Sendable {
         return name
     }
 
+    /// ISO path of `url` relative to `base`.
+    ///
+    /// `contentsOfDirectory` returns symlink-resolved paths (`/private/var/...`)
+    /// while `temporaryDirectory` stays `/var/...`. Stripping with `dropFirst` on
+    /// the raw strings leaves a junk prefix such as `817/data/BLEEM.BIN`, so every
+    /// file except the boot binary lands in that folder.
+    private static func isoRelativePath(of url: URL, base: URL) -> String {
+        let basePath = base.resolvingSymlinksInPath().path
+        let urlPath = url.resolvingSymlinksInPath().path
+        let relative: String
+        if urlPath == basePath {
+            relative = ""
+        } else if urlPath.hasPrefix(basePath + "/") {
+            relative = String(urlPath.dropFirst(basePath.count + 1))
+        } else {
+            relative = url.lastPathComponent
+        }
+        return relative.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
     private func populateFromFolder(
         builder: Iso9660Builder,
         directory: URL,
@@ -348,14 +368,10 @@ nonisolated struct GDromMenuBuilder: Sendable {
             options: [.skipsHiddenFiles]
         )
 
-        let localDirPath = String(directory.path.dropFirst(basePath.path.count))
-        if localDirPath.count > 1 {
-            let isoPath = localDirPath
-                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-                .replacingOccurrences(of: "/", with: "\\")
-            if !isoPath.isEmpty {
-                builder.addDirectory(isoPath)
-            }
+        let localDirPath = Self.isoRelativePath(of: directory, base: basePath)
+        if !localDirPath.isEmpty {
+            let isoPath = localDirPath.replacingOccurrences(of: "/", with: "\\")
+            builder.addDirectory(isoPath)
         }
 
         var bootFile: URL?
@@ -377,8 +393,7 @@ nonisolated struct GDromMenuBuilder: Sendable {
                 bootFile = file
                 continue
             }
-            let rel = String(file.path.dropFirst(basePath.path.count))
-                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let rel = Self.isoRelativePath(of: file, base: basePath)
             try builder.addFile(rel, sourceURL: file)
         }
 

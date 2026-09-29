@@ -60,7 +60,7 @@ Pipeline: archive → Developer ID export → notarize/staple app → HFS-compre
 | Resource | Purpose |
 | --- | --- |
 | `MenuAssets/gdMenu.zip` | Stock GDmenu assets for slot-01 rebuild |
-| `MenuAssets/openMenu.zip` | openMenu **1.6.3-ateam** assets for slot-01 rebuild (virtual folders, Folders themes) |
+| `MenuAssets/openMenu.zip` | openMenu **1.7.0-ateam** assets for slot-01 rebuild (virtual folders, Folders themes) |
 | `GameDB/dreamcast-titles.json` | Serial → pretty title map (scan / auto-rename) |
 
 ## Architecture notes
@@ -114,7 +114,7 @@ As also credited by GDMENUCardManager:
 
 - **GDmenu** by neuroacid  
 - **[openMenu](https://github.com/mrneo240/openmenu/)** by mrneo240  
-- **[openMenu Virtual Folder Bundle](https://github.com/DerekPascarella/openMenu-Virtual-Folder-Bundle)** by Derek Pascarella (ateam) — bundled openMenu bake target (1.6.3-ateam)  
+- **[openMenu Virtual Folder Bundle](https://github.com/DerekPascarella/openMenu-Virtual-Folder-Bundle)** by Derek Pascarella (ateam) — bundled openMenu bake target (1.7.0-ateam)  
 - openMenu DAT resources: [imagedb](https://github.com/mrneo240/openMenu_imagedb), [metadb](https://github.com/mrneo240/openMenu_metadb)  
 - Special thanks to **megavolt85** and the wider Dreamcast scene  
 

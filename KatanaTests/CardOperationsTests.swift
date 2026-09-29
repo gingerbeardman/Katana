@@ -170,13 +170,13 @@ struct CardOperationsTests {
         #expect(n3 == "A")
     }
 
-    @Test func reorderDoesNotRewriteUnchangedPaddedFolders() throws {
+    @Test func reorderNormalizesPaddedFoldersToSpecWidth() throws {
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent("katana-pad-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: root) }
 
-        // 3-digit names under 100, plus 100 — a 2-slot swap must not park 001–099.
+        // GDEMU names are 01–99, then 100. Extra zeros are not a second valid width.
         for n in 1...100 {
             let folder = root.appendingPathComponent(String(format: "%03d", n), isDirectory: true)
             try fm.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -189,14 +189,17 @@ struct CardOperationsTests {
         order.swapAt(98, 99)
         try CardOperations.applyOrder(orderedIDs: order, games: games, rootURL: root)
 
-        #expect(fm.fileExists(atPath: root.appendingPathComponent("001").path))
-        let g1 = try String(contentsOf: root.appendingPathComponent("001/name.txt"), encoding: .utf8)
-        #expect(g1 == "G1")
-        #expect(!fm.fileExists(atPath: root.appendingPathComponent(".katana-tmp").path))
+        let g1 = try String(contentsOf: root.appendingPathComponent("01/name.txt"), encoding: .utf8)
+        let g50 = try String(contentsOf: root.appendingPathComponent("50/name.txt"), encoding: .utf8)
         let n99 = try String(contentsOf: root.appendingPathComponent("99/name.txt"), encoding: .utf8)
         let n100 = try String(contentsOf: root.appendingPathComponent("100/name.txt"), encoding: .utf8)
+        #expect(g1 == "G1")
+        #expect(g50 == "G50")
         #expect(n99 == "G100")
         #expect(n100 == "G99")
+        #expect(!fm.fileExists(atPath: root.appendingPathComponent("001").path))
+        #expect(!fm.fileExists(atPath: root.appendingPathComponent("099").path))
+        #expect(!fm.fileExists(atPath: root.appendingPathComponent(".katana-tmp").path))
     }
 
     @Test func recoverParkedRenumberFoldersRestoresToFreeSlots() throws {

@@ -10,15 +10,36 @@ enum GdtexLoader: Sendable {
         var status: String
     }
 
+    /// Shown when neither a per-game texture nor a menu `BOX.DAT` entry exists.
+    nonisolated static let missingCoverStatus = "No cover"
+
     /// Resolve cover art for a game entry. Safe off the main actor.
-    nonisolated static func load(for game: GameEntry) -> Result {
-        load(folderURL: game.folderURL, imageFileName: game.imageFileName, format: game.format)
+    ///
+    /// `0GDTEX.PVR` on the game wins. Otherwise the slot-01 openMenu `BOX.DAT` is
+    /// searched by serial — that is the art openMenu shows, and most CDI games have no texture of their own.
+    nonisolated static func load(
+        for game: GameEntry,
+        menuFolder: URL? = nil,
+        menuImageFileName: String? = nil,
+        serials: [String] = []
+    ) -> Result {
+        load(
+            folderURL: game.folderURL,
+            imageFileName: game.imageFileName,
+            format: game.format,
+            menuFolder: menuFolder,
+            menuImageFileName: menuImageFileName,
+            serials: serials
+        )
     }
 
     nonisolated static func load(
         folderURL: URL,
         imageFileName: String,
-        format: DiscFormat
+        format: DiscFormat,
+        menuFolder: URL? = nil,
+        menuImageFileName: String? = nil,
+        serials: [String] = []
     ) -> Result {
         // 1) Loose file next to the disc image (common after Easy 0GDTEX tools).
         if let data = readLoosePVR(in: folderURL) {
@@ -32,12 +53,19 @@ enum GdtexLoader: Sendable {
             }
         }
 
-        // 3) Single-file images: not supported without a full image library.
-        if format == .cdi || format == .ccd {
-            return Result(image: nil, status: "No 0GDTEX.PVR in folder")
+        // 3) openMenu box database on slot 01, keyed by serial.
+        if let menuFolder,
+           let box = OpenMenuBoxArt.imageData(
+               matching: serials,
+               menuFolder: menuFolder,
+               imageFileName: menuImageFileName ?? "disc.gdi"
+           ),
+           let image = try? PvrDecoder.decodeImage(from: box)
+        {
+            return Result(image: image, status: "")
         }
 
-        return Result(image: nil, status: "File not found")
+        return Result(image: nil, status: missingCoverStatus)
     }
 
     // MARK: -

@@ -5,7 +5,6 @@ dist/
 **/xcuserdata/
 *.xcuserstate
 DerivedData/
-CHANGELOG.md
 
 # IDE
 .nova/

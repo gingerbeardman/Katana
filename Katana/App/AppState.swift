@@ -125,6 +125,8 @@ final class AppState {
     var trashSummary: CardOperations.TrashSummary = .empty
     /// Transient status toast — auto-clears; never a modal.
     var flashMessage: String?
+    /// Bumped after a loose cover is written or removed so the inspector reloads it.
+    var coverRevision = 0
     var lastError: String?
     /// Non-nil when a newer GitHub release is available (banner until dismissed).
     var availableUpdate: UpdateChecker.AvailableUpdate?
@@ -594,7 +596,23 @@ final class AppState {
         volume != nil && !isBusy && volume?.isReadOnly != true && !isArranging
     }
 
-    var canDeleteSelection: Bool { !selection.isEmpty && !isBusy && !isArranging }
+    /// Games in the current selection. Slot 01 (the menu) is never included.
+    var deletableSelectionCount: Int {
+        games.reduce(into: 0) { count, game in
+            if selection.contains(game.id), !game.isMenu, game.number != 1 {
+                count += 1
+            }
+        }
+    }
+
+    /// Slot 01 is the menu. Delete, rename, and cover apply to games only.
+    var canDeleteSelection: Bool {
+        !isBusy && !isArranging && deletableSelectionCount > 0
+    }
+
+    var canRenameSelection: Bool {
+        !isBusy && games.contains { selection.contains($0.id) && !$0.isMenu && $0.number != 1 }
+    }
 
     var canArrange: Bool {
         volume != nil && !isBusy && volume?.isReadOnly != true && games.count > 1
@@ -729,7 +747,10 @@ final class AppState {
     /// until the hosting cell is in a window — an extra `async` delay here only made
     /// the first rename of a session race the table’s own focus/selection settle.
     func beginInlineRename(_ id: GameEntry.ID) {
-        guard !isBusy, !isScanning, games.contains(where: { $0.id == id }) else { return }
+        guard !isBusy, !isScanning,
+              let game = games.first(where: { $0.id == id }),
+              !game.isMenu, game.number != 1
+        else { return }
         selection = [id]
         // If already renaming this row, leave the field alone.
         if renamingGameID == id { return }
@@ -1340,26 +1361,12 @@ final class AppState {
             // Assume on-card menu matches the scanned list until the user edits it.
             captureBakedMenuFingerprint()
             menuContentDirty = false
-            // Slot-01 name is enough to know GDmenu vs openMenu (Extended is refined
-            // from folder sidecars / persisted baked kind). Don't wait for IP.BIN or a
-            // deferred task, or the picker vs default baked (.gdMenu) looks stale.
-            if let menu = result.entries.first(where: { $0.number == 1 || $0.isMenu }),
-               let fromName = MenuKind.detect(fromName: menu.name)
-            {
-                bakedMenuKind = fromName
-            }
-            let uuid = result.volume.volumeUUID
-            if let baked = try? await VolumeStore.shared.bakedMenuKind(for: uuid) {
-                bakedMenuKind = baked
-            }
-            if let saved = try? await VolumeStore.shared.menuKind(for: uuid) {
-                menuKind = saved
-            } else {
-                menuKind = bakedMenuKind
-            }
+            // Detect before the list is interactive so the picker does not appear as
+            // the previous card's type (or a migrated Extended) and then change.
+            await applyDetectedMenuKind(for: result.volume.volumeUUID, games: result.entries)
 
-            // List is interactive as soon as rows are assigned — do not block on menu
-            // detection (IP.BIN), trash summary, or bookmark refresh.
+            // Menu type is already resolved. Trash summary and bookmark refresh stay
+            // off this path so the list can become interactive.
             scanProgress = nil
             isScanning = false
             refreshStatus()
@@ -1383,9 +1390,6 @@ final class AppState {
                 }
                 if let freshBookmark {
                     await MainActor.run { self.bookmarkData = freshBookmark }
-                }
-                await LaunchTrace.measureAsync("resolveMenuKind (deferred)") {
-                    await self.resolveMenuKind(for: rememberVolume.volumeUUID, games: result.entries)
                 }
                 await self.loadCachedHashRate(for: rememberVolume.volumeUUID)
                 if needsNotDup {
@@ -1571,12 +1575,13 @@ final class AppState {
 
     /// Write current entries back into the volume cache so the next open is fully warm.
     /// Called after enrichment completes and after every card mutation (via
-    /// `persistCacheAfterMutation`) — the saved entries carry IP headers, sizes, and hashes,
-    /// each validated on the next scan by its folder fingerprint (image size + mod time).
+    /// `persistCacheAfterMutation`) — the saved entries carry IP headers, sizes, and hashes.
+    /// A probed folder whose image or `serial.txt` changed drops the previous IP header
+    /// instead of pairing the new fingerprint with the old disc.
     private func persistEnrichedCache(volumeUUID: String) {
         guard let volume, volume.volumeUUID == volumeUUID else { return }
         let entries = games
-        Task.detached(priority: .utility) {
+        Task.detached(priority: .utility) { [weak self] in
             // Merge against the stored cache instead of walking all folders on the card:
             // renames/renumbers don't change folder contents, so the stored on-disk
             // fingerprint stays valid with only its folderName updated — zero card I/O.
@@ -1593,6 +1598,7 @@ final class AppState {
 
             var cached: [CachedEntry] = []
             cached.reserveCapacity(entries.count)
+            var corrections: [StaleDiscCorrection] = []
             var probed = 0
             for game in entries {
                 // Entry carries its live detailsLoaded flag — mutation-time saves can include
@@ -1613,7 +1619,15 @@ final class AppState {
                     cached.append(CachedEntry(fingerprint: fp, entry: game))
                 } else if let fp = try? CardScanner.onDiskFingerprint(for: game.folderURL) {
                     probed += 1
-                    cached.append(CachedEntry(fingerprint: fp, entry: game))
+                    let (saved, correction) = FolderFingerprint.reconciling(
+                        game,
+                        stored: storedByID[game.id]?.fingerprint,
+                        probed: fp
+                    )
+                    if let correction {
+                        corrections.append(correction)
+                    }
+                    cached.append(CachedEntry(fingerprint: fp, entry: saved))
                 }
             }
             let cache = CardCache(
@@ -1628,6 +1642,47 @@ final class AppState {
             LaunchTrace.mark(
                 "cache save: \(cache.entries.count) entries, \(withHeaders) with IP headers, \(probed) probed on card"
             )
+            guard !corrections.isEmpty else { return }
+            await self?.applyDiscMetadataCorrections(corrections)
+        }
+    }
+
+    /// Slot 01's image is being replaced. Drop the cached IP header, and adopt
+    /// `serial.txt` when it names a different disc than the row.
+    private func expireReplacedDiscIdentity(_ game: inout GameEntry) {
+        game.ipHeader = nil
+        let url = game.folderURL.appendingPathComponent("serial.txt")
+        guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return }
+        let serial = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !serial.isEmpty else { return }
+        if FolderFingerprint.normalizedSerial(serial) != FolderFingerprint.normalizedSerial(game.serial) {
+            game.serial = serial
+        }
+    }
+
+    /// Drop IP fields the cache save already rejected. Skips a row whose serial or
+    /// header changed again while the probe was in flight.
+    private func applyDiscMetadataCorrections(_ corrections: [StaleDiscCorrection]) {
+        guard !corrections.isEmpty else { return }
+        var next = games
+        var changed = false
+        var selected = false
+        for correction in corrections {
+            guard let idx = next.firstIndex(where: { $0.id == correction.id }) else { continue }
+            guard next[idx].serial == correction.previousSerial,
+                  next[idx].ipHeader == correction.previousHeader
+            else { continue }
+            next[idx].serial = correction.serial
+            next[idx].ipHeader = correction.ipHeader
+            changed = true
+            if selection.contains(correction.id) {
+                selected = true
+            }
+        }
+        guard changed else { return }
+        games = next
+        if selected {
+            rebuildInspectorSnapshot()
         }
     }
 
@@ -1841,25 +1896,30 @@ final class AppState {
         }
     }
 
-    /// Prefer saved choice for picker; always set `bakedMenuKind` from what’s on the card.
-    /// Detection may open the menu image (IP.BIN) — always off the main actor.
-    private func resolveMenuKind(for volumeUUID: String, games: [GameEntry]) async {
+    /// Set the picker from slot 01. A saved choice wins only when the user has
+    /// switched type without rebuilding, or when the image could not be read and
+    /// the name is the ambiguous `openMenu`.
+    private func applyDetectedMenuKind(for volumeUUID: String, games: [GameEntry]) async {
         let snapshot = games
+        let saved = try? await VolumeStore.shared.menuKind(for: volumeUUID)
+        let savedBaked = try? await VolumeStore.shared.bakedMenuKind(for: volumeUUID)
         let detected = await LaunchTrace.measureAsync("detectMenuKind (detached)") {
-            await Task.detached(priority: .utility) {
-                MenuRebuildService.detectMenuKind(games: snapshot)
+            await Task.detached(priority: .userInitiated) {
+                MenuRebuildService.detectMenu(games: snapshot)
             }.value
         }
-        if let detected {
-            bakedMenuKind = detected
-            try? await VolumeStore.shared.setBakedMenuKind(detected, for: volumeUUID)
+        let choice = MenuKindOpenChoice.resolve(
+            detected: detected,
+            saved: saved,
+            savedBaked: savedBaked
+        )
+        bakedMenuKind = choice.bakedMenuKind
+        menuKind = choice.menuKind
+        if choice.persistBakedMenuKind {
+            try? await VolumeStore.shared.setBakedMenuKind(choice.bakedMenuKind, for: volumeUUID)
         }
-        if let saved = try? await VolumeStore.shared.menuKind(for: volumeUUID) {
-            menuKind = saved
-        } else {
-            menuKind = bakedMenuKind
-            // Remember detection so rebuild stays consistent even if name.txt is edited later.
-            try? await VolumeStore.shared.setMenuKind(menuKind, for: volumeUUID)
+        if choice.persistMenuKind {
+            try? await VolumeStore.shared.setMenuKind(choice.menuKind, for: volumeUUID)
         }
     }
 
@@ -2219,6 +2279,104 @@ final class AppState {
         }
     }
 
+    // MARK: - Custom cover
+
+    /// True when the single selected game has a loose `0GDTEX.PVR`.
+    var canRemoveCustomCover: Bool {
+        guard !isBusy, let game = selectedGame, !game.isMenu, game.number != 1 else { return false }
+        return LooseCover.exists(in: scopedFolder(for: game))
+    }
+
+    /// Pick a picture and save it as a loose `0GDTEX.PVR` next to the selected game.
+    func changeCoverImage() {
+        guard !isBusy, let game = selectedGame, !game.isMenu, game.number != 1 else { return }
+        if !requestCardWriteAccess() { return }
+
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        var types: [UTType] = [.image]
+        if let pvr = UTType(filenameExtension: "pvr") {
+            types.append(pvr)
+        }
+        panel.allowedContentTypes = types
+        panel.message = "A picture is scaled to a square and saved as 0GDTEX.PVR. A PVR file is copied as-is when Katana can read it."
+        panel.prompt = "Set Cover"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+
+        let data: Data
+        do {
+            data = try LooseCover.coverData(from: url)
+        } catch {
+            lastError = error.localizedDescription
+            statusText = "Couldn’t read cover"
+            return
+        }
+
+        do {
+            try replaceLooseCover(data, gameID: game.id, actionName: "Change Cover")
+        } catch {
+            if isPermissionError(error), requestCardWriteAccess() {
+                do {
+                    try replaceLooseCover(data, gameID: game.id, actionName: "Change Cover")
+                    return
+                } catch {
+                    lastError = error.localizedDescription
+                }
+            } else {
+                lastError = error.localizedDescription
+            }
+            statusText = "Couldn’t save cover"
+        }
+    }
+
+    /// Delete the loose `0GDTEX.PVR` for the selected game. Art inside the disc stays.
+    func removeCustomCover() {
+        guard !isBusy, let game = selectedGame, !game.isMenu, game.number != 1 else { return }
+        if !requestCardWriteAccess() { return }
+        do {
+            try replaceLooseCover(nil, gameID: game.id, actionName: "Remove Custom Cover")
+        } catch {
+            if isPermissionError(error), requestCardWriteAccess() {
+                do {
+                    try replaceLooseCover(nil, gameID: game.id, actionName: "Remove Custom Cover")
+                    return
+                } catch {
+                    lastError = error.localizedDescription
+                }
+            } else {
+                lastError = error.localizedDescription
+            }
+            statusText = "Couldn’t remove cover"
+        }
+    }
+
+    /// `data == nil` removes the loose file. Registers undo of the previous bytes.
+    private func replaceLooseCover(_ data: Data?, gameID: UUID, actionName: String) throws {
+        guard let game = games.first(where: { $0.id == gameID }) else { return }
+        let folder = scopedFolder(for: game)
+        let previous = LooseCover.read(in: folder)
+        if let data {
+            try LooseCover.write(data, to: folder)
+        } else {
+            guard try LooseCover.remove(from: folder) else { return }
+        }
+        undoManager.registerUndo(withTarget: self) { target in
+            try? target.replaceLooseCover(previous, gameID: gameID, actionName: actionName)
+        }
+        undoManager.setActionName(actionName)
+        coverRevision += 1
+        flash(data == nil ? "Custom cover removed" : "Cover updated")
+    }
+
+    private func scopedFolder(for game: GameEntry) -> URL {
+        CardOperations.scopedFolderURL(for: game, under: accessURL ?? volume?.rootURL)
+    }
+
     // MARK: - Import (add discs)
 
     /// Pick disc images / game folders and copy them into the next free slots.
@@ -2361,6 +2519,7 @@ final class AppState {
     func rename(id: UUID, to newName: String) {
         guard !isBusy, let index = games.firstIndex(where: { $0.id == id }) else { return }
         let game = games[index]
+        guard !game.isMenu, game.number != 1 else { return }
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed != game.name, !trimmed.isEmpty else { return }
 
@@ -2737,6 +2896,7 @@ final class AppState {
         actionName: String,
         newName: (GameEntry) -> String?
     ) {
+        let targets = targets.filter { !$0.isMenu && $0.number != 1 }
         guard !targets.isEmpty, !isBusy else { return }
         if !requestCardWriteAccess() { return }
 
@@ -2832,8 +2992,9 @@ final class AppState {
         guard !isBusy, let volume, !ids.isEmpty else { return }
         if !requestCardWriteAccess() { return }
         let snapshot = games
-        let victims = snapshot.filter { ids.contains($0.id) }
+        let victims = snapshot.filter { ids.contains($0.id) && !$0.isMenu && $0.number != 1 }
         guard !victims.isEmpty else { return }
+        let victimIDs = Set(victims.map(\.id))
 
         let label = victims.count == 1 ? victims[0].name : "\(victims.count) games"
 
@@ -2887,7 +3048,7 @@ final class AppState {
                 let liveRoot = accessURL ?? root
                 let result = try await Task.detached {
                     try CardOperations.delete(
-                        gameIDs: ids,
+                        gameIDs: victimIDs,
                         games: snapshot,
                         rootURL: liveRoot,
                         permanent: permanent,
@@ -3311,7 +3472,13 @@ final class AppState {
             return false
         }
 
-        let snapshot = games
+        // Slot 01's image is replaced by this rebuild. A cached header (and a serial
+        // that disagrees with serial.txt) would be written into the new list and then
+        // saved against the new fingerprint.
+        var snapshot = games
+        if let menuIdx = snapshot.firstIndex(where: { $0.number == 1 || $0.isMenu }) {
+            expireReplacedDiscIdentity(&snapshot[menuIdx])
+        }
         // Keep security-scoped URL instance (no `.standardizedFileURL`).
         guard let root = accessURL ?? volume?.rootURL else { return false }
         let kind = menuKind
@@ -3356,8 +3523,13 @@ final class AppState {
             }
 
             // Persist IP headers read on cache misses so the next rebuild stays warm.
-            if !result.filledHeaders.isEmpty {
-                applyIpHeaderFills(result.filledHeaders)
+            // The menu image was just replaced; its pre-install read must not be cached.
+            let gameFills = result.filledHeaders.filter { fill in
+                guard let game = snapshot.first(where: { $0.id == fill.gameID }) else { return false }
+                return game.number != 1 && !game.isMenu
+            }
+            if !gameFills.isEmpty {
+                applyIpHeaderFills(gameFills)
             }
 
             // Light refresh of the menu row. Never walk the menu tree on quit —
@@ -3369,9 +3541,13 @@ final class AppState {
                 games[idx].imageFileName = "disc.gdi"
                 games[idx].folderPath = result.menuFolderPath
                 games[idx].contentSHA256 = nil
+                expireReplacedDiscIdentity(&games[idx])
                 if !quitting, let size = directorySize(at: result.menuFolderPath) {
                     games[idx].byteSize = size
                     games[idx].payloadByteSize = size
+                }
+                if selection.contains(games[idx].id) {
+                    rebuildInspectorSnapshot()
                 }
             }
             menuKind = result.menuKind

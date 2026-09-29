@@ -18,6 +18,8 @@ struct InspectorView: View {
     @State private var ipInfo: IpBinInfo?
     @State private var gdtexImage: NSImage?
     @State private var gdtexStatus: String = ""
+    @State private var coverHovering = false
+    @State private var hasLooseCover = false
     @State private var detailLoadToken: UUID = UUID()
     @FocusState private var nameFieldFocused: Bool
     @FocusState private var extrasFieldFocused: Bool
@@ -36,7 +38,11 @@ struct InspectorView: View {
             case .empty:
                 emptyState
             case .single(let game, let dup, let marked):
-                singleInspector(game, duplicate: dup, markedNotDuplicate: marked)
+                if game.isMenu || game.number == 1 {
+                    menuInspector(game)
+                } else {
+                    singleInspector(game, duplicate: dup, markedNotDuplicate: marked)
+                }
             case .multi(let games, let totalBytes, let anyDup, let anyMarked):
                 multiInspector(
                     games,
@@ -49,6 +55,80 @@ struct InspectorView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // Track busy separately (does not depend on `games`).
         .disabled(state.isBusy)
+    }
+
+    // MARK: - Menu (slot 01)
+
+    /// Slot 01 is the console menu, not a game. No rename, cover, IP fields, or delete.
+    private func menuInspector(_ game: GameEntry) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                collapsible(.menu) {
+                    menuSectionBody(game)
+                }
+                sectionDivider
+                collapsible(.onCard) {
+                    onCardSectionBody(game)
+                }
+                sectionDivider
+                collapsible(.actions) {
+                    menuActionsBody(game)
+                }
+            }
+        }
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private func menuSectionBody(_ game: GameEntry) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(game.name)
+                .font(.title3.weight(.semibold))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text(titleStatusLine(for: game))
+                .font(.callout.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .multilineTextAlignment(.center)
+
+            Text(state.menuKind.helpText)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(state.menuNeedsRebuild
+                 ? "The menu list is out of date. Rebuild so the console matches this card."
+                 : "Games start at slot 02. Rebuild writes this list into the menu.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func menuActionsBody(_ game: GameEntry) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                state.rebuildMenuList()
+            } label: {
+                Text("Rebuild Menu…")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!state.canRebuildMenu)
+            .help("Bake \(state.menuKind.displayName) into slot 01 (⌘S)")
+
+            Button {
+                revealInFinder(game)
+            } label: {
+                Text("Reveal in Finder")
+                    .frame(maxWidth: .infinity)
+            }
+        }
     }
 
     // MARK: - Single
@@ -88,7 +168,7 @@ struct InspectorView: View {
                 }
                 sectionDivider
                 collapsible(.gdtex) {
-                    gdtexSectionBody
+                    gdtexSectionBody(game)
                 }
                 sectionDivider
                 collapsible(.onCard) {
@@ -106,7 +186,14 @@ struct InspectorView: View {
             loadDiscDetails(for: game)
         }
         .onChange(of: game.id) { _, _ in
+            coverHovering = false
             syncDraft(from: game)
+            loadDiscDetails(for: game)
+        }
+        .onChange(of: game.ipHeader) { _, _ in
+            loadDiscDetails(for: game)
+        }
+        .onChange(of: state.coverRevision) { _, _ in
             loadDiscDetails(for: game)
         }
         .onChange(of: game.name) { _, new in
@@ -256,23 +343,26 @@ struct InspectorView: View {
                             }
                         }
 
-                        Button(role: .destructive) {
-                            state.deleteSelected()
-                        } label: {
-                            Text("Delete \(games.count) Games")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .disabled(state.isBusy)
-                        .help("Soft-delete to card trash")
+                        let deletable = games.filter { !$0.isMenu && $0.number != 1 }
+                        if !deletable.isEmpty {
+                            Button(role: .destructive) {
+                                state.delete(ids: Set(deletable.map(\.id)), permanent: false)
+                            } label: {
+                                Text("Delete \(deletable.count) Games")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .disabled(state.isBusy)
+                            .help("Soft-delete to card trash. Slot 01 stays.")
 
-                        Button(role: .destructive) {
-                            state.deleteSelectedImmediately()
-                        } label: {
-                            Text("Delete \(games.count) Immediately…")
-                                .frame(maxWidth: .infinity)
+                            Button(role: .destructive) {
+                                state.delete(ids: Set(deletable.map(\.id)), permanent: true)
+                            } label: {
+                                Text("Delete \(deletable.count) Immediately…")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .disabled(state.isBusy)
+                            .help("Erase from the card now; cannot be undone. Slot 01 stays.")
                         }
-                        .disabled(state.isBusy)
-                        .help("Erase from the card now; cannot be undone")
                     }
                 }
             }
@@ -619,9 +709,9 @@ struct InspectorView: View {
 
     // MARK: - Cover (0GDTEX.PVR)
 
-    private var gdtexSectionBody: some View {
+    private func gdtexSectionBody(_ game: GameEntry) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            ZStack {
+            ZStack(alignment: .bottom) {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.35))
                     .aspectRatio(1, contentMode: .fit)
@@ -641,8 +731,39 @@ struct InspectorView: View {
                         .multilineTextAlignment(.center)
                         .padding(12)
                 }
+
+                if coverHovering {
+                    HStack(spacing: 8) {
+                        Button("Change…") {
+                            state.changeCoverImage()
+                        }
+                        .help("Change Cover Image…")
+                        if hasLooseCover {
+                            Button("Remove") {
+                                state.removeCustomCover()
+                            }
+                            .help("Remove Custom Cover")
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.regularMaterial, in: Capsule())
+                    .padding(.bottom, 8)
+                }
             }
             .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+            .onHover { coverHovering = $0 }
+            .contextMenu {
+                Button("Change Cover Image…") {
+                    state.changeCoverImage()
+                }
+                Button("Remove Custom Cover") {
+                    state.removeCustomCover()
+                }
+                .disabled(!hasLooseCover)
+            }
+            .help("Change Cover Image…")
         }
     }
 
@@ -833,28 +954,41 @@ struct InspectorView: View {
         ipInfo = nil
         gdtexImage = nil
         gdtexStatus = "Loading…"
+        hasLooseCover = false
 
         let folder = game.folderURL
         let imageName = game.imageFileName
         let format = game.format
         let entry = game
+        let menu = state.games.first(where: \.isMenu)
+        let menuFolder = menu?.folderURL
+        let menuImage = menu?.imageFileName
 
         // Prefer in-memory header cache (warm rebuilds / prior inspector visit).
         if let cached = game.ipHeader {
             ipInfo = cached
+            let serials = coverSerials(game: entry, extra: cached.productNumber)
             Task.detached(priority: .userInitiated) {
-                let tex = GdtexLoader.load(for: entry)
+                let tex = GdtexLoader.load(
+                    for: entry,
+                    menuFolder: menuFolder,
+                    menuImageFileName: menuImage,
+                    serials: serials
+                )
+                let loose = LooseCover.exists(in: folder)
                 await MainActor.run {
                     guard detailLoadToken == token else { return }
                     gdtexImage = tex.image
                     gdtexStatus = tex.image == nil
-                        ? (tex.status.isEmpty ? "File not found" : tex.status)
+                        ? (tex.status.isEmpty ? GdtexLoader.missingCoverStatus : tex.status)
                         : ""
+                    hasLooseCover = loose
                 }
             }
             return
         }
 
+        let knownSerials = coverSerials(game: entry, extra: nil)
         Task.detached(priority: .userInitiated) {
             let ip = IpBinReader.read(
                 folderURL: folder,
@@ -862,7 +996,15 @@ struct InspectorView: View {
                 format: format
             ) ?? IpBinInfo.fallback(name: entry.name, serial: entry.serial)
 
-            let tex = GdtexLoader.load(for: entry)
+            var serials = knownSerials
+            if !ip.productNumber.isEmpty { serials.append(ip.productNumber) }
+            let tex = GdtexLoader.load(
+                for: entry,
+                menuFolder: menuFolder,
+                menuImageFileName: menuImage,
+                serials: serials
+            )
+            let loose = LooseCover.exists(in: folder)
 
             await MainActor.run {
                 guard detailLoadToken == token else { return }
@@ -871,10 +1013,22 @@ struct InspectorView: View {
                 state.applyIpHeader(ip, forGameID: entry.id)
                 gdtexImage = tex.image
                 gdtexStatus = tex.image == nil
-                    ? (tex.status.isEmpty ? "File not found" : tex.status)
+                    ? (tex.status.isEmpty ? GdtexLoader.missingCoverStatus : tex.status)
                     : ""
+                hasLooseCover = loose
             }
         }
+    }
+
+    private func coverSerials(game: GameEntry, extra: String?) -> [String] {
+        var ids = [game.serial]
+        if let product = game.ipHeader?.productNumber, !product.isEmpty {
+            ids.append(product)
+        }
+        if let extra, !extra.isEmpty {
+            ids.append(extra)
+        }
+        return ids
     }
 
     private func commitName(for game: GameEntry) {

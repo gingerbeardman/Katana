@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 @main
@@ -182,7 +183,7 @@ struct KatanaApp: App {
                         state.lowercaseSelection()
                     }
                 }
-                .disabled(state.selection.isEmpty || state.isBusy)
+                .disabled(!state.canRenameSelection)
 
                 Menu("Automatically Rename") {
                     ForEach(AutoRenameSource.allCases) { source in
@@ -192,12 +193,26 @@ struct KatanaApp: App {
                         .help(source.helpText)
                     }
                 }
-                .disabled(state.selection.isEmpty || state.isBusy)
+                .disabled(!state.canRenameSelection)
+
+                Divider()
+
+                Button("Change Cover Image…") {
+                    state.changeCoverImage()
+                }
+                .disabled(state.selectedGame == nil || state.selectedGame?.isMenu == true || state.selectedGame?.number == 1 || state.isBusy)
+                .help("Save a picture or a PVR file as 0GDTEX.PVR next to the selected game")
+
+                Button("Remove Custom Cover") {
+                    state.removeCustomCover()
+                }
+                .disabled(!state.canRemoveCustomCover)
+                .help("Delete the loose 0GDTEX.PVR next to the selected game. Art inside the disc is left in place")
 
                 // Pair: soft Delete + ⌥-alternate Delete Immediately… (wired on the
                 // native NSMenu by MenuOptionAlternates — only one row shows at a time).
-                Button(state.selection.count > 1
-                       ? "Delete \(state.selection.count) Games"
+                Button(state.deletableSelectionCount > 1
+                       ? "Delete \(state.deletableSelectionCount) Games"
                        : "Delete Selected") {
                     state.deleteSelected()
                 }
@@ -210,8 +225,8 @@ struct KatanaApp: App {
                 .disabled(!state.canDeleteSelection || state.isTextInputFocused)
                 .help("Soft-delete to card trash (fast, undoable). Hold ⌥ for Delete Immediately.")
 
-                Button(state.selection.count > 1
-                       ? "Delete \(state.selection.count) Games Immediately…"
+                Button(state.deletableSelectionCount > 1
+                       ? "Delete \(state.deletableSelectionCount) Games Immediately…"
                        : "Delete Immediately…") {
                     state.deleteSelectedImmediately()
                 }
@@ -357,6 +372,10 @@ struct KatanaApp: App {
             CommandGroup(after: .help) {
                 Button("Welcome to Katana") {
                     WelcomeWindowController.shared.show()
+                }
+
+                Button("Katana on GitHub…") {
+                    NSWorkspace.shared.open(UpdateChecker.repositoryURL)
                 }
 
                 Button("Check for Updates…") {

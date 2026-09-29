@@ -161,16 +161,23 @@ enum MenuRebuildService: Sendable {
 
     // MARK: - Detect
 
-    /// Infer which menu system the card uses from slot 01 name and/or IP.BIN.
-    /// Stock and Extended share the `openMenu` name — folder sidecars promote to Extended.
-    nonisolated static func detectMenuKind(games: [GameEntry]) -> MenuKind? {
+    /// Infer which menu system the card uses.
+    ///
+    /// Slot 01 is named `openMenu` for both stock and Extended. The baked
+    /// `OPENMENU.INI` / `LIST.INI` distinguishes them. Folder sidecars still
+    /// promote an openMenu-family card to Extended. `confirmed` is false only
+    /// when the name is plain `openMenu` and the list file could not be read —
+    /// that must not overwrite a saved Extended choice.
+    nonisolated static func detectMenu(games: [GameEntry]) -> MenuKindDetection? {
         let menu = games.first(where: { $0.number == 1 || $0.isMenu }) ?? games.first
         guard let menu else { return nil }
 
         var kind: MenuKind?
+        var confirmed = false
         if let k = MenuKind.detect(fromName: menu.name) {
             LaunchTrace.mark("detectMenuKind: from name \"\(menu.name)\" → \(k.rawValue)")
             kind = k
+            confirmed = k != .openMenu
         }
         if kind == nil {
             let serialStart = CFAbsoluteTimeGetCurrent()
@@ -182,6 +189,7 @@ enum MenuRebuildService: Sendable {
                     "detectMenuKind: from serial.txt (\(Int((CFAbsoluteTimeGetCurrent() - serialStart) * 1000))ms) → \(k.rawValue)"
                 )
                 kind = k
+                confirmed = k != .openMenu
             }
         }
         if kind == nil {
@@ -191,18 +199,86 @@ enum MenuRebuildService: Sendable {
                     "detectMenuKind: from IP.BIN (\(Int((CFAbsoluteTimeGetCurrent() - ipStart) * 1000))ms) → \(k.rawValue)"
                 )
                 kind = k
+                confirmed = k != .openMenu
             } else {
                 LaunchTrace.mark(
                     "detectMenuKind: no match (IP.BIN attempt \(Int((CFAbsoluteTimeGetCurrent() - ipStart) * 1000))ms)"
                 )
             }
         }
+
+        // Plain `openMenu` (or no name) — the list in the menu image is authoritative.
+        // Skip the read when the name is already GDmenu or ateam/Extended.
+        if kind != .gdMenu, kind != .openMenuExtended, let fromList = bakedListKind(in: menu) {
+            LaunchTrace.mark("detectMenuKind: from baked list → \(fromList.rawValue)")
+            kind = fromList
+            confirmed = true
+        }
+
         guard var kind else { return nil }
         if kind.isOpenMenuFamily, games.contains(where: \.hasOpenMenuFolderMeta) {
             kind = .openMenuExtended
+            confirmed = true
             LaunchTrace.mark("detectMenuKind: folder/type sidecars → openMenuExtended")
         }
-        return kind
+        return MenuKindDetection(kind: kind, confirmed: confirmed)
+    }
+
+    nonisolated static func detectMenuKind(games: [GameEntry]) -> MenuKind? {
+        detectMenu(games: games)?.kind
+    }
+
+    /// `OPENMENU.INI` / `LIST.INI` from the slot-01 GDI, else a loose copy in the folder.
+    private nonisolated static let bakedListNames = ["OPENMENU.INI", "LIST.INI"]
+
+    private nonisolated static func bakedListKind(in menu: GameEntry) -> MenuKind? {
+        if let text = listTextFromGDI(menu), let kind = MenuKind.detect(fromBakedList: text) {
+            return kind
+        }
+        if let text = looseListText(in: menu.folderURL), let kind = MenuKind.detect(fromBakedList: text) {
+            return kind
+        }
+        return nil
+    }
+
+    private nonisolated static func looseListText(in folder: URL) -> String? {
+        for name in bakedListNames {
+            let url = folder.appendingPathComponent(name)
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            guard let text = readListText(url), MenuKind.detect(fromBakedList: text) != nil else { continue }
+            return text
+        }
+        return nil
+    }
+
+    private nonisolated static func listTextFromGDI(_ menu: GameEntry) -> String? {
+        let gdiName = menu.imageFileName.lowercased().hasSuffix(".gdi")
+            ? menu.imageFileName
+            : "disc.gdi"
+        let gdiURL = menu.folderURL.appendingPathComponent(gdiName)
+        guard let cue = readListText(gdiURL) else { return nil }
+
+        var tracks: [Iso9660FileExtractor.DataTrack] = []
+        for track in GdiCue.parseTracks(in: cue) where track.type == 4 {
+            let trackURL = menu.folderURL.appendingPathComponent(track.fileName)
+            guard FileManager.default.fileExists(atPath: trackURL.path) else { continue }
+            tracks.append(.init(lba: UInt32(track.lba), url: trackURL))
+        }
+        guard !tracks.isEmpty else { return nil }
+
+        let extracted = Iso9660FileExtractor.extract(named: bakedListNames, tracks: tracks)
+        for name in bakedListNames {
+            guard let data = extracted[name], !data.isEmpty else { continue }
+            let text = String(data: data, encoding: .utf8)
+                ?? String(data: data, encoding: .isoLatin1)
+            if let text, MenuKind.detect(fromBakedList: text) != nil { return text }
+        }
+        return nil
+    }
+
+    private nonisolated static func readListText(_ url: URL) -> String? {
+        if let text = try? String(contentsOf: url, encoding: .utf8) { return text }
+        return try? String(contentsOf: url, encoding: .isoLatin1)
     }
 
     // MARK: - Bundle resources

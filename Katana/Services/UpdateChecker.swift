@@ -3,6 +3,11 @@ import Foundation
 /// Checks the public GitHub Releases feed for a newer Katana version.
 /// Opt out of default MainActor isolation — `check()` runs from a background Task.
 nonisolated enum UpdateChecker: Sendable {
+    /// Project page (Help → Katana on GitHub…).
+    nonisolated static let repositoryURL = URL(
+        string: "https://github.com/gingerbeardman/Katana"
+    )!
+
     /// Stable public releases API (JSON). Same data as the Releases page / atom feed.
     nonisolated static let latestReleaseURL = URL(
         string: "https://api.github.com/repos/gingerbeardman/Katana/releases/latest"

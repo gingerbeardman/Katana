@@ -238,6 +238,10 @@ struct MenuListGeneratorTests {
         #expect(MenuKind.detect(fromName: "openMenu") == .openMenu)
         #expect(MenuKind.detect(fromName: "OPEN MENU") == .openMenu)
         #expect(MenuKind.detect(fromName: "openMenu 1.6.3-ateam") == .openMenuExtended)
+        #expect(MenuKind.detect(fromName: "openMenu 1.7.0-ateam") == .openMenuExtended)
+        #expect(MenuKind.detect(fromBakedList: "[OPENMENU]\n01.name=openMenu\n") == .openMenu)
+        #expect(MenuKind.detect(fromBakedList: "[OPENMENU]\n01.folder=\n01.type=game\n") == .openMenuExtended)
+        #expect(MenuKind.detect(fromBakedList: "[GDMENU]\n01.name=GDMENU\n") == .gdMenu)
         #expect(MenuKind.detect(fromName: "openMenu Extended") == .openMenuExtended)
         #expect(MenuKind.detect(fromName: "Sonic") == nil)
 
@@ -300,7 +304,95 @@ struct MenuListGeneratorTests {
             virtualFolder: "Games\\RPGs"
         )
         #expect(MenuRebuildService.detectMenuKind(games: [menu]) == .openMenu)
+        #expect(MenuRebuildService.detectMenu(games: [menu])?.confirmed == false)
         #expect(MenuRebuildService.detectMenuKind(games: [menu, game]) == .openMenuExtended)
+        #expect(MenuRebuildService.detectMenu(games: [menu, game])?.confirmed == true)
+    }
+
+    @Test func detectMenuKindReadsBakedList() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("katana-menu-kind-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let menu = GameEntry(
+            id: UUID(),
+            number: 1,
+            name: "openMenu",
+            serial: "NEODC_1",
+            format: .gdi,
+            imageFileName: "disc.gdi",
+            folderPath: root.path,
+            byteSize: 1,
+            payloadByteSize: 1,
+            contentSHA256: nil,
+            isMenu: true
+        )
+
+        try """
+        [OPENMENU]
+        num_items=1
+
+        [ITEMS]
+        01.name=openMenu
+        01.product=NEODC1
+
+        """.write(to: root.appendingPathComponent("OPENMENU.INI"), atomically: true, encoding: .utf8)
+        #expect(MenuRebuildService.detectMenuKind(games: [menu]) == .openMenu)
+        #expect(MenuRebuildService.detectMenu(games: [menu])?.confirmed == true)
+
+        try """
+        [OPENMENU]
+        num_items=1
+
+        [ITEMS]
+        01.name=openMenu
+        01.folder=
+        01.type=game
+
+        """.write(to: root.appendingPathComponent("OPENMENU.INI"), atomically: true, encoding: .utf8)
+        #expect(MenuRebuildService.detectMenuKind(games: [menu]) == .openMenuExtended)
+
+        try FileManager.default.removeItem(at: root.appendingPathComponent("OPENMENU.INI"))
+        try """
+        [GDMENU]
+        01.name=GDMENU
+
+        """.write(to: root.appendingPathComponent("LIST.INI"), atomically: true, encoding: .utf8)
+        #expect(MenuRebuildService.detectMenuKind(games: [menu]) == .gdMenu)
+    }
+
+    @Test func menuKindOpenChoiceFollowsConfirmedCard() {
+        let stock = MenuKindDetection(kind: .openMenu, confirmed: true)
+        let corrected = MenuKindOpenChoice.resolve(
+            detected: stock,
+            saved: .openMenuExtended,
+            savedBaked: .openMenuExtended
+        )
+        #expect(corrected.menuKind == .openMenu)
+        #expect(corrected.bakedMenuKind == .openMenu)
+        #expect(corrected.persistMenuKind)
+        #expect(corrected.persistBakedMenuKind)
+
+        let ambiguous = MenuKindDetection(kind: .openMenu, confirmed: false)
+        let kept = MenuKindOpenChoice.resolve(
+            detected: ambiguous,
+            saved: .openMenuExtended,
+            savedBaked: .openMenuExtended
+        )
+        #expect(kept.menuKind == .openMenuExtended)
+        #expect(kept.bakedMenuKind == .openMenuExtended)
+        #expect(!kept.persistMenuKind)
+
+        let pending = MenuKindOpenChoice.resolve(
+            detected: stock,
+            saved: .gdMenu,
+            savedBaked: .openMenu
+        )
+        #expect(pending.menuKind == .gdMenu)
+        #expect(pending.bakedMenuKind == .openMenu)
+        #expect(!pending.persistMenuKind)
+        #expect(!pending.persistBakedMenuKind)
     }
 }
 

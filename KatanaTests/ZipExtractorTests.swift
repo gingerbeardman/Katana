@@ -50,7 +50,7 @@ struct ZipExtractorTests {
             contentsOf: dest.appendingPathComponent("VERSION.TXT"),
             encoding: .utf8
         ).trimmingCharacters(in: .whitespacesAndNewlines)
-        #expect(version == "1.6.3-ateam")
+        #expect(version == "1.7.0-ateam")
         let binSize = try dest.appendingPathComponent("menu_data/1ST_READ.BIN")
             .resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         #expect(binSize > 400_000)

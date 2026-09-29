@@ -530,10 +530,34 @@ struct GameListView: View {
 
     @ViewBuilder
     private func selectionContextMenu(_ selectedIDs: Set<GameEntry.ID>) -> some View {
-        let count = selectedIDs.count
-        let multi = count > 1
+        let selectedGames = state.games.filter { selectedIDs.contains($0.id) }
+        let menuOnly = !selectedGames.isEmpty && selectedGames.allSatisfy { $0.isMenu || $0.number == 1 }
+        if menuOnly {
+            Button("Rebuild Menu…") {
+                state.rebuildMenuList()
+            }
+            .disabled(!state.canRebuildMenu)
+            .help("Bake \(state.menuKind.displayName) into slot 01")
 
-        if count == 1, let id = selectedIDs.first {
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting(selectedGames.map(\.folderURL))
+            }
+        } else {
+            gameSelectionContextMenu(selectedIDs, selectedGames: selectedGames)
+        }
+    }
+
+    @ViewBuilder
+    private func gameSelectionContextMenu(
+        _ selectedIDs: Set<GameEntry.ID>,
+        selectedGames: [GameEntry]
+    ) -> some View {
+        let count = selectedIDs.count
+        let gameIDs = Set(selectedGames.filter { !$0.isMenu && $0.number != 1 }.map(\.id))
+        let gameCount = gameIDs.count
+        let multi = gameCount > 1
+
+        if gameCount == 1, let id = gameIDs.first {
             Button("Rename") {
                 state.beginInlineRename(id)
             }
@@ -546,7 +570,6 @@ struct GameListView: View {
         }
         .disabled(count == 0)
 
-        let selectedGames = state.games.filter { selectedIDs.contains($0.id) }
         if state.duplicatesEnabled {
             let anyDup = selectedGames.contains { state.duplicateInfo(for: $0.id) != nil }
             let anyMarked = selectedGames.contains { state.isMarkedNotDuplicate($0) }
@@ -562,36 +585,36 @@ struct GameListView: View {
             }
         }
 
-        Menu(multi ? "Manually Rename (\(count))" : "Manually Rename") {
+        Menu(multi ? "Manually Rename (\(gameCount))" : "Manually Rename") {
             Button("Sentence Case") {
-                state.selection = selectedIDs
+                state.selection = gameIDs
                 state.sentenceCaseSelection()
             }
             Button("Title Case") {
-                state.selection = selectedIDs
+                state.selection = gameIDs
                 state.titleCaseSelection()
             }
             Button("Uppercase") {
-                state.selection = selectedIDs
+                state.selection = gameIDs
                 state.uppercaseSelection()
             }
             Button("Lowercase") {
-                state.selection = selectedIDs
+                state.selection = gameIDs
                 state.lowercaseSelection()
             }
         }
-        .disabled(count == 0 || state.isBusy)
+        .disabled(gameCount == 0 || state.isBusy)
 
         Menu("Automatically Rename") {
             ForEach(AutoRenameSource.allCases) { source in
                 Button(source.menuTitle) {
-                    state.selection = selectedIDs
-                    state.autoRename(ids: selectedIDs, from: source)
+                    state.selection = gameIDs
+                    state.autoRename(ids: gameIDs, from: source)
                 }
                 .help(source.helpText)
             }
         }
-        .disabled(count == 0 || state.isBusy)
+        .disabled(gameCount == 0 || state.isBusy)
 
         let assignable = selectedGames.filter { !$0.isMenu && $0.number != 1 }
         if state.menuKind.supportsVirtualFolders, !assignable.isEmpty {
@@ -677,16 +700,16 @@ struct GameListView: View {
         Divider()
 
         // Adjacent pair: MenuOptionAlternates marks Immediately as ⌥-alternate of Delete.
-        Button(multi ? "Delete \(count) Games" : "Delete", role: .destructive) {
-            state.delete(ids: selectedIDs, permanent: false)
+        Button(multi ? "Delete \(gameCount) Games" : "Delete", role: .destructive) {
+            state.delete(ids: gameIDs, permanent: false)
         }
-        .disabled(count == 0 || state.isBusy)
+        .disabled(gameCount == 0 || state.isBusy)
         .help("Soft-delete to card trash (fast, undoable). Hold ⌥ for Delete Immediately.")
 
-        Button(multi ? "Delete \(count) Games Immediately…" : "Delete Immediately…", role: .destructive) {
-            state.delete(ids: selectedIDs, permanent: true)
+        Button(multi ? "Delete \(gameCount) Games Immediately…" : "Delete Immediately…", role: .destructive) {
+            state.delete(ids: gameIDs, permanent: true)
         }
-        .disabled(count == 0 || state.isBusy)
+        .disabled(gameCount == 0 || state.isBusy)
         .help("Erase from the card now — slow for large games; cannot be undone")
     }
 

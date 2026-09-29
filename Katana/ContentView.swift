@@ -47,8 +47,8 @@ struct ContentView: View {
                             Label("Delete", systemImage: "minus")
                         }
                         .disabled(!state.canDeleteSelection)
-                        .help(state.selection.count > 1
-                              ? "Soft-delete \(state.selection.count) games (⌫). Option-click / ⌥⌫ erases immediately."
+                        .help(state.deletableSelectionCount > 1
+                              ? "Soft-delete \(state.deletableSelectionCount) games (⌫). Option-click / ⌥⌫ erases immediately."
                               : "Soft-delete selected game (⌫). Option-click / ⌥⌫ erases immediately.")
                     }
 

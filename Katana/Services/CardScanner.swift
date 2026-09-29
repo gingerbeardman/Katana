@@ -94,13 +94,16 @@ enum CardScanner: Sendable {
         }
         let numbered = try numberedFolderURLs(at: rootURL)
         let liveByNumber = Dictionary(uniqueKeysWithValues: numbered.map { ($0.0, $0.1) })
-        return snapshotResultIfValid(
+        let (healed, changed) = droppingStaleSerials(cache)
+        guard let result = snapshotResultIfValid(
             rootURL: rootURL,
             volume: volume,
-            cache: cache,
+            cache: healed,
             liveByNumber: liveByNumber,
             started: started
-        )
+        ) else { return nil }
+        saveHealedCacheIfNeeded(healed, changed: changed)
+        return result
     }
 
     /// Build entries from a saved cache under `rootURL` (no SD inventory required).
@@ -110,14 +113,12 @@ enum CardScanner: Sendable {
         cache: CardCache
     ) -> [GameEntry] {
         cache.entries.compactMap { cached -> GameEntry? in
-            var entry = cached.entry
             let folderName = cached.fingerprint.folderName
             guard let number = FolderNumbering.parse(folderName) else { return nil }
-            entry.number = number
-            entry.folderPath = rootURL.appendingPathComponent(folderName, isDirectory: true).path
+            let folderPath = rootURL.appendingPathComponent(folderName, isDirectory: true).path
             // Keep stored `detailsLoaded` — do not treat provisional image-only sizes
             // (tiny GDI cue files) as final, or Size stays at 0 MB forever.
-            return entry
+            return entryTrusting(cached, number: number, folderPath: folderPath)
         }
         .sorted { $0.number < $1.number }
     }
@@ -152,10 +153,7 @@ enum CardScanner: Sendable {
             guard let folderURL = liveByNumber[number],
                   let cached = byCachedNumber[number]
             else { return nil }
-            var entry = cached.entry
-            entry.number = number
-            entry.folderPath = folderURL.path
-            entries.append(entry)
+            entries.append(entryTrusting(cached, number: number, folderPath: folderURL.path))
         }
         guard entries.count == liveByNumber.count, !entries.isEmpty else { return nil }
 
@@ -199,10 +197,12 @@ enum CardScanner: Sendable {
         // SD root inventory on a cold FAT reader with 200+ folders is the multi-second pause;
         // folder-set verification is optional for trust path (Rescan still does a full pass).
         if preferSnapshotCache, recoveredParked == 0, let cached, !cached.entries.isEmpty {
+            let (healed, changed) = droppingStaleSerials(cached)
             let trusted = LaunchTrace.measure("CardScanner trust-cache build") {
-                entriesFromCache(rootURL: rootURL, cache: cached)
+                entriesFromCache(rootURL: rootURL, cache: healed)
             }
-            if trusted.count == cached.entries.count, !trusted.isEmpty {
+            if trusted.count == healed.entries.count, !trusted.isEmpty {
+                saveHealedCacheIfNeeded(healed, changed: changed)
                 LaunchTrace.mark(
                     "CardScanner snapshot HIT (trust-cache) \(trusted.count) entries (\(Int(Date().timeIntervalSince(started) * 1000))ms)"
                 )
@@ -234,16 +234,18 @@ enum CardScanner: Sendable {
         LaunchTrace.mark("CardScanner numbered folders=\(numbered.count)")
 
         if preferSnapshotCache, let cached {
+            let (healed, changed) = droppingStaleSerials(cached)
             let snapshot = LaunchTrace.measure("CardScanner snapshot check") {
                 snapshotResultIfValid(
                     rootURL: rootURL,
                     volume: volume,
-                    cache: cached,
+                    cache: healed,
                     liveByNumber: liveByNumber,
                     started: started
                 )
             }
             if let snapshot {
+                saveHealedCacheIfNeeded(healed, changed: changed)
                 LaunchTrace.mark("CardScanner snapshot HIT \(snapshot.entries.count) entries")
                 // Paint every row at once so “Show duplicates only” / markers never sit on an empty table.
                 if let onProgress, !snapshot.entries.isEmpty {
@@ -299,11 +301,9 @@ enum CardScanner: Sendable {
             let firstPaint: [GameEntry] = LaunchTrace.measure("CardScanner build firstPaint") {
                 numbered.map { number, url in
                     let folderName = url.lastPathComponent
-                    if var entry = cacheByFolder[folderName]?.entry {
-                        entry.number = number
-                        entry.folderPath = url.path
+                    if let cached = cacheByFolder[folderName] {
                         // Respect stored detailsLoaded (provisional GDI sizes stay pending).
-                        return entry
+                        return entryTrusting(cached, number: number, folderPath: url.path)
                     }
                     return GameEntry(
                         id: UUID(),
@@ -500,10 +500,10 @@ enum CardScanner: Sendable {
         let serialOnDisk = fingerprint.serialTxt
 
         // Cache hit: reuse entry fields; only trust sizes when details were fully enriched.
+        // Serial disagreement still drops the IP header — the fingerprint may already
+        // describe the new image (see `FolderFingerprint.adoptingSerial`).
         if let cached, cached.fingerprint == fingerprint {
-            var entry = cached.entry
-            entry.number = number
-            entry.folderPath = folderURL.path
+            let entry = entryTrusting(cached, number: number, folderPath: folderURL.path)
             // Never promote provisional image-only sizes to “loaded” — GDI cue files are tiny.
             return FolderScan(entry: entry, fingerprint: fingerprint, cacheHit: true)
         }
@@ -641,6 +641,47 @@ enum CardScanner: Sendable {
     }
 
     // MARK: - Helpers
+
+    /// Cached row with slot path filled in, and IP fields dropped when `serial.txt` disagrees.
+    private nonisolated static func entryTrusting(
+        _ cached: CachedEntry,
+        number: Int,
+        folderPath: String
+    ) -> GameEntry {
+        var entry = FolderFingerprint.adoptingSerial(cached.entry, from: cached.fingerprint)
+        entry.number = number
+        entry.folderPath = folderPath
+        return entry
+    }
+
+    /// Copy whose entries adopt `serial.txt` when it names a different disc than the saved serial.
+    private nonisolated static func droppingStaleSerials(_ cache: CardCache) -> (cache: CardCache, changed: Bool) {
+        var healed = cache
+        var changed = false
+        for index in healed.entries.indices {
+            let fixed = FolderFingerprint.adoptingSerial(
+                healed.entries[index].entry,
+                from: healed.entries[index].fingerprint
+            )
+            if fixed != healed.entries[index].entry {
+                healed.entries[index].entry = fixed
+                changed = true
+            }
+        }
+        if changed {
+            healed.scannedAt = Date()
+        }
+        return (healed, changed)
+    }
+
+    /// Persist a healed cache off the open path. No-op when nothing was stale.
+    private nonisolated static func saveHealedCacheIfNeeded(_ cache: CardCache, changed: Bool) {
+        guard changed else { return }
+        let healed = cache
+        Task.detached(priority: .utility) {
+            try? await CardCacheStore.shared.save(healed)
+        }
+    }
 
     private nonisolated static func detectImageName(in names: [String]) -> String? {
         // Prefer O(n) scan over building a full dictionary for tiny folders.

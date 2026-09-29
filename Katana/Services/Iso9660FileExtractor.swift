@@ -23,6 +23,13 @@ nonisolated enum Iso9660FileExtractor: Sendable {
         extract(named: [fileName], tracks: tracks)[fileName]
     }
 
+    /// A root file’s extent. `startLBA` is absolute; `length` is the directory’s data length.
+    struct LocatedFile: Sendable {
+        var tracks: [DataTrack]
+        var startLBA: UInt32
+        var length: Int
+    }
+
     /// One directory walk for several root-level names (openMenu DAT preserve).
     nonisolated static func extract(named fileNames: [String], tracks: [DataTrack]) -> [String: Data] {
         guard !tracks.isEmpty, !fileNames.isEmpty else { return [:] }
@@ -32,49 +39,112 @@ nonisolated enum Iso9660FileExtractor: Sendable {
         var found: [String: Data] = [:]
         let sorted = tracks.sorted { $0.lba < $1.lba }
         for dirTrack in sorted.reversed() {
-            extractFromDirectory(
+            for hit in rootHits(
                 wanted: wanted,
-                found: &found,
                 tracks: sorted,
                 directoryLBAOffset: dirTrack.lba,
                 preferredDirectoryTrack: dirTrack,
                 io: io
-            )
+            ) where found[hit.name] == nil {
+                let bytes = readAbsoluteExtent(
+                    tracks: sorted,
+                    absoluteLBA: hit.lba,
+                    length: hit.length,
+                    io: io
+                )
+                if !bytes.isEmpty {
+                    found[hit.name] = Data(bytes)
+                }
+            }
             if found.count == wanted.count { break }
         }
         return found
     }
 
+    /// Locate root files without reading their payload (BOX.DAT is far too big to pull in whole).
+    nonisolated static func locate(named fileNames: [String], tracks: [DataTrack]) -> [String: LocatedFile] {
+        guard !tracks.isEmpty, !fileNames.isEmpty else { return [:] }
+        let io = HandleCache()
+        defer { io.close() }
+        let wanted = Dictionary(uniqueKeysWithValues: fileNames.map { (normalizeName($0), $0) })
+        var found: [String: LocatedFile] = [:]
+        let sorted = tracks.sorted { $0.lba < $1.lba }
+        for dirTrack in sorted.reversed() {
+            for hit in rootHits(
+                wanted: wanted,
+                tracks: sorted,
+                directoryLBAOffset: dirTrack.lba,
+                preferredDirectoryTrack: dirTrack,
+                io: io
+            ) where found[hit.name] == nil {
+                found[hit.name] = LocatedFile(tracks: sorted, startLBA: hit.lba, length: hit.length)
+            }
+            if found.count == wanted.count { break }
+        }
+        return found
+    }
+
+    /// Read `count` bytes at `offset` within a located file. Sector-aligned on the disc, not in the file.
+    nonisolated static func read(file: LocatedFile, offset: Int, count: Int) -> Data? {
+        guard offset >= 0, count > 0, offset < file.length else { return nil }
+        let count = min(count, file.length - offset)
+        let io = HandleCache()
+        defer { io.close() }
+        var result = Data()
+        result.reserveCapacity(count)
+        var remaining = count
+        var pos = offset
+        while remaining > 0 {
+            let sectorIndex = pos / sectorSize
+            let skip = pos % sectorSize
+            let lba = file.startLBA &+ UInt32(sectorIndex)
+            guard let sector = readAbsoluteSector(tracks: file.tracks, absoluteLBA: lba, io: io),
+                  skip < sector.count
+            else { return nil }
+            let take = min(remaining, sector.count - skip)
+            result.append(contentsOf: sector[skip..<(skip + take)])
+            remaining -= take
+            pos += take
+        }
+        return result.count == count ? result : nil
+    }
+
     // MARK: - Core
 
-    private nonisolated static func extractFromDirectory(
+    private struct RootHit {
+        var name: String
+        var lba: UInt32
+        var length: Int
+    }
+
+    private nonisolated static func rootHits(
         wanted: [String: String],
-        found: inout [String: Data],
         tracks: [DataTrack],
         directoryLBAOffset: UInt32,
         preferredDirectoryTrack: DataTrack?,
         io: HandleCache
-    ) {
+    ) -> [RootHit] {
         let dirTrack = preferredDirectoryTrack
             ?? tracks.first(where: { $0.lba == directoryLBAOffset })
             ?? tracks.first
-        guard let dirTrack else { return }
+        guard let dirTrack else { return [] }
 
         guard let pvd = readAbsoluteSector(
             tracks: tracks, absoluteLBA: directoryLBAOffset + 16, io: io
         ) ?? io.readSector(dirTrack.url, fileSector: 16)
-        else { return }
-        guard pvd.count >= 190, pvd[0] == 1 else { return }
+        else { return [] }
+        guard pvd.count >= 190, pvd[0] == 1 else { return [] }
 
         let rootLBA = le32(pvd, 156 + 2)
         let rootLen = Int(le32(pvd, 156 + 10))
-        guard rootLBA > 0, rootLen > 0 else { return }
+        guard rootLBA > 0, rootLen > 0 else { return [] }
 
         let rootData = readAbsoluteExtent(
             tracks: tracks, absoluteLBA: rootLBA, length: rootLen, io: io
         )
-        guard !rootData.isEmpty else { return }
+        guard !rootData.isEmpty else { return [] }
 
+        var hits: [RootHit] = []
         var offset = 0
         while offset + 33 <= rootData.count {
             let recLen = Int(rootData[offset])
@@ -97,25 +167,20 @@ nonisolated enum Iso9660FileExtractor: Sendable {
                     bytes: rootData[(offset + 33)..<(offset + 33 + nameLen)],
                     encoding: .ascii
                 ) ?? ""
-                if let canonical = wanted[normalizeName(rawName)], found[canonical] == nil {
+                if let canonical = wanted[normalizeName(rawName)],
+                   !hits.contains(where: { $0.name == canonical })
+                {
                     let fileLBA = le32(rootData, offset + 2)
                     let fileLen = Int(le32(rootData, offset + 10))
                     if fileLBA > 0, fileLen > 0 {
-                        let bytes = readAbsoluteExtent(
-                            tracks: tracks,
-                            absoluteLBA: fileLBA,
-                            length: fileLen,
-                            io: io
-                        )
-                        if !bytes.isEmpty {
-                            found[canonical] = Data(bytes)
-                            if found.count == wanted.count { return }
-                        }
+                        hits.append(RootHit(name: canonical, lba: fileLBA, length: fileLen))
+                        if hits.count == wanted.count { return hits }
                     }
                 }
             }
             offset += recLen
         }
+        return hits
     }
 
     // MARK: - Track I/O

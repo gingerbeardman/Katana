@@ -92,7 +92,7 @@ Collapsible sections, each remembering its expanded state:
 - **Title** — editable display name, slot number, format, size
 - **Duplicate** — grade, matching signals, position in the group, group member list, and group-selection actions
 - **IP.BIN** — product title (only when it differs from the display name), version, disc number, VGA flag, serial, region, CRC, and Code Breaker detection
-- **Cover** — the game’s `0GDTEX.PVR` artwork, decoded natively
+- **Cover** — the game’s `0GDTEX.PVR`, or the openMenu box image for its serial, decoded natively
 - **On Card** — image file name and full on-disk path, selectable
 - **Actions** — rename menus, Reveal in Finder, delete
 - **Multi-select** — count, combined size, a preview list, and bulk actions
@@ -101,7 +101,9 @@ Collapsible sections, each remembering its expanded state:
 
 - **Native PVR decoding** — no external tools. RGB565, ARGB1555, and ARGB4444, in square-twiddled, rectangle, and rectangle-twiddled layouts
 - **Loose `0GDTEX.PVR`** next to the disc image is used when present
+- **Custom cover** — hover the thumbnail, its menu, or Game → Change Cover Image… and pick a PNG, JPEG, or any other picture macOS can open. Katana center-crops it to a square, scales it to 256×256, and writes a loose `0GDTEX.PVR`. A `.pvr` file is copied unchanged when Katana can decode it. Remove Custom Cover deletes that file. A texture already inside the disc image is left in place
 - **Extracted from GDI** — for GDI sets, Katana reads the high-density ISO track directly and pulls the texture out (quote-aware `.gdi` cues, same as import / IP.BIN)
+- **openMenu box art** — when a game has no `0GDTEX.PVR`, Cover uses the `BOX.DAT` already in slot 01, matched by serial (hyphens ignored). Putting art into `BOX.DAT` is still GDMENU Card Manager
 
 ## Duplicate Detection
 
@@ -131,7 +133,7 @@ Collapsible sections, each remembering its expanded state:
 ## Menu Rebuild
 
 - **Native Swift bake** — GDmenu (`LIST.INI`), stock openMenu (`OPENMENU.INI`), or openMenu Extended (`OPENMENU.INI` with `folder=`, `folder_altN=`, `type=`) written into slot 01
-- **Artwork DATs kept on rebuild** — existing `BOX.DAT` / `ICON.DAT` / `META.DAT` / `FOLDRART.*` inside the current menu image are extracted and written back into the new bake (assigning new art is still GDMENU Card Manager)
+- **Artwork DATs kept on rebuild** — existing `BOX.DAT` / `ICON.DAT` / `META.DAT` / `FOLDRART.*` inside the current menu image are extracted and written back into the new bake (putting new art into those files is still GDMENU Card Manager)
 - **Real GDI output** — ISO 9660 Level 1, multi-track GDI at LBA 45000, with truncate and CDDA handling, MIL-CD-safe
 - **No helper binaries** — no .NET runtime, no nested executables, no brotli dylibs in the app bundle; menu asset zips unpack **in-process** (sandbox-safe; no `/usr/bin/unzip`)
 - **List keys match folders** — menu stays in **`01`** (same as GDMENU Card Manager); game slots use card-wide width (`002`… on a 100+ game card) so GDmenu can resolve titles
@@ -139,8 +141,9 @@ Collapsible sections, each remembering its expanded state:
 - **Out-of-date banner** — a warning strip appears above the list when names or order no longer match the baked menu; **fingerprint-based** dirty state clears if you reverse the change (e.g. add a game then delete it, or undo a rename)
 - **Prompt on quit** — you're asked before leaving with a stale menu image; quit-time rebuild skips UI thrash so exit stays responsive
 - **Progress** — headers (2–80%), bake stages (assets, tracks, disc.gdi), and byte-tracked install on the edge bar; bar reaches full width on completion; the status line shows where headers come from (**“270 cached · 12 from card”**)
-- **Cached IP headers** — import, enrichment, rebuilds, and the inspector store IP.BIN fields on each game **and in the on-disk card cache**, so rebuilds skip re-reading every GDI across launches; cleared when the disc content hash changes (homebrew images without a readable IP.BIN are re-read each time)
-- **Bundled stock assets** — GDmenu and **openMenu 1.6.3-ateam** (Virtual Folder Bundle) packs ship inside the app as zip resources. Stock openMenu and openMenu Extended share that ateam pack for now; Extended is what writes `folder=` / `type=` and shows those columns
+- **Cached IP headers** — import, enrichment, rebuilds, and the inspector store IP.BIN fields on each game **and in the on-disk card cache**, so rebuilds skip re-reading every GDI across launches; cleared when the disc image, `serial.txt`, or content hash changes (homebrew images without a readable IP.BIN are re-read each time)
+- **Bundled stock assets** — GDmenu and **openMenu 1.7.0-ateam** (Virtual Folder Bundle) packs ship inside the app as zip resources. Stock openMenu and openMenu Extended share that ateam pack for now; Extended is what writes `folder=` / `type=` and shows those columns
+- **Menu type follows the card** — opening a card selects GDmenu, openMenu, or openMenu Extended from the slot-01 list. A stock openMenu card stays on openMenu. A switch you have not rebuilt yet is kept
 
 ## Game Database
 
@@ -195,7 +198,7 @@ Collapsible sections, each remembering its expanded state:
 | Platform | macOS only | Windows, Linux, macOS |
 | Built with | Native Swift / SwiftUI | C# / .NET 6 / Avalonia |
 | Runtime required | None | .NET 6 Desktop Runtime |
-| GDmenu + openMenu | Yes (GDmenu, stock openMenu, **openMenu Extended** / 1.6.3-ateam) | Yes |
+| GDmenu + openMenu | Yes (GDmenu, stock openMenu, **openMenu Extended** / 1.7.0-ateam) | Yes |
 | Virtual folders / disc type | Yes (`folder.txt`, `type.txt`, extras) | ateam fork |
 | Menu GDI bake | Native Swift | Bundled tooling |
 | GDI / CDI / CCD | Yes | Yes |
@@ -218,6 +221,7 @@ Collapsible sections, each remembering its expanded state:
 | Manual case conversion | Yes | – |
 | Inline Finder-style rename | Yes | – |
 | Cover art (0GDTEX.PVR) | Yes | Yes |
+| Custom cover from an image or PVR file | Loose `0GDTEX.PVR` | `BOX.DAT` / `ICON.DAT` |
 | CodeBreaker detection | Yes | Yes |
 | `name.txt` compatibility | Yes | Yes |
 | Immediate on-card writes | Yes | Save step |

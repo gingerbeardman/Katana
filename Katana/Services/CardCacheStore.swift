@@ -83,9 +83,9 @@ actor CardCacheStore {
 
     /// Patch IP.BIN headers into cached entries without touching fingerprints.
     ///
-    /// Headers live inside the disc image the fingerprint already validates
-    /// (size + mod time), so a header read from the card is valid for as long
-    /// as the fingerprint matches. Lets menu rebuilds stay on SSD across launches.
+    /// Only pass a header just read from the image this fingerprint describes.
+    /// Saving the cache drops the header when that image or `serial.txt` changes,
+    /// so a replaced disc cannot keep the previous IP fields under a new fingerprint.
     func applyIpHeaders(
         volumeUUID: String,
         headersByFolder: [String: IpBinInfo]

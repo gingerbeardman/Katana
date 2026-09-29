@@ -118,7 +118,7 @@ nonisolated enum MenuKind: String, Sendable, Codable, CaseIterable, Identifiable
         case .openMenu:
             return "Stock openMenu (OPENMENU.INI). Folder and Type columns stay hidden."
         case .openMenuExtended:
-            return "openMenu 1.6.3-ateam Virtual Folder Bundle — folders, disc types, and Folders themes."
+            return "openMenu 1.7.0-ateam Virtual Folder Bundle — folders, disc types, and Folders themes."
         }
     }
 
@@ -155,5 +155,78 @@ nonisolated enum MenuKind: String, Sendable, Codable, CaseIterable, Identifiable
         if product.hasPrefix("NEODC") { return .openMenu }
         if let fromProduct = detect(fromName: product) { return fromProduct }
         return nil
+    }
+
+    /// Kind last baked into slot 01, from `OPENMENU.INI` / `LIST.INI`.
+    /// Extended always writes `.folder=` / `.type=`. Stock openMenu and GDmenu do not.
+    static func detect(fromBakedList text: String) -> MenuKind? {
+        let hasOpen = text.range(of: "[OPENMENU]", options: .caseInsensitive) != nil
+        let hasGD = text.range(of: "[GDMENU]", options: .caseInsensitive) != nil
+        if hasOpen {
+            if text.range(of: ".folder=", options: .caseInsensitive) != nil
+                || text.range(of: ".type=", options: .caseInsensitive) != nil
+            {
+                return .openMenuExtended
+            }
+            return .openMenu
+        }
+        if hasGD { return .gdMenu }
+        return nil
+    }
+}
+
+/// What `detectMenuKind` found, and whether it is enough to replace a saved choice.
+nonisolated struct MenuKindDetection: Equatable, Sendable {
+    var kind: MenuKind
+    /// Slot-01 list, a GDmenu / ateam name, or folder sidecars. A plain `openMenu`
+    /// name with no readable list cannot tell stock from Extended.
+    var confirmed: Bool
+}
+
+/// Picker (`menuKind`) and on-card kind when a volume opens.
+///
+/// A saved pair that matches is the last detection, so a confirmed read replaces it.
+/// A saved pair that differs is a menu switch the user has not rebuilt yet.
+nonisolated struct MenuKindOpenChoice: Equatable, Sendable {
+    var menuKind: MenuKind
+    var bakedMenuKind: MenuKind
+    var persistMenuKind: Bool
+    var persistBakedMenuKind: Bool
+
+    static func resolve(
+        detected: MenuKindDetection?,
+        saved: MenuKind?,
+        savedBaked: MenuKind?
+    ) -> MenuKindOpenChoice {
+        let pendingSwitch = saved != nil && savedBaked != nil && saved != savedBaked
+        let trustDetection = detected?.confirmed == true || saved == nil || saved == detected?.kind
+
+        let menu: MenuKind
+        let baked: MenuKind
+        if pendingSwitch, let saved {
+            menu = saved
+            if trustDetection, let detected {
+                baked = detected.kind
+            } else {
+                baked = savedBaked ?? detected?.kind ?? .gdMenu
+            }
+        } else if trustDetection, let detected {
+            menu = detected.kind
+            baked = detected.kind
+        } else if let saved {
+            menu = saved
+            baked = savedBaked ?? detected?.kind ?? saved
+        } else {
+            let fallback = detected?.kind ?? .gdMenu
+            menu = fallback
+            baked = fallback
+        }
+
+        return MenuKindOpenChoice(
+            menuKind: menu,
+            bakedMenuKind: baked,
+            persistMenuKind: menu != saved,
+            persistBakedMenuKind: baked != savedBaked
+        )
     }
 }

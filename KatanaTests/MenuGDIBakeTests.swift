@@ -103,4 +103,49 @@ final class MenuGDIBakeTests: XCTestCase {
         let t5 = try out.appendingPathComponent("track05.iso").resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         XCTAssertGreaterThan(t5, 100_000)
     }
+
+    func testDetectsExtendedFromBakedGDI() throws {
+        let assets = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Tools/MenuAssets/openMenu")
+        guard FileManager.default.fileExists(atPath: assets.appendingPathComponent("IP.BIN").path) else {
+            throw XCTSkip("openMenu assets not found")
+        }
+
+        let fm = FileManager.default
+        let out = fm.temporaryDirectory.appendingPathComponent("native-bake-detect-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: out, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: out) }
+
+        let ip = IpBinInfo.fallback(name: "openMenu", serial: "NEODC_1")
+        let items = [
+            MenuListGenerator.Item(number: 1, name: "openMenu", serial: "NEODC_1", ip: ip),
+        ]
+        try MenuGDIBake.build(
+            MenuGDIBake.Options(
+                kind: .openMenuExtended,
+                listText: MenuListGenerator.makeList(kind: .openMenuExtended, items: items),
+                assetsRoot: assets,
+                outDir: out,
+                truncate: true
+            )
+        )
+
+        let menu = GameEntry(
+            id: UUID(),
+            number: 1,
+            name: "openMenu",
+            serial: "NEODC_1",
+            format: .gdi,
+            imageFileName: "disc.gdi",
+            folderPath: out.path,
+            byteSize: 1,
+            payloadByteSize: 1,
+            contentSHA256: nil,
+            isMenu: true
+        )
+        XCTAssertEqual(MenuRebuildService.detectMenuKind(games: [menu]), .openMenuExtended)
+        XCTAssertEqual(MenuRebuildService.detectMenu(games: [menu])?.confirmed, true)
+    }
 }
