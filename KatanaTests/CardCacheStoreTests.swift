@@ -6,7 +6,7 @@ struct CardCacheStoreTests {
     @Test func applyNameUpdatesPatchesEntryWithoutClearingCache() async throws {
         let uuid = "test-cache-\(UUID().uuidString)"
 
-        let entry = GameEntry(
+        var entry = GameEntry(
             id: UUID(),
             number: 2,
             name: "Old Name",
@@ -20,6 +20,7 @@ struct CardCacheStoreTests {
             isMenu: false,
             detailsLoaded: true
         )
+        entry.coverSource = .custom
         let fingerprint = FolderFingerprint(
             folderName: "02",
             imageFileName: "disc.gdi",
@@ -48,6 +49,7 @@ struct CardCacheStoreTests {
         #expect(loaded?.entries.first?.entry.name == "New Name")
         #expect(loaded?.entries.first?.fingerprint.nameTxt == "New Name")
         #expect(loaded?.entries.first?.entry.serial == "MK-51000")
+        #expect(loaded?.entries.first?.entry.coverSource == .custom)
         #expect(loaded?.entries.first?.fingerprint.folderName == "02")
 
         try await CardCacheStore.shared.clear(volumeUUID: uuid)
@@ -124,6 +126,10 @@ struct CardCacheStoreTests {
         #expect(first.entries.count == 1)
 
         let volumeUUID = first.volume.volumeUUID
+        // Scan writes the cache on a detached task so the list can return first.
+        let stored = await cacheStored(volumeUUID: volumeUUID)
+        #expect(stored)
+
         try await CardCacheStore.shared.applyNameUpdates(
             volumeUUID: volumeUUID,
             namesByFolder: ["01": (name: "Custom Menu", isMenu: true)]
@@ -306,6 +312,18 @@ struct CardCacheStoreTests {
         #expect(kept.name == "Custom Menu")
         #expect(kept.ipHeader == IpBinInfo.menuDefaults)
         #expect(kept.serial == "MK6969")
+    }
+
+    /// Scan persists the cache after returning the list. Wait until that write lands.
+    private func cacheStored(volumeUUID: String) async -> Bool {
+        for _ in 0..<50 {
+            if let cache = try? await CardCacheStore.shared.load(volumeUUID: volumeUUID),
+               !cache.entries.isEmpty {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return false
     }
 
     private static let dreamShellHeader = IpBinInfo(

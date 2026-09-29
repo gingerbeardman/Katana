@@ -142,6 +142,14 @@ struct GameListView: View {
                 }
                 .width(min: 72, ideal: 88, max: 110)
                 .customizationID("size")
+
+                TableColumn("Cover", value: \.coverSortKey) { game in
+                    CoverColumnCell(game: game)
+                        .opacity(state.isDeemphasizedInList(game) ? 0.38 : 1)
+                }
+                .width(min: 64, ideal: 76, max: 110)
+                .customizationID("cover")
+                .defaultVisibility(.hidden)
             } rows: {
                 ForEach(displayedGames) { game in
                     TableRow(game)

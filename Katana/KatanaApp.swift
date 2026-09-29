@@ -201,7 +201,7 @@ struct KatanaApp: App {
                     state.changeCoverImage()
                 }
                 .disabled(state.selectedGame == nil || state.selectedGame?.isMenu == true || state.selectedGame?.number == 1 || state.isBusy)
-                .help("Save a picture or a PVR file as 0GDTEX.PVR next to the selected game")
+                .help("Save a picture or a PVR file as 0GDTEX.PVR. Rebuild the menu to show it on the Dreamcast")
 
                 Button("Remove Custom Cover") {
                     state.removeCustomCover()

@@ -57,6 +57,60 @@ struct GameEntryTests {
     }
 }
 
+struct CoverPresenceTests {
+    @Test func looseFileCountsAndMenuDoesNot() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("katana-cover-\(UUID().uuidString)", isDirectory: true)
+        let folder = root.appendingPathComponent("02", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let game = GameEntry(
+            id: UUID(),
+            number: 2,
+            name: "Crazy Taxi",
+            serial: "MK-51035",
+            format: .cdi,
+            imageFileName: "disc.cdi",
+            folderPath: folder.path,
+            byteSize: 1,
+            payloadByteSize: 1,
+            contentSHA256: nil,
+            isMenu: false
+        )
+        #expect(CoverPresence.source(for: game) == .none)
+        try Data([0x00]).write(to: folder.appendingPathComponent("0GDTEX.PVR"))
+        #expect(CoverPresence.source(for: game) == .custom)
+
+        var menu = game
+        menu.number = 1
+        menu.isMenu = true
+        #expect(CoverPresence.source(for: menu) == .none)
+    }
+
+    @Test func missingCoverSourceDecodesAsNone() throws {
+        let game = GameEntry(
+            id: UUID(),
+            number: 2,
+            name: "Test",
+            serial: "MK-1",
+            format: .gdi,
+            imageFileName: "disc.gdi",
+            folderPath: "/tmp/02",
+            byteSize: 1,
+            payloadByteSize: 1,
+            contentSHA256: nil,
+            isMenu: false
+        )
+        var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(game)) as! [String: Any]
+        object.removeValue(forKey: "coverSource")
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(GameEntry.self, from: data)
+        #expect(decoded.coverSource == .none)
+        #expect(decoded.name == "Test")
+    }
+}
+
 struct OpenMenuRegionTests {
     @Test func cleanedJUEOrderAndStripsJunk() {
         #expect(OpenMenuRegion.cleaned("eu") == "UE")

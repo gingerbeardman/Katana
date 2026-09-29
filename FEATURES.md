@@ -37,7 +37,7 @@ Open a card, browse the numbered game folders, rename / reorder / delete with im
 ## Game List
 
 - **Multi-select table** — Title, Serial, Format, Size, and slot number columns
-- **Toggleable columns** — Control-click a column header to show or hide Serial, Folder, Type, Disc, Format, or Size (same native SwiftUI table customization as 2UP). # and Title stay visible; widths and visibility persist per menu type. **Folder** and **Type** are shown by default only for **openMenu Extended** (hidden for GDmenu and stock openMenu)
+- **Toggleable columns** — Control-click a column header to show or hide Serial, Folder, Type, Disc, Format, Size, or Cover (same native SwiftUI table customization as 2UP). # and Title stay visible; widths and visibility persist per menu type. **Folder** and **Type** are shown by default only for **openMenu Extended** (hidden for GDmenu and stock openMenu). **Cover** reads **Custom** for a loose `0GDTEX.PVR`, **Disc** for art inside the disc image, or **None**, and is hidden until you turn it on
 - **Display-only sorting** — click a column header to sort the view. Slot numbers on the card are never touched. A status strip spells this out whenever a non-slot sort is active, with one-click **Newest First** / **Slot Order**
 - **Sort remembered per card** — each volume keeps its own display sort across sessions
 - **Apply A–Z to Card** — the deliberate, separate action that actually renumbers folders on the SD card
@@ -101,9 +101,9 @@ Collapsible sections, each remembering its expanded state:
 
 - **Native PVR decoding** — no external tools. RGB565, ARGB1555, and ARGB4444, in square-twiddled, rectangle, and rectangle-twiddled layouts
 - **Loose `0GDTEX.PVR`** next to the disc image is used when present
-- **Custom cover** — hover the thumbnail, its menu, or Game → Change Cover Image… and pick a PNG, JPEG, or any other picture macOS can open. Katana center-crops it to a square, scales it to 256×256, and writes a loose `0GDTEX.PVR`. A `.pvr` file is copied unchanged when Katana can decode it. Remove Custom Cover deletes that file. A texture already inside the disc image is left in place
+- **Custom cover** — hover the thumbnail, its menu, or Game → Change Cover Image… and pick a PNG, JPEG, or any other picture macOS can open. Katana center-crops it to a square, scales it to 256×256, and writes a loose `0GDTEX.PVR`. A `.pvr` file is copied unchanged when Katana can decode it. Remove Custom Cover deletes that file. A texture already inside the disc image is left in place. Rebuild the menu to show the cover on the Dreamcast: openMenu reads `BOX.DAT` / `ICON.DAT` in slot 01, not the loose file
 - **Extracted from GDI** — for GDI sets, Katana reads the high-density ISO track directly and pulls the texture out (quote-aware `.gdi` cues, same as import / IP.BIN)
-- **openMenu box art** — when a game has no `0GDTEX.PVR`, Cover uses the `BOX.DAT` already in slot 01, matched by serial (hyphens ignored). Putting art into `BOX.DAT` is still GDMENU Card Manager
+- **openMenu box art** — when a game has no `0GDTEX.PVR`, Cover uses the `BOX.DAT` already in slot 01, matched by serial (hyphens ignored). A custom cover is written into that file on the next menu rebuild
 
 ## Duplicate Detection
 
@@ -133,7 +133,7 @@ Collapsible sections, each remembering its expanded state:
 ## Menu Rebuild
 
 - **Native Swift bake** — GDmenu (`LIST.INI`), stock openMenu (`OPENMENU.INI`), or openMenu Extended (`OPENMENU.INI` with `folder=`, `folder_altN=`, `type=`) written into slot 01
-- **Artwork DATs kept on rebuild** — existing `BOX.DAT` / `ICON.DAT` / `META.DAT` / `FOLDRART.*` inside the current menu image are extracted and written back into the new bake (putting new art into those files is still GDMENU Card Manager)
+- **Artwork DATs kept on rebuild** — existing `BOX.DAT` / `ICON.DAT` / `META.DAT` / `FOLDRART.*` inside the current menu image are extracted and written back into the new bake. A loose `0GDTEX.PVR` is added to `BOX.DAT` and `ICON.DAT` under that game’s product id so openMenu shows it
 - **Real GDI output** — ISO 9660 Level 1, multi-track GDI at LBA 45000, with truncate and CDDA handling, MIL-CD-safe
 - **No helper binaries** — no .NET runtime, no nested executables, no brotli dylibs in the app bundle; menu asset zips unpack **in-process** (sandbox-safe; no `/usr/bin/unzip`)
 - **List keys match folders** — menu stays in **`01`** (same as GDMENU Card Manager); game slots use card-wide width (`002`… on a 100+ game card) so GDmenu can resolve titles

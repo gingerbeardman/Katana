@@ -173,6 +173,8 @@ final class AppState {
     /// Background fill of folder sizes / stored hashes after a fast scan.
     private var detailEnrichmentTask: Task<Void, Never>?
     private var detailEnrichmentGeneration: UInt64 = 0
+    /// Background pass that fills `GameEntry.coverSource` after the list is visible.
+    private var coverPresenceGeneration: UInt64 = 0
     /// Coalesce size writes so SwiftUI is not notified every 8-folder FAT batch.
     private var enrichmentPendingDetails: [(UUID, CardScanner.FolderDetails)] = []
     private var enrichmentFlushTask: Task<Void, Never>?
@@ -1437,7 +1439,10 @@ final class AppState {
     private func startLazyDetailEnrichment(volumeUUID: String) {
         cancelLazyDetailEnrichment()
         let pending = games.filter(\.needsDetailEnrichment)
-        guard !pending.isEmpty else { return }
+        guard !pending.isEmpty else {
+            scheduleCoverPresenceRefresh()
+            return
+        }
 
         detailEnrichmentGeneration &+= 1
         let generation = detailEnrichmentGeneration
@@ -1495,6 +1500,7 @@ final class AppState {
                 // Final accurate grades once all sizes/hashes are known.
                 self.scheduleDuplicateRecompute(showPendingMarkers: false)
                 self.persistEnrichedCache(volumeUUID: volumeUUID)
+                self.scheduleCoverPresenceRefresh()
             }
         }
     }
@@ -1568,6 +1574,7 @@ final class AppState {
         detailEnrichmentGeneration &+= 1
         detailEnrichmentTask?.cancel()
         detailEnrichmentTask = nil
+        coverPresenceGeneration &+= 1
         enrichmentFlushTask?.cancel()
         enrichmentFlushTask = nil
         enrichmentPendingDetails = []
@@ -2301,7 +2308,7 @@ final class AppState {
             types.append(pvr)
         }
         panel.allowedContentTypes = types
-        panel.message = "A picture is scaled to a square and saved as 0GDTEX.PVR. A PVR file is copied as-is when Katana can read it."
+        panel.message = "A picture is scaled to a square and saved as 0GDTEX.PVR. Rebuild the menu to show it on the Dreamcast. A PVR file is copied as-is when Katana can read it."
         panel.prompt = "Set Cover"
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
@@ -2370,7 +2377,61 @@ final class AppState {
         }
         undoManager.setActionName(actionName)
         coverRevision += 1
+        if let index = games.firstIndex(where: { $0.id == gameID }) {
+            if data != nil {
+                games[index].coverSource = .custom
+            } else {
+                let game = games[index]
+                let generation = coverPresenceGeneration
+                Task.detached(priority: .utility) {
+                    let source = CoverPresence.source(for: game)
+                    await MainActor.run {
+                        guard generation == self.coverPresenceGeneration,
+                              let index = self.games.firstIndex(where: { $0.id == gameID })
+                        else { return }
+                        self.games[index].coverSource = source
+                    }
+                }
+            }
+        }
+        markMenuNeedsRebuild()
         flash(data == nil ? "Custom cover removed" : "Cover updated")
+    }
+
+    /// Fills the Cover column without blocking the list. A loose file is custom;
+    /// a texture inside the disc is disc. Skips a row whose value changed after
+    /// this pass started (a cover edit).
+    private func scheduleCoverPresenceRefresh() {
+        coverPresenceGeneration &+= 1
+        let generation = coverPresenceGeneration
+        let snapshot = games
+        let volumeUUID = volume?.volumeUUID
+        Task.detached(priority: .utility) {
+            var sources: [UUID: CoverSource] = [:]
+            sources.reserveCapacity(snapshot.count)
+            for game in snapshot {
+                if Task.isCancelled { return }
+                sources[game.id] = CoverPresence.source(for: game)
+            }
+            let previous = Dictionary(uniqueKeysWithValues: snapshot.map { ($0.id, $0.coverSource) })
+            await MainActor.run {
+                guard generation == self.coverPresenceGeneration else { return }
+                var next = self.games
+                var changed = false
+                for index in next.indices {
+                    let id = next[index].id
+                    guard let source = sources[id], let was = previous[id] else { continue }
+                    guard next[index].coverSource == was, next[index].coverSource != source else { continue }
+                    next[index].coverSource = source
+                    changed = true
+                }
+                guard changed else { return }
+                self.games = next
+                if let volumeUUID {
+                    self.persistEnrichedCache(volumeUUID: volumeUUID)
+                }
+            }
+        }
     }
 
     private func scopedFolder(for game: GameEntry) -> URL {
@@ -2472,6 +2533,7 @@ final class AppState {
             if let last = result.added.last {
                 selection = [last.id]
             }
+            scheduleCoverPresenceRefresh()
             scheduleDuplicateRecompute()
             markMenuNeedsRebuild()
             persistCacheAfterMutation()
@@ -3383,9 +3445,17 @@ final class AppState {
             .sorted { $0.number < $1.number }
             .map { g in
                 let extras = g.extraFolders.joined(separator: ",")
-                return "\(g.number)\u{1e}\(g.name)\u{1e}\(g.serial)\u{1e}\(g.isMenu ? 1 : 0)\u{1e}\(g.virtualFolder)\u{1e}\(extras)\u{1e}\(g.discType.rawValue)\u{1e}\(g.discLabel)\u{1e}\(g.regionLabel)"
+                return "\(g.number)\u{1e}\(g.name)\u{1e}\(g.serial)\u{1e}\(g.isMenu ? 1 : 0)\u{1e}\(g.virtualFolder)\u{1e}\(extras)\u{1e}\(g.discType.rawValue)\u{1e}\(g.discLabel)\u{1e}\(g.regionLabel)\u{1e}\(coverStamp(for: g))"
             }
             .joined(separator: "\u{1f}")
+    }
+
+    /// Loose-cover mtime, so changing a picture marks the menu out of date.
+    private func coverStamp(for game: GameEntry) -> String {
+        guard let url = LooseCover.fileURL(in: game.folderURL),
+              let date = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        else { return "-" }
+        return String(Int(date.timeIntervalSince1970))
     }
 
     private func captureBakedMenuFingerprint() {

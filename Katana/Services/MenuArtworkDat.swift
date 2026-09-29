@@ -25,6 +25,34 @@ enum MenuArtworkDat: Sendable {
         return found.filter { !$0.value.isEmpty }
     }
 
+    /// Loose `0GDTEX.PVR` files keyed by the same product id openMenu looks up.
+    nonisolated static func looseCovers(in games: [GameEntry]) -> [String: Data] {
+        var covers: [String: Data] = [:]
+        for game in games where !game.isMenu && game.number != 1 {
+            let id = MenuListGenerator.openMenuProductID(for: game.serial)
+            guard !id.isEmpty, let data = LooseCover.read(in: game.folderURL), !data.isEmpty else { continue }
+            covers[id] = data
+        }
+        return covers
+    }
+
+    /// Puts loose covers into `BOX.DAT` (256²) and `ICON.DAT` (128²).
+    nonisolated static func applyingLooseCovers(_ covers: [String: Data], to dats: inout [String: Data]) {
+        guard !covers.isEmpty else { return }
+        if let box = OpenMenuArtworkDat.merge(covers: covers, into: dats["BOX.DAT"]) {
+            dats["BOX.DAT"] = box
+        }
+        var icons: [String: Data] = [:]
+        for (id, pvr) in covers {
+            if let icon = OpenMenuArtworkDat.iconTexture(from: pvr) {
+                icons[id] = icon
+            }
+        }
+        if let icon = OpenMenuArtworkDat.merge(covers: icons, into: dats["ICON.DAT"]) {
+            dats["ICON.DAT"] = icon
+        }
+    }
+
     // MARK: - Loose files (unusual; kept for completeness)
 
     nonisolated private static func looseFiles(in folderURL: URL) -> [String: Data] {

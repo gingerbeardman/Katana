@@ -89,6 +89,24 @@ struct NumberColumnCell: View {
     }
 }
 
+/// Cover column: None, Disc, or Custom. The menu slot is blank.
+struct CoverColumnCell: View {
+    let game: GameEntry
+
+    var body: some View {
+        Group {
+            if game.isMenu || game.number == 1 {
+                Text("—")
+                    .foregroundStyle(.tertiary)
+            } else {
+                Text(game.coverSource.displayName)
+                    .foregroundStyle(game.coverSource == .none ? .tertiary : .secondary)
+            }
+        }
+        .help(game.isMenu || game.number == 1 ? "" : game.coverSource.helpText)
+    }
+}
+
 struct MenuChip: View {
     var body: some View {
         Text("MENU")

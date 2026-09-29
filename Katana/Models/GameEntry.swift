@@ -34,6 +34,9 @@ nonisolated struct GameEntry: Identifiable, Codable, Hashable, Sendable {
     var discLabel: String = ""
     /// Override for `N.region=` / `region.txt` (JUE). Empty → IP.BIN region field.
     var regionLabel: String = ""
+    /// Cover column: loose file (**custom**), texture inside the disc (**disc**), or **none**.
+    /// Menu slot stays `.none`. A loose file is known on the fast scan; disc art fills in after.
+    var coverSource: CoverSource = .none
 
     var folderURL: URL {
         URL(fileURLWithPath: folderPath, isDirectory: true)
@@ -50,6 +53,9 @@ nonisolated struct GameEntry: Identifiable, Codable, Hashable, Sendable {
 
     /// Sort key for the Disc table column (display-only).
     var discLabelSortKey: String { resolvedDisc() }
+
+    /// Sort key for the Cover column (the word shown in the cell).
+    var coverSortKey: String { coverSource.displayName }
 
     /// Sidecars that only openMenu Extended bakes (`folder.txt` / extras / non-game type).
     var hasOpenMenuFolderMeta: Bool {
@@ -93,5 +99,60 @@ nonisolated struct GameEntry: Identifiable, Codable, Hashable, Sendable {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         return n.caseInsensitiveCompare("GDMENU") == .orderedSame
             || n.caseInsensitiveCompare("openMenu") == .orderedSame
+    }
+}
+
+nonisolated extension GameEntry {
+    enum CodingKeys: String, CodingKey {
+        case id, number, name, serial, format, imageFileName, folderPath
+        case byteSize, payloadByteSize, contentSHA256, isMenu, detailsLoaded
+        case ipHeader, virtualFolder, extraFolders, discType, discLabel, regionLabel
+        case coverSource
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        number = try c.decode(Int.self, forKey: .number)
+        name = try c.decode(String.self, forKey: .name)
+        serial = try c.decode(String.self, forKey: .serial)
+        format = try c.decode(DiscFormat.self, forKey: .format)
+        imageFileName = try c.decode(String.self, forKey: .imageFileName)
+        folderPath = try c.decode(String.self, forKey: .folderPath)
+        byteSize = try c.decode(Int64.self, forKey: .byteSize)
+        payloadByteSize = try c.decode(Int64.self, forKey: .payloadByteSize)
+        contentSHA256 = try c.decodeIfPresent(String.self, forKey: .contentSHA256)
+        isMenu = try c.decode(Bool.self, forKey: .isMenu)
+        detailsLoaded = try c.decodeIfPresent(Bool.self, forKey: .detailsLoaded) ?? false
+        ipHeader = try c.decodeIfPresent(IpBinInfo.self, forKey: .ipHeader)
+        virtualFolder = try c.decodeIfPresent(String.self, forKey: .virtualFolder) ?? ""
+        extraFolders = try c.decodeIfPresent([String].self, forKey: .extraFolders) ?? []
+        discType = try c.decodeIfPresent(OpenMenuItemType.self, forKey: .discType) ?? .game
+        discLabel = try c.decodeIfPresent(String.self, forKey: .discLabel) ?? ""
+        regionLabel = try c.decodeIfPresent(String.self, forKey: .regionLabel) ?? ""
+        coverSource = try c.decodeIfPresent(CoverSource.self, forKey: .coverSource) ?? .none
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(number, forKey: .number)
+        try c.encode(name, forKey: .name)
+        try c.encode(serial, forKey: .serial)
+        try c.encode(format, forKey: .format)
+        try c.encode(imageFileName, forKey: .imageFileName)
+        try c.encode(folderPath, forKey: .folderPath)
+        try c.encode(byteSize, forKey: .byteSize)
+        try c.encode(payloadByteSize, forKey: .payloadByteSize)
+        try c.encodeIfPresent(contentSHA256, forKey: .contentSHA256)
+        try c.encode(isMenu, forKey: .isMenu)
+        try c.encode(detailsLoaded, forKey: .detailsLoaded)
+        try c.encodeIfPresent(ipHeader, forKey: .ipHeader)
+        try c.encode(virtualFolder, forKey: .virtualFolder)
+        try c.encode(extraFolders, forKey: .extraFolders)
+        try c.encode(discType, forKey: .discType)
+        try c.encode(discLabel, forKey: .discLabel)
+        try c.encode(regionLabel, forKey: .regionLabel)
+        try c.encode(coverSource, forKey: .coverSource)
     }
 }

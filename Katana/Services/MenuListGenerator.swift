@@ -15,6 +15,16 @@ enum MenuListGenerator: Sendable {
         var regionLabel: String = ""
     }
 
+    /// Id openMenu uses for `n.product=` and for `BOX.DAT` / `ICON.DAT` lookup.
+    /// Hyphens are removed; only the first token is kept (`MK-51035` → `MK51035`).
+    nonisolated static func openMenuProductID(for serial: String) -> String {
+        serial
+            .replacingOccurrences(of: "-", with: "")
+            .split(whereSeparator: \.isWhitespace)
+            .first
+            .map(String.init) ?? ""
+    }
+
     /// Format a list key to match **on-disk** folder names: `01`…`99`, then `100`….
     nonisolated static func formatFolderNumber(_ number: Int) -> String {
         FolderNumbering.format(number)
@@ -70,13 +80,7 @@ enum MenuListGenerator: Sendable {
         sb += "\(n).version=\(ip.version)\n"
         sb += "\(n).date=\(ip.releaseDate)\n"
         if kind.isOpenMenuFamily {
-            // openMenu product id: strip dashes, first token only.
-            let product = item.serial
-                .replacingOccurrences(of: "-", with: "")
-                .split(whereSeparator: \.isWhitespace)
-                .first
-                .map(String.init) ?? ""
-            sb += "\(n).product=\(product)\n"
+            sb += "\(n).product=\(openMenuProductID(for: item.serial))\n"
             if kind.supportsVirtualFolders {
                 sb += "\(n).folder=\(item.virtualFolder)\n"
                 for (index, extra) in item.extraFolders.prefix(5).enumerated() {

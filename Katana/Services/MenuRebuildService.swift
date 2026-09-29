@@ -91,7 +91,11 @@ enum MenuRebuildService: Sendable {
                 fromMenuFolder: menu.folderURL,
                 imageFileName: menu.imageFileName
             )
-            if !preservedDats.isEmpty {
+            let loose = MenuArtworkDat.looseCovers(in: ordered)
+            if !loose.isEmpty {
+                progress?("Adding \(loose.count) custom cover\(loose.count == 1 ? "" : "s")…", assetsEnd)
+                MenuArtworkDat.applyingLooseCovers(loose, to: &preservedDats)
+            } else if !preservedDats.isEmpty {
                 progress?(
                     "Keeping \(preservedDats.count) artwork DAT\(preservedDats.count == 1 ? "" : "s")…",
                     assetsEnd

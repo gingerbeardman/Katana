@@ -27,6 +27,23 @@ nonisolated enum OpenMenuBoxArt: Sendable {
         return imageData(matching: serials, origin: origin)
     }
 
+    /// True when the menu `BOX.DAT` has a chunk for any of `serials`. Does not read the picture.
+    nonisolated static func contains(
+        matching serials: [String],
+        menuFolder: URL,
+        imageFileName: String
+    ) -> Bool {
+        guard let origin = origin(menuFolder: menuFolder, imageFileName: imageFileName),
+              let index = Cache.shared.index(for: origin)
+        else { return false }
+        for serial in serials {
+            for key in lookupKeys(for: serial) where index.chunks[key] != nil {
+                return true
+            }
+        }
+        return false
+    }
+
     // MARK: - Origin
 
     private enum Origin: Sendable {

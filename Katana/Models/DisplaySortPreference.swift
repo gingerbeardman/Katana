@@ -12,6 +12,7 @@ nonisolated struct DisplaySortPreference: Codable, Hashable, Sendable {
         case disc
         case format
         case size
+        case cover
     }
 
     var field: Field
@@ -52,6 +53,8 @@ nonisolated struct DisplaySortPreference: Codable, Hashable, Sendable {
             return [KeyPathComparator(\.formatSortKey, order: order)]
         case .size:
             return [KeyPathComparator(\.byteSize, order: order)]
+        case .cover:
+            return [KeyPathComparator(\.coverSortKey, order: order)]
         }
     }
 
@@ -69,6 +72,7 @@ nonisolated struct DisplaySortPreference: Codable, Hashable, Sendable {
         case \GameEntry.discLabelSortKey: field = .disc
         case \GameEntry.formatSortKey: field = .format
         case \GameEntry.byteSize: field = .size
+        case \GameEntry.coverSortKey: field = .cover
         default: return nil
         }
         return DisplaySortPreference(field: field, ascending: ascending)
@@ -94,6 +98,7 @@ nonisolated struct DisplaySortPreference: Codable, Hashable, Sendable {
         case .disc: return "Disc \(dir)"
         case .format: return "Format \(dir)"
         case .size: return "Size \(dir)"
+        case .cover: return "Cover \(dir)"
         }
     }
 }

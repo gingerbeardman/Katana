@@ -503,7 +503,15 @@ enum CardScanner: Sendable {
         // Serial disagreement still drops the IP header — the fingerprint may already
         // describe the new image (see `FolderFingerprint.adoptingSerial`).
         if let cached, cached.fingerprint == fingerprint {
-            let entry = entryTrusting(cached, number: number, folderPath: folderURL.path)
+            var entry = entryTrusting(cached, number: number, folderPath: folderURL.path)
+            if !entry.isMenu, entry.number != 1 {
+                if LooseCover.exists(in: folderURL) {
+                    entry.coverSource = .custom
+                } else if entry.coverSource == .custom {
+                    // Loose file was removed. Disc art is filled in after the list is up.
+                    entry.coverSource = .none
+                }
+            }
             // Never promote provisional image-only sizes to “loaded” — GDI cue files are tiny.
             return FolderScan(entry: entry, fingerprint: fingerprint, cacheHit: true)
         }
@@ -548,7 +556,8 @@ enum CardScanner: Sendable {
             extraFolders: isMenu ? [] : extras,
             discType: isMenu ? .game : discType,
             discLabel: isMenu ? "" : discLabel,
-            regionLabel: isMenu ? "" : regionLabel
+            regionLabel: isMenu ? "" : regionLabel,
+            coverSource: (!isMenu && LooseCover.exists(in: folderURL)) ? .custom : .none
         )
 
         return FolderScan(entry: entry, fingerprint: fingerprint, cacheHit: false)

@@ -115,8 +115,8 @@ enum LooseCover: Sendable {
                 space: CGColorSpaceCreateDeviceRGB(),
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
             ) else { return false }
-            context.translateBy(x: 0, y: CGFloat(height))
-            context.scaleBy(x: 1, y: -1)
+            // `draw` already writes the image upright: buffer row 0 is the top.
+            // A y-flip here mirrors the cover.
             context.interpolationQuality = .high
             context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
             return true

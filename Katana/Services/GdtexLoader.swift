@@ -97,18 +97,37 @@ enum GdtexLoader: Sendable {
 
     /// Pull 0GDTEX.PVR from GDI data tracks via ISO 9660 (multi-track aware).
     private nonisolated static func extractFromGDI(folderURL: URL, gdiFileName: String) -> Data? {
+        let tracks = dataTracks(folderURL: folderURL, gdiFileName: gdiFileName)
+        guard !tracks.isEmpty else { return nil }
+        return Iso9660FileExtractor.extract(named: "0GDTEX.PVR", tracks: tracks)
+    }
+
+    /// True when a GDI’s data track has a `0GDTEX.PVR` directory entry. Does not read the texture.
+    nonisolated static func discHasTexture(
+        folderURL: URL,
+        imageFileName: String,
+        format: DiscFormat
+    ) -> Bool {
+        guard format == .gdi || imageFileName.lowercased().hasSuffix(".gdi") else { return false }
+        let tracks = dataTracks(folderURL: folderURL, gdiFileName: imageFileName)
+        guard !tracks.isEmpty else { return false }
+        return Iso9660FileExtractor.locate(named: ["0GDTEX.PVR"], tracks: tracks)["0GDTEX.PVR"] != nil
+    }
+
+    private nonisolated static func dataTracks(
+        folderURL: URL,
+        gdiFileName: String
+    ) -> [Iso9660FileExtractor.DataTrack] {
         let gdiURL = folderURL.appendingPathComponent(gdiFileName)
         let text = (try? String(contentsOf: gdiURL, encoding: .utf8))
             ?? (try? String(contentsOf: gdiURL, encoding: .isoLatin1))
-        guard let text else { return nil }
-
+        guard let text else { return [] }
         var tracks: [Iso9660FileExtractor.DataTrack] = []
         for track in GdiCue.parseTracks(in: text) where track.type == 4 {
             let trackURL = folderURL.appendingPathComponent(track.fileName)
             guard FileManager.default.fileExists(atPath: trackURL.path) else { continue }
             tracks.append(.init(lba: UInt32(track.lba), url: trackURL))
         }
-        guard !tracks.isEmpty else { return nil }
-        return Iso9660FileExtractor.extract(named: "0GDTEX.PVR", tracks: tracks)
+        return tracks
     }
 }

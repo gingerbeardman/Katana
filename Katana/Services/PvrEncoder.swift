@@ -7,15 +7,23 @@ import Foundation
 enum PvrEncoder: Sendable {
     nonisolated static let side = 256
 
-    /// Center-crops `rgba` to a square, scales it to 256×256, and encodes.
-    /// Pixels are straight RGBA8888 with row 0 at the top.
-    nonisolated static func encodeCover(rgba: [UInt8], width: Int, height: Int) -> Data? {
-        guard width > 0, height > 0, rgba.count >= width * height * 4 else { return nil }
+    /// Center-crops `rgba` to a square, scales it to `side`×`side`, and encodes.
+    /// Pixels are straight RGBA8888 with row 0 at the top. `side` is 256 for
+    /// `BOX.DAT` and 128 for `ICON.DAT`.
+    nonisolated static func encodeCover(
+        rgba: [UInt8],
+        width: Int,
+        height: Int,
+        side: Int = Self.side
+    ) -> Data? {
+        guard width > 0, height > 0, side > 0, side & (side - 1) == 0,
+              rgba.count >= width * height * 4
+        else { return nil }
         let square = centerCrop(rgba, width: width, height: height)
         let scaled = square.side == side
             ? square.pixels
             : scale(square.pixels, from: square.side, to: side)
-        return encode(scaled256: scaled)
+        return encode(square: scaled, side: side)
     }
 
     // MARK: - Crop and scale
@@ -73,7 +81,7 @@ enum PvrEncoder: Sendable {
 
     // MARK: - PVR
 
-    private nonisolated static func encode(scaled256 rgba: [UInt8]) -> Data {
+    private nonisolated static func encode(square rgba: [UInt8], side: Int) -> Data {
         let pixelFormat = choosePixelFormat(rgba)
         let twiddleMap = makeTwiddleMap(size: side)
         var pixels = [UInt8](repeating: 0, count: side * side * 2)

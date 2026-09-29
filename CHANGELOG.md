@@ -2,7 +2,7 @@
 
 Scratchpad for notes to publish with the **next** release. Keep user-facing and succinct.
 
-Current release is **4.0** (GitHub `v4.0`, build **7**). New work lands under **Unreleased**.
+Current release is **4.0.1** (GitHub `v4.0.1`, build **8**). New work lands under **Unreleased**.
 
 ## Unreleased
 
@@ -14,6 +14,25 @@ Current release is **4.0** (GitHub `v4.0`, build **7**). New work lands under **
 
 ### fix
 - (none)
+
+### remove
+- (none)
+
+---
+
+## 4.0.1
+
+Shipped as **v4.0.1** on GitHub (universal notarized DMG). Build **8**.
+
+### add
+- **Cover column** — the game list can show None, Disc, or Custom for each game’s cover. Hidden until you turn the column on
+
+### change
+- (none)
+
+### fix
+- **Cover** — a JPEG or PNG saved as the cover keeps its orientation instead of being mirrored
+- **Cover on the Dreamcast** — rebuilding an openMenu card copies each loose `0GDTEX.PVR` into `BOX.DAT` and `ICON.DAT`, which is where the menu looks up artwork
 
 ### remove
 - (none)

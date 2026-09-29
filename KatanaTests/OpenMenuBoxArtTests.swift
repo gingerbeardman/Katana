@@ -24,6 +24,16 @@ struct OpenMenuBoxArtTests {
         )
         #expect(found.image?.size == NSSize(width: 2, height: 2))
         #expect(found.status.isEmpty)
+        #expect(OpenMenuBoxArt.contains(
+            matching: ["T-9705N"],
+            menuFolder: menu,
+            imageFileName: "disc.gdi"
+        ))
+        #expect(!OpenMenuBoxArt.contains(
+            matching: ["T0000N"],
+            menuFolder: menu,
+            imageFileName: "disc.gdi"
+        ))
     }
 
     @Test func perGameTextureWinsOverBoxDat() throws {
